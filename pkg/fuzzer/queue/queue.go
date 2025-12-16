@@ -30,6 +30,7 @@ type Request struct {
 	Prog        *prog.Prog // for RequestTypeProgram
 	BinaryFile  string     // for RequestTypeBinary
 	GlobPattern string     // for 	RequestTypeGlob
+	ProgID      int64
 
 	// Return all signal for these calls instead of new signal.
 	ReturnAllSignal []int

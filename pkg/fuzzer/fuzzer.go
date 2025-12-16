@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/syzkaller/pkg/corpus"
@@ -33,6 +34,7 @@ type Fuzzer struct {
 	target       *prog.Target
 	hintsLimiter prog.HintsLimiter
 	runningJobs  map[jobIntrospector]struct{}
+	nextProgID   int64
 
 	ct           *prog.ChoiceTable
 	ctProgs      int
@@ -58,6 +60,7 @@ func NewFuzzer(ctx context.Context, cfg *Config, rnd *rand.Rand,
 		rnd:         rnd,
 		target:      target,
 		runningJobs: map[jobIntrospector]struct{}{},
+		nextProgID:  0,
 
 		// We're okay to lose some of the messages -- if we are already
 		// regenerating the table, we don't want to repeat it right away.
@@ -131,6 +134,10 @@ func (fuzzer *Fuzzer) executeWithFlags(executor queue.Executor, req *queue.Reque
 }
 
 func (fuzzer *Fuzzer) prepare(req *queue.Request, flags ProgFlags, attempt int) {
+	if req != nil && req.Prog != nil && req.ProgID == 0 {
+		atomic.AddInt64(&fuzzer.nextProgID, 1)
+		req.ProgID = fuzzer.nextProgID
+	}
 	req.OnDone(func(req *queue.Request, res *queue.Result) bool {
 		return fuzzer.processResult(req, res, flags, attempt)
 	})
