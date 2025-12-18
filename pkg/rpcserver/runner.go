@@ -274,6 +274,21 @@ func (runner *Runner) sendRequest(req *queue.Request) error {
 	if err := req.Validate(); err != nil {
 		panic(err)
 	}
+
+	log.Logf(1, "Runner %d sending request:\n", runner.id)
+	log.Logf(1, "  Type=%v Important=%v Avoid=%v ReturnOutput=%v ReturnError=%v ReturnAllSignal=%v ExecOpts=%+v ID=%v\n", req.Type, req.Important, req.Avoid, req.ReturnOutput, req.ReturnError, req.ReturnAllSignal, req.ExecOpts, req.ProgID)
+	switch req.Type {
+	case flatrpc.RequestTypeProgram:
+		if req.Prog != nil {
+			log.Logf(1, "  Prog:\n%s", req.Prog.String())
+		} else {
+			log.Logf(1, "  Prog: <nil> (BUG: program request without prog)")
+		}
+	case flatrpc.RequestTypeGlob:
+		log.Logf(1, "  Glob: pattern=%q", req.GlobPattern)
+	default:
+	}
+
 	runner.nextRequestID++
 	id := runner.nextRequestID
 	var flags flatrpc.RequestFlag
