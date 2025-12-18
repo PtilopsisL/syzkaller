@@ -17,6 +17,7 @@ import (
 	"github.com/google/syzkaller/pkg/csource"
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
+	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/pkg/stat"
@@ -145,6 +146,10 @@ func (fuzzer *Fuzzer) prepare(req *queue.Request, flags ProgFlags, attempt int) 
 
 func (fuzzer *Fuzzer) enqueue(executor queue.Executor, req *queue.Request, flags ProgFlags, attempt int) {
 	fuzzer.prepare(req, flags, attempt)
+
+	log.Logf(1, "[ENQUEUE] ID(%v): important=%v exec_opts=%+v prog:\n%s\n",
+		req.ProgID, req.Important, req.ExecOpts, req.ProgID, req.Prog.String())
+
 	executor.Submit(req)
 }
 
