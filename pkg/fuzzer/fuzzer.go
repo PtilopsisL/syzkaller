@@ -42,6 +42,8 @@ type Fuzzer struct {
 	ctMu         sync.Mutex // TODO: use RWLock.
 	ctRegenerate chan struct{}
 
+	distributed *distributedState
+
 	execQueues
 }
 
@@ -68,6 +70,24 @@ func NewFuzzer(ctx context.Context, cfg *Config, rnd *rand.Rand,
 		ctRegenerate: make(chan struct{}),
 	}
 	f.execQueues = newExecQueues(f)
+
+	// Server or client
+	if cfg.DistributedAddr == "" {
+		log.Logf(0, "fuzzer mode: standalone")
+	} else {
+		if err := f.initDistributed(cfg.DistributedAddr, cfg.DistributedID); err != nil {
+			log.Logf(0, "fuzzer mode: distributed init failed (addr=%s): %v", cfg.DistributedAddr, err)
+			panic(fmt.Sprintf("init distributed mode failed: %v", err))
+		}
+		// client mode
+		if f.distributed != nil && f.distributed.role == DistributedRoleClient {
+			log.Logf(0, "fuzzer mode: distributed client (addr=%s, id=%s)", cfg.DistributedAddr, f.distributed.clientID)
+			f.execQueues.source = queue.Callback(f.distributedNextRequest)
+		} else {
+			log.Logf(0, "fuzzer mode: distributed server (addr=%s)", cfg.DistributedAddr)
+		}
+	}
+
 	f.updateChoiceTable(nil)
 	go f.choiceTableUpdater()
 	if cfg.Debug {
@@ -220,20 +240,22 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 }
 
 type Config struct {
-	Debug          bool
-	Corpus         *corpus.Corpus
-	Logf           func(level int, msg string, args ...interface{})
-	Snapshot       bool
-	Coverage       bool
-	FaultInjection bool
-	Comparisons    bool
-	Collide        bool
-	EnabledCalls   map[*prog.Syscall]bool
-	NoMutateCalls  map[int]bool
-	FetchRawCover  bool
-	NewInputFilter func(call string) bool
-	PatchTest      bool
-	ModeKFuzzTest  bool
+	Debug           bool
+	Corpus          *corpus.Corpus
+	Logf            func(level int, msg string, args ...interface{})
+	Snapshot        bool
+	Coverage        bool
+	FaultInjection  bool
+	Comparisons     bool
+	Collide         bool
+	EnabledCalls    map[*prog.Syscall]bool
+	NoMutateCalls   map[int]bool
+	FetchRawCover   bool
+	NewInputFilter  func(call string) bool
+	PatchTest       bool
+	ModeKFuzzTest   bool
+	DistributedAddr string
+	DistributedID   string
 }
 
 func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call int, triage *map[int]*triageCall) {

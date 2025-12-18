@@ -18,6 +18,13 @@ type Config struct {
 	HTTP string `json:"http"`
 	// TCP address to serve RPC for fuzzer processes (optional).
 	RPC string `json:"rpc,omitempty"`
+	// Distributed fuzzer mode (optional).
+	// If set, syz-manager will pass this address to the fuzzer so that fuzzer instances
+	// can auto-elect a role:
+	//   - Server: the first instance that successfully listens on this address.
+	//   - Client: subsequent instances that connect to the existing server.
+	// Empty means standalone (local generation).
+	DistributedAddr string `json:"distributed_addr,omitempty"`
 	// Location of a working directory for the syz-manager process. Outputs here include:
 	// - <workdir>/crashes/*: crash output files
 	// - <workdir>/corpus.db: corpus with interesting programs
