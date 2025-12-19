@@ -82,7 +82,7 @@ func NewFuzzer(ctx context.Context, cfg *Config, rnd *rand.Rand,
 		// client mode
 		if f.distributed != nil && f.distributed.role == DistributedRoleClient {
 			log.Logf(0, "fuzzer mode: distributed client (addr=%s, id=%s)", cfg.DistributedAddr, f.distributed.clientID)
-			f.execQueues.source = queue.Callback(f.distributedNextRequest)
+			f.execQueues.genSource.Store(queue.Callback(f.distributedNextRequest))
 		} else {
 			log.Logf(0, "fuzzer mode: distributed server (addr=%s)", cfg.DistributedAddr)
 		}
@@ -108,6 +108,7 @@ type execQueues struct {
 	candidateQueue       *queue.PlainQueue
 	triageQueue          *queue.DynamicOrderer
 	smashQueue           *queue.PlainQueue
+	genSource            *queue.DynamicSourceCtl
 	source               queue.Source
 }
 
@@ -126,13 +127,19 @@ func newExecQueues(fuzzer *Fuzzer) execQueues {
 		// mutating various corpus programs.
 		skipQueue = 2
 	}
+
+	// The last stage is a switchable generator:
+	// - standalone/server: genFuzz
+	// - distributed client: distributedNextRequest
+	ret.genSource = queue.DynamicSource(queue.Callback(fuzzer.genFuzz))
+
 	// Sources are listed in the order, in which they will be polled.
 	ret.source = queue.Order(
 		ret.triageCandidateQueue,
 		ret.candidateQueue,
 		ret.triageQueue,
 		queue.Alternate(ret.smashQueue, skipQueue),
-		queue.Callback(fuzzer.genFuzz),
+		ret.genSource,
 	)
 	return ret
 }
