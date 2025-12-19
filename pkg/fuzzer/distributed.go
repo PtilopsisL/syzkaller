@@ -7,9 +7,9 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/prog"
@@ -37,9 +37,15 @@ type distributedState struct {
 	rpcClient *rpc.Client
 	clientID  string
 
-	// server inflight requests: ProgID -> original *queue.Request
+	// server bookkeeping (optional, for stats/visibility)
+	nextID   int64
 	mu       sync.Mutex
-	inflight map[int64]*queue.Request
+	inflight map[int64]inflightInfo
+}
+
+type inflightInfo struct {
+	ClientID string
+	SentAt   time.Time
 }
 
 // NOTE: net/rpc requires argument and reply types to be exported (or builtin).
@@ -49,21 +55,22 @@ type DistributedFetchArgs struct {
 	ClientID string
 }
 
+// Server -> client: only the program (no ExecOpts, no coverage, no output).
 type DistributedWireRequest struct {
 	ProgID    int64
-	ExecOpts  flatrpc.ExecOpts
 	ProgData  []byte
 	Important bool
 }
 
-type DistributedWireResult struct {
-	ProgID int64
-
-	Info    *flatrpc.ProgInfo
-	Output  []byte
-	Status  queue.Status
-	ErrText string
+// Client -> server: only an execution acknowledgement.
+type DistributedAckArgs struct {
+	ClientID string
+	ProgID   int64
+	OK       bool
+	ErrText  string
 }
+
+type DistributedAckReply struct{}
 
 // initDistributed initializes distributed mode.
 // It tries to listen on addr; if it succeeds, this process becomes the server.
@@ -71,7 +78,7 @@ type DistributedWireResult struct {
 func (f *Fuzzer) initDistributed(addr, clientID string) error {
 	ds := &distributedState{
 		f:        f,
-		inflight: make(map[int64]*queue.Request),
+		inflight: make(map[int64]inflightInfo),
 	}
 
 	// Generate a client ID if not provided.
@@ -89,7 +96,6 @@ func (f *Fuzzer) initDistributed(addr, clientID string) error {
 		ds.ln = ln
 		ds.rpcServer = rpc.NewServer()
 
-		// Register an EXPORTED receiver type (DistributedRPC) and EXPORTED args/reply types.
 		if err := ds.rpcServer.RegisterName("FuzzerDist", (*DistributedRPC)(ds)); err != nil {
 			_ = ln.Close()
 			return fmt.Errorf("register distributed rpc: %w", err)
@@ -141,12 +147,14 @@ func (f *Fuzzer) closeDistributed() {
 }
 
 // distributedNextRequest is used on the client side as a queue.Source callback.
-// It fetches the next request from the server via RPC and converts it to a local queue.Request.
+// It fetches a program from the server and returns it as a local queue.Request.
+// The request is processed locally (triage/minimize/corpus) by this client's fuzzer.
 func (f *Fuzzer) distributedNextRequest() *queue.Request {
 	ds := f.distributed
 	if ds == nil || ds.role != DistributedRoleClient {
 		return nil
 	}
+
 	for {
 		var wreq DistributedWireRequest
 		err := ds.rpcClient.Call(
@@ -166,12 +174,16 @@ func (f *Fuzzer) distributedNextRequest() *queue.Request {
 			continue
 		}
 
-		// On the client, when execution finishes, send the result back to the server.
+		// Ensure the request participates in the local fuzzer lifecycle.
+		// This sets ProgID if needed and installs the local processResult callback.
+		f.prepare(req, 0, 0)
+
+		// Best-effort ack to the server (does not affect local processing).
 		req.OnDone(func(r *queue.Request, res *queue.Result) bool {
-			ds.sendResult(r, res)
-			// The client does not run processResult; it only reports back.
+			ds.sendAck(r, res)
 			return true
 		})
+
 		return req
 	}
 }
@@ -190,94 +202,94 @@ func (f *Fuzzer) wireToRequest(w *DistributedWireRequest) (*queue.Request, error
 	return &queue.Request{
 		ProgID:    w.ProgID,
 		Prog:      p,
-		ExecOpts:  w.ExecOpts,
 		Important: w.Important,
 	}, nil
 }
 
-// sendResult sends the execution result from the client back to the server.
-func (ds *distributedState) sendResult(req *queue.Request, res *queue.Result) {
+// sendAck sends a lightweight execution acknowledgement from the client to the server.
+func (ds *distributedState) sendAck(req *queue.Request, res *queue.Result) {
 	if ds.rpcClient == nil {
 		return
 	}
-	wr := &DistributedWireResult{
-		ProgID: req.ProgID,
-		Info:   res.Info,
-		Output: res.Output,
-		Status: res.Status,
+	ok := true
+	errText := ""
+	if res != nil && res.Err != nil {
+		ok = false
+		errText = res.Err.Error()
 	}
-	if res.Err != nil {
-		wr.ErrText = res.Err.Error()
+	args := &DistributedAckArgs{
+		ClientID: ds.clientID,
+		ProgID:   req.ProgID,
+		OK:       ok,
+		ErrText:  errText,
 	}
-	var nothing struct{}
-	if err := ds.rpcClient.Call("FuzzerDist.Report", wr, &nothing); err != nil {
-		log.Logf(0, "distributed Report failed: %v", err)
+	var reply DistributedAckReply
+	if err := ds.rpcClient.Call("FuzzerDist.Ack", args, &reply); err != nil {
+		log.Logf(0, "distributed Ack failed: %v", err)
 	}
 }
 
 // DistributedRPC is the RPC receiver type on the server side.
-// It is a thin wrapper around distributedState; net/rpc prefers exported receiver types.
 type DistributedRPC distributedState
 
-// Fetch is called by clients to obtain the next request to execute.
+// Fetch is called by clients to obtain the next program to execute.
+// IMPORTANT: This must not consume the server's execution scheduling queue.
+// It only generates/serializes a new prog to distribute.
 func (ds *DistributedRPC) Fetch(args *DistributedFetchArgs, reply *DistributedWireRequest) error {
 	if ds.role != DistributedRoleServer {
 		return errors.New("not a distributed server")
 	}
-
-	// Use the existing Fuzzer.Next() scheduling logic on the server.
-	req := ds.f.Next()
-	if req == nil {
-		return errors.New("nil request from fuzzer")
+	if args == nil || args.ClientID == "" {
+		return errors.New("missing ClientID")
 	}
 
-	var progData []byte
-	if req.Prog != nil {
-		progData = req.Prog.Serialize()
+	// Generate a new program using the fuzzer generator.
+	// We intentionally do NOT call ds.f.Next() here.
+	req := ds.f.genFuzz()
+	if req == nil || req.Prog == nil {
+		return errors.New("failed to generate program")
 	}
+
+	// Assign an ID for tracking/ack purposes.
+	id := atomic.AddInt64(&ds.nextID, 1)
 
 	*reply = DistributedWireRequest{
-		ProgID:    req.ProgID,
-		ExecOpts:  req.ExecOpts,
-		ProgData:  progData,
+		ProgID:    id,
+		ProgData:  req.Prog.Serialize(),
 		Important: req.Important,
 	}
 
-	// Track this request as in-flight until the client reports back.
 	ds.mu.Lock()
-	ds.inflight[req.ProgID] = req
+	ds.inflight[id] = inflightInfo{ClientID: args.ClientID, SentAt: time.Now()}
 	ds.mu.Unlock()
+
 	return nil
 }
 
-// Report is called by clients to report back the execution result.
-// The server finds the original queue.Request and calls Done(), which
-// triggers the usual processResult / triage logic.
-func (ds *DistributedRPC) Report(args *DistributedWireResult, _ *struct{}) error {
+// Ack is called by clients to acknowledge they executed a program.
+// The server does not use this to drive triage/minimize/corpus; it is purely for confirmation/stats.
+func (ds *DistributedRPC) Ack(args *DistributedAckArgs, _ *DistributedAckReply) error {
 	if ds.role != DistributedRoleServer {
 		return errors.New("not a distributed server")
 	}
+	if args == nil || args.ClientID == "" {
+		return errors.New("missing ClientID")
+	}
 
 	ds.mu.Lock()
-	req := ds.inflight[args.ProgID]
+	_, ok := ds.inflight[args.ProgID]
 	delete(ds.inflight, args.ProgID)
 	ds.mu.Unlock()
 
-	if req == nil {
-		// Possibly already cleaned up or unknown ProgID; ignore.
+	// Best-effort logging; do not fail the RPC if ProgID is unknown.
+	if !ok {
+		log.Logf(1, "distributed ack: unknown prog id %d from client %s", args.ProgID, args.ClientID)
 		return nil
 	}
-
-	var err error
-	if args.ErrText != "" {
-		err = errors.New(args.ErrText)
+	if args.OK {
+		log.Logf(3, "distributed ack: prog %d executed by client %s", args.ProgID, args.ClientID)
+	} else {
+		log.Logf(2, "distributed ack: prog %d failed on client %s: %s", args.ProgID, args.ClientID, args.ErrText)
 	}
-
-	req.Done(&queue.Result{
-		Info:   args.Info,
-		Output: args.Output,
-		Status: args.Status,
-		Err:    err,
-	})
 	return nil
 }
