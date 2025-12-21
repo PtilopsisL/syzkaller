@@ -341,6 +341,15 @@ func (fuzzer *Fuzzer) genFuzz() *queue.Request {
 			Stat: fuzzer.statExecCollide,
 		}
 	}
+
+	// If this fuzzer is a distributed server, register the new prog
+	// so that all clients will also execute it (with a global ProgID).
+	if fuzzer.distributed != nil && fuzzer.distributed.role == DistributedRoleServer &&
+		req != nil && req.Prog != nil {
+		fuzzer.distributed.registerProgFromServer(req)
+	}
+
+	// As before: install processResult callback, set ProgID if still 0, etc.
 	fuzzer.prepare(req, 0, 0)
 	return req
 }

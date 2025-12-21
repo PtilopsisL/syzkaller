@@ -23,6 +23,30 @@ const (
 	DistributedRoleClient
 )
 
+// progExecState describes per-client execution state for a single prog.
+type progExecState int
+
+const (
+	progStateNotSent progExecState = iota // known globally, but not yet assigned to this client
+	progStatePending                      // sent to this client, waiting for execution
+	progStateOK                           // client reported success
+	progStateFailed                       // client reported failure
+)
+
+// storedProg is a globally generated program on the server.
+type storedProg struct {
+	ID        int64
+	ProgData  []byte
+	Important bool
+}
+
+// clientState tracks what each client has already seen and how it went.
+type clientState struct {
+	ID      string
+	NextIdx int                     // index into distributedState.programs slice
+	Status  map[int64]progExecState // progID -> state
+}
+
 // distributedState is attached to Fuzzer and holds all distributed execution state.
 type distributedState struct {
 	f *Fuzzer
@@ -37,15 +61,13 @@ type distributedState struct {
 	rpcClient *rpc.Client
 	clientID  string
 
-	// server bookkeeping (optional, for stats/visibility)
-	nextID   int64
+	// server global program registry and per-client progress.
 	mu       sync.Mutex
-	inflight map[int64]inflightInfo
-}
+	cond     *sync.Cond
+	programs []storedProg
+	nextID   int64
 
-type inflightInfo struct {
-	ClientID string
-	SentAt   time.Time
+	clients map[string]*clientState
 }
 
 // NOTE: net/rpc requires argument and reply types to be exported (or builtin).
@@ -77,9 +99,10 @@ type DistributedAckReply struct{}
 // Otherwise, it tries to connect as a client.
 func (f *Fuzzer) initDistributed(addr, clientID string) error {
 	ds := &distributedState{
-		f:        f,
-		inflight: make(map[int64]inflightInfo),
+		f:       f,
+		clients: make(map[string]*clientState),
 	}
+	ds.cond = sync.NewCond(&ds.mu)
 
 	// Generate a client ID if not provided.
 	if clientID == "" {
@@ -144,6 +167,46 @@ func (f *Fuzzer) closeDistributed() {
 	if ds.ln != nil {
 		_ = ds.ln.Close()
 	}
+}
+
+// getOrCreateClientLocked returns the clientState for a given client ID.
+// ds.mu must be held by the caller.
+func (ds *distributedState) getOrCreateClientLocked(id string) *clientState {
+	if st, ok := ds.clients[id]; ok {
+		return st
+	}
+	st := &clientState{
+		ID:     id,
+		Status: make(map[int64]progExecState),
+	}
+	ds.clients[id] = st
+	return st
+}
+
+// registerProgFromServer is called on the server each time we generate
+// a new fuzz program (in genFuzz). It assigns a global ProgID and stores
+// the serialized program so that all current and future clients can execute it.
+func (ds *distributedState) registerProgFromServer(req *queue.Request) {
+	if req == nil || req.Prog == nil {
+		return
+	}
+	data := req.Prog.Serialize()
+
+	// Allocate a new global ID and append to the global program list.
+	id := atomic.AddInt64(&ds.nextID, 1)
+
+	ds.mu.Lock()
+	ds.programs = append(ds.programs, storedProg{
+		ID:        id,
+		ProgData:  data,
+		Important: req.Important,
+	})
+	// Wake up any clients blocked in Fetch waiting for new programs.
+	ds.cond.Broadcast()
+	ds.mu.Unlock()
+
+	// Make the request use this global ID (prepare() will not override it).
+	req.ProgID = id
 }
 
 // distributedNextRequest is used on the client side as a queue.Source callback.
@@ -233,8 +296,12 @@ func (ds *distributedState) sendAck(req *queue.Request, res *queue.Result) {
 type DistributedRPC distributedState
 
 // Fetch is called by clients to obtain the next program to execute.
-// IMPORTANT: This must not consume the server's execution scheduling queue.
-// It only generates/serializes a new prog to distribute.
+// It does not consume the server's own scheduling queues; instead it
+// walks the global program list and assigns any program that the given
+// client has not yet executed.
+//
+// For a newly joined client, NextIdx starts at 0, so it will re-run all
+// previously generated programs in order.
 func (ds *DistributedRPC) Fetch(args *DistributedFetchArgs, reply *DistributedWireRequest) error {
 	if ds.role != DistributedRoleServer {
 		return errors.New("not a distributed server")
@@ -243,31 +310,31 @@ func (ds *DistributedRPC) Fetch(args *DistributedFetchArgs, reply *DistributedWi
 		return errors.New("missing ClientID")
 	}
 
-	// Generate a new program using the fuzzer generator.
-	// We intentionally do NOT call ds.f.Next() here.
-	req := ds.f.genFuzz()
-	if req == nil || req.Prog == nil {
-		return errors.New("failed to generate program")
-	}
-
-	// Assign an ID for tracking/ack purposes.
-	id := atomic.AddInt64(&ds.nextID, 1)
-
-	*reply = DistributedWireRequest{
-		ProgID:    id,
-		ProgData:  req.Prog.Serialize(),
-		Important: req.Important,
-	}
-
 	ds.mu.Lock()
-	ds.inflight[id] = inflightInfo{ClientID: args.ClientID, SentAt: time.Now()}
-	ds.mu.Unlock()
+	defer ds.mu.Unlock()
 
-	return nil
+	st := (*distributedState)(ds).getOrCreateClientLocked(args.ClientID)
+
+	for {
+		if st.NextIdx < len(ds.programs) {
+			sp := ds.programs[st.NextIdx]
+			st.NextIdx++
+			st.Status[sp.ID] = progStatePending
+
+			*reply = DistributedWireRequest{
+				ProgID:    sp.ID,
+				ProgData:  sp.ProgData,
+				Important: sp.Important,
+			}
+			return nil
+		}
+		// No new programs yet: wait until registerProgFromServer() broadcasts.
+		ds.cond.Wait()
+	}
 }
 
 // Ack is called by clients to acknowledge they executed a program.
-// The server does not use this to drive triage/minimize/corpus; it is purely for confirmation/stats.
+// The server updates per-client state; this is only for bookkeeping/stats.
 func (ds *DistributedRPC) Ack(args *DistributedAckArgs, _ *DistributedAckReply) error {
 	if ds.role != DistributedRoleServer {
 		return errors.New("not a distributed server")
@@ -277,19 +344,17 @@ func (ds *DistributedRPC) Ack(args *DistributedAckArgs, _ *DistributedAckReply) 
 	}
 
 	ds.mu.Lock()
-	_, ok := ds.inflight[args.ProgID]
-	delete(ds.inflight, args.ProgID)
-	ds.mu.Unlock()
+	defer ds.mu.Unlock()
 
-	// Best-effort logging; do not fail the RPC if ProgID is unknown.
-	if !ok {
-		log.Logf(1, "distributed ack: unknown prog id %d from client %s", args.ProgID, args.ClientID)
-		return nil
-	}
+	st := (*distributedState)(ds).getOrCreateClientLocked(args.ClientID)
+
 	if args.OK {
-		log.Logf(3, "distributed ack: prog %d executed by client %s", args.ProgID, args.ClientID)
+		st.Status[args.ProgID] = progStateOK
+		log.Logf(3, "distributed ack: prog %d executed OK by client %s", args.ProgID, args.ClientID)
 	} else {
-		log.Logf(2, "distributed ack: prog %d failed on client %s: %s", args.ProgID, args.ClientID, args.ErrText)
+		st.Status[args.ProgID] = progStateFailed
+		log.Logf(2, "distributed ack: prog %d failed on client %s: %s",
+			args.ProgID, args.ClientID, args.ErrText)
 	}
 	return nil
 }
