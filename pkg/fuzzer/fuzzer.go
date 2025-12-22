@@ -247,22 +247,24 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 }
 
 type Config struct {
-	Debug           bool
-	Corpus          *corpus.Corpus
-	Logf            func(level int, msg string, args ...interface{})
-	Snapshot        bool
-	Coverage        bool
-	FaultInjection  bool
-	Comparisons     bool
-	Collide         bool
-	EnabledCalls    map[*prog.Syscall]bool
-	NoMutateCalls   map[int]bool
-	FetchRawCover   bool
-	NewInputFilter  func(call string) bool
-	PatchTest       bool
-	ModeKFuzzTest   bool
-	DistributedAddr string
-	DistributedID   string
+	Debug                 bool
+	Corpus                *corpus.Corpus
+	Logf                  func(level int, msg string, args ...interface{})
+	Snapshot              bool
+	Coverage              bool
+	FaultInjection        bool
+	Comparisons           bool
+	Collide               bool
+	EnabledCalls          map[*prog.Syscall]bool
+	NoMutateCalls         map[int]bool
+	FetchRawCover         bool
+	NewInputFilter        func(call string) bool
+	PatchTest             bool
+	ModeKFuzzTest         bool
+	DistributedAddr       string
+	DistributedID         string
+	DistributedDumpPeriod time.Duration
+	Workdir               string
 }
 
 func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call int, triage *map[int]*triageCall) {

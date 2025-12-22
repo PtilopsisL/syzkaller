@@ -5,6 +5,7 @@ package mgrconfig
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/google/syzkaller/pkg/asset"
 )
@@ -25,6 +26,9 @@ type Config struct {
 	//   - Client: subsequent instances that connect to the existing server.
 	// Empty means standalone (local generation).
 	DistributedAddr string `json:"distributed_addr,omitempty"`
+	// Optional period for the distributed server to dump client debug logs.
+	// If unset, a reasonable default is used.
+	DistributedDumpPeriod time.Duration `json:"distributed_dump_period,omitempty"`
 	// Location of a working directory for the syz-manager process. Outputs here include:
 	// - <workdir>/crashes/*: crash output files
 	// - <workdir>/corpus.db: corpus with interesting programs

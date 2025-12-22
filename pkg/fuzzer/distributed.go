@@ -1,17 +1,21 @@
 package fuzzer
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
 	"net/rpc"
 	"os"
+	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
 	"github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/prog"
 )
 
@@ -68,6 +72,9 @@ type distributedState struct {
 	nextID   int64
 
 	clients map[string]*clientState
+
+	dumpWorkdir string
+	dumpPeriod  time.Duration
 }
 
 // NOTE: net/rpc requires argument and reply types to be exported (or builtin).
@@ -102,6 +109,8 @@ func (f *Fuzzer) initDistributed(addr, clientID string) error {
 		f:       f,
 		clients: make(map[string]*clientState),
 	}
+	ds.dumpWorkdir = f.Config.Workdir
+	ds.dumpPeriod = f.Config.DistributedDumpPeriod
 	ds.cond = sync.NewCond(&ds.mu)
 
 	// Generate a client ID if not provided.
@@ -127,6 +136,7 @@ func (f *Fuzzer) initDistributed(addr, clientID string) error {
 		go ds.acceptLoop()
 		log.Logf(0, "fuzzer distributed: server listening on %s", addr)
 		f.distributed = ds
+		ds.startClientStateDumpLoop()
 		return nil
 	}
 
@@ -357,4 +367,142 @@ func (ds *DistributedRPC) Ack(args *DistributedAckArgs, _ *DistributedAckReply) 
 			args.ProgID, args.ClientID, args.ErrText)
 	}
 	return nil
+}
+
+const (
+	distributedDumpFilename      = "distributed_clients.tsv"
+	defaultDistributedDumpPeriod = 20 * time.Second
+)
+
+type clientStateSnapshot struct {
+	id      string
+	nextIdx int
+	status  map[int64]progExecState
+}
+
+func (ds *distributedState) startClientStateDumpLoop() {
+	if ds == nil || ds.role != DistributedRoleServer {
+		return
+	}
+	if ds.dumpWorkdir == "" {
+		return
+	}
+	period := ds.dumpPeriod
+	if period == 0 {
+		period = defaultDistributedDumpPeriod
+	}
+	go func() {
+		ticker := time.NewTicker(period)
+		defer ticker.Stop()
+
+		// Dump once on startup.
+		ds.dumpClientStatesToFile()
+
+		for range ticker.C {
+			ds.dumpClientStatesToFile()
+		}
+	}()
+}
+
+func (ds *distributedState) dumpClientStatesToFile() {
+	workdir := ds.dumpWorkdir
+	if workdir == "" {
+		return
+	}
+	outPath := filepath.Join(workdir, distributedDumpFilename)
+	tmpPath := outPath + ".tmp"
+
+	// Snapshot under lock to avoid racing with Fetch/Ack.
+	var snaps []clientStateSnapshot
+	var totalPrograms int
+	ds.mu.Lock()
+	totalPrograms = len(ds.programs)
+	snaps = make([]clientStateSnapshot, 0, len(ds.clients))
+	for id, st := range ds.clients {
+		m := make(map[int64]progExecState, len(st.Status))
+		for pid, s := range st.Status {
+			m[pid] = s
+		}
+		snaps = append(snaps, clientStateSnapshot{
+			id:      id,
+			nextIdx: st.NextIdx,
+			status:  m,
+		})
+	}
+	ds.mu.Unlock()
+
+	sort.Slice(snaps, func(i, j int) bool { return snaps[i].id < snaps[j].id })
+
+	// Build TSV.
+	buf := new(bytes.Buffer)
+	fmt.Fprintf(buf, "# generated_at\t%s\n", time.Now().Format(time.RFC3339Nano))
+	fmt.Fprintf(buf, "# total_programs\t%d\n", totalPrograms)
+	fmt.Fprintf(buf, "# columns are tab-separated (TSV)\n")
+
+	fmt.Fprintf(buf, "\n[clients]\n")
+	fmt.Fprintf(buf, "client_id\tnext_idx\ttotal_programs\tnot_assigned\tpending\tok\tfailed\n")
+	for _, c := range snaps {
+		var pending, ok, failed int
+		for _, st := range c.status {
+			switch st {
+			case progStatePending:
+				pending++
+			case progStateOK:
+				ok++
+			case progStateFailed:
+				failed++
+			}
+		}
+		notAssigned := totalPrograms - c.nextIdx
+		if notAssigned < 0 {
+			notAssigned = 0
+		}
+		fmt.Fprintf(buf, "%s\t%d\t%d\t%d\t%d\t%d\t%d\n",
+			c.id, c.nextIdx, totalPrograms, notAssigned, pending, ok, failed)
+	}
+
+	// Dump the full per-prog state map as a separate table.
+	// This is the actual content of clients[*].Status.
+	fmt.Fprintf(buf, "\n[states]\n")
+	fmt.Fprintf(buf, "client_id\tprog_id\tstate\n")
+	for _, c := range snaps {
+		ids := make([]int64, 0, len(c.status))
+		for pid := range c.status {
+			ids = append(ids, pid)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		for _, pid := range ids {
+			fmt.Fprintf(buf, "%s\t%d\t%s\n", c.id, pid, progExecStateString(c.status[pid]))
+		}
+	}
+
+	// Write to tmp then rename to overwrite old file.
+	if err := os.WriteFile(tmpPath, buf.Bytes(), osutil.DefaultFilePerm); err != nil {
+		log.Logf(0, "distributed dump: write %s failed: %v", tmpPath, err)
+		return
+	}
+	if err := os.Rename(tmpPath, outPath); err != nil {
+		// Best-effort: remove existing and retry.
+		_ = os.Remove(outPath)
+		if err2 := os.Rename(tmpPath, outPath); err2 != nil {
+			log.Logf(0, "distributed dump: rename %s -> %s failed: %v", tmpPath, outPath, err2)
+			_ = os.Remove(tmpPath)
+			return
+		}
+	}
+}
+
+func progExecStateString(st progExecState) string {
+	switch st {
+	case progStateNotSent:
+		return "NOT_SENT"
+	case progStatePending:
+		return "PENDING"
+	case progStateOK:
+		return "OK"
+	case progStateFailed:
+		return "FAILED"
+	default:
+		return "UNKNOWN"
+	}
 }

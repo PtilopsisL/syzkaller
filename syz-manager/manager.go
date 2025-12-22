@@ -1166,16 +1166,18 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 
 		rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 		fuzzerObj := fuzzer.NewFuzzer(context.Background(), &fuzzer.Config{
-			Corpus:          mgr.corpus,
-			Snapshot:        mgr.cfg.Snapshot,
-			Coverage:        mgr.cfg.Cover,
-			DistributedAddr: mgr.cfg.DistributedAddr,
-			FaultInjection:  features&flatrpc.FeatureFault != 0,
-			Comparisons:     features&flatrpc.FeatureComparisons != 0,
-			Collide:         true,
-			EnabledCalls:    enabledSyscalls,
-			NoMutateCalls:   mgr.cfg.NoMutateCalls,
-			FetchRawCover:   mgr.cfg.RawCover,
+			Corpus:                mgr.corpus,
+			Snapshot:              mgr.cfg.Snapshot,
+			Coverage:              mgr.cfg.Cover,
+			DistributedAddr:       mgr.cfg.DistributedAddr,
+			DistributedDumpPeriod: mgr.cfg.DistributedDumpPeriod,
+			FaultInjection:        features&flatrpc.FeatureFault != 0,
+			Comparisons:           features&flatrpc.FeatureComparisons != 0,
+			Collide:               true,
+			EnabledCalls:          enabledSyscalls,
+			NoMutateCalls:         mgr.cfg.NoMutateCalls,
+			FetchRawCover:         mgr.cfg.RawCover,
+			Workdir:               mgr.cfg.Workdir,
 			Logf: func(level int, msg string, args ...interface{}) {
 				if level != 0 {
 					return
