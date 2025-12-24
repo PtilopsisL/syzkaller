@@ -29,13 +29,14 @@ type Fuzzer struct {
 	Config *Config
 	Cover  *Cover
 
-	ctx          context.Context
-	mu           sync.Mutex
-	rnd          *rand.Rand
-	target       *prog.Target
-	hintsLimiter prog.HintsLimiter
-	runningJobs  map[jobIntrospector]struct{}
-	nextProgID   int64
+	ctx           context.Context
+	mu            sync.Mutex
+	rnd           *rand.Rand
+	target        *prog.Target
+	hintsLimiter  prog.HintsLimiter
+	runningJobs   map[jobIntrospector]struct{}
+	nextProgID    int64
+	straceLimiter chan struct{}
 
 	ct           *prog.ChoiceTable
 	ctProgs      int
@@ -67,7 +68,8 @@ func NewFuzzer(ctx context.Context, cfg *Config, rnd *rand.Rand,
 
 		// We're okay to lose some of the messages -- if we are already
 		// regenerating the table, we don't want to repeat it right away.
-		ctRegenerate: make(chan struct{}),
+		ctRegenerate:  make(chan struct{}),
+		straceLimiter: make(chan struct{}, 1),
 	}
 	f.execQueues = newExecQueues(f)
 
@@ -173,6 +175,8 @@ func (fuzzer *Fuzzer) prepare(req *queue.Request, flags ProgFlags, attempt int) 
 
 func (fuzzer *Fuzzer) enqueue(executor queue.Executor, req *queue.Request, flags ProgFlags, attempt int) {
 	fuzzer.prepare(req, flags, attempt)
+
+	fuzzer.maybeStraceProg(executor, req)
 
 	log.Logf(1, "[ENQUEUE] ID(%v): important=%v exec_opts=%+v prog:\n%s\n",
 		req.ProgID, req.Important, req.ExecOpts, req.ProgID, req.Prog.String())
