@@ -248,7 +248,7 @@ func (f *Fuzzer) distributedNextRequest() *queue.Request {
 		}
 
 		// Ensure the request participates in the local fuzzer lifecycle.
-		// This sets ProgID if needed and installs the local processResult callback.
+		// This installs the local processResult callback.
 		f.prepare(req, 0, 0)
 
 		// Best-effort ack to the server (does not affect local processing).

@@ -43,6 +43,21 @@ func (fuzzer *Fuzzer) maybeStraceProg(executor queue.Executor, req *queue.Reques
 	}()
 }
 
+func (fuzzer *Fuzzer) saveProgForStrace(req *queue.Request) {
+	if req == nil || req.Prog == nil || req.ProgID == 0 || fuzzer.Config.Workdir == "" {
+		return
+	}
+	logDir := filepath.Join(fuzzer.Config.Workdir, straceLogDirName)
+	if err := osutil.MkdirAll(logDir); err != nil {
+		fuzzer.Logf(0, "failed to create prog log dir: %v", err)
+		return
+	}
+	progPath := filepath.Join(logDir, fmt.Sprintf("prog-%d.syz", req.ProgID))
+	if err := os.WriteFile(progPath, req.Prog.Serialize(), 0o644); err != nil {
+		fuzzer.Logf(0, "failed to write prog for %d: %v", req.ProgID, err)
+	}
+}
+
 func runProgUnderStrace(executor queue.Executor, workdir string, progID int64, p *prog.Prog,
 	execOpts flatrpc.ExecOpts, release func()) error {
 	logDir := filepath.Join(workdir, straceLogDirName)

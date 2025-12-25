@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/syzkaller/pkg/corpus"
@@ -35,7 +34,6 @@ type Fuzzer struct {
 	target        *prog.Target
 	hintsLimiter  prog.HintsLimiter
 	runningJobs   map[jobIntrospector]struct{}
-	nextProgID    int64
 	straceLimiter chan struct{}
 
 	ct           *prog.ChoiceTable
@@ -64,7 +62,6 @@ func NewFuzzer(ctx context.Context, cfg *Config, rnd *rand.Rand,
 		rnd:         rnd,
 		target:      target,
 		runningJobs: map[jobIntrospector]struct{}{},
-		nextProgID:  0,
 
 		// We're okay to lose some of the messages -- if we are already
 		// regenerating the table, we don't want to repeat it right away.
@@ -164,10 +161,6 @@ func (fuzzer *Fuzzer) executeWithFlags(executor queue.Executor, req *queue.Reque
 }
 
 func (fuzzer *Fuzzer) prepare(req *queue.Request, flags ProgFlags, attempt int) {
-	if req != nil && req.Prog != nil && req.ProgID == 0 {
-		atomic.AddInt64(&fuzzer.nextProgID, 1)
-		req.ProgID = fuzzer.nextProgID
-	}
 	req.OnDone(func(req *queue.Request, res *queue.Result) bool {
 		return fuzzer.processResult(req, res, flags, attempt)
 	})
@@ -355,7 +348,7 @@ func (fuzzer *Fuzzer) genFuzz() *queue.Request {
 		fuzzer.distributed.registerProgFromServer(req)
 	}
 
-	// As before: install processResult callback, set ProgID if still 0, etc.
+	// Install processResult callback.
 	fuzzer.prepare(req, 0, 0)
 	return req
 }
@@ -391,6 +384,7 @@ func (fuzzer *Fuzzer) Next() *queue.Request {
 		// The fuzzer is not supposed to issue nil requests.
 		panic("nil request from the fuzzer")
 	}
+	fuzzer.saveProgForStrace(req)
 	return req
 }
 
