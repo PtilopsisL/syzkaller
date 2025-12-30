@@ -51,6 +51,7 @@ var (
 	flagSandbox    = flag.String("sandbox", "none", "sandbox for fuzzing (none/setuid/namespace/android)")
 	flagSandboxArg = flag.Int("sandbox_arg", 0, "argument for sandbox runner to adjust it via config")
 	flagDebug      = flag.Bool("debug", false, "debug output from executor")
+	flagStrace     = flag.Bool("strace", false, "log syscalls via libsclog in syz-executor")
 	flagSlowdown   = flag.Int("slowdown", 1, "execution slowdown caused by emulation/instrumentation")
 	flagUnsafe     = flag.Bool("unsafe", false, "use unsafe program deserialization mode")
 	flagGlob       = flag.String("glob", "", "run glob expansion request")
@@ -125,6 +126,9 @@ func main() {
 	env := sandbox
 	if *flagDebug {
 		env |= flatrpc.ExecEnvDebug
+	}
+	if *flagStrace {
+		env |= flatrpc.ExecEnvSyscallTrace
 	}
 	cover := *flagSignal || *flagHints || *flagCoverFile != ""
 	if cover {

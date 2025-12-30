@@ -26,6 +26,8 @@
 
 #include "pkg/flatrpc/flatrpc.h"
 
+#include "libsclog/sclog.h"
+
 #if defined(__GNUC__)
 #define SYSCALLAPI
 #define NORETURN __attribute__((noreturn))
@@ -74,6 +76,7 @@ const int kExtraCoverFd = kCoverFd - 1;
 const int kMaxArgs = 9;
 const int kCoverSize = 512 << 10;
 const int kFailStatus = 67;
+const size_t kSctraceBufferSize = 16 << 10;
 
 // Two approaches of dealing with kcov memory.
 const int kCoverOptimizedCount = 8; // the max number of kcov instances
@@ -273,6 +276,7 @@ static bool flag_nic_vf;
 static bool flag_vhci_injection;
 static bool flag_wifi;
 static bool flag_delay_kcov_mmap;
+static bool flag_sctrace = false;
 
 static bool flag_collect_cover;
 static bool flag_collect_signal;
@@ -398,6 +402,11 @@ struct thread_t {
 	bool fault_injected;
 	cover_t cov;
 	bool soft_fail_state;
+	struct {
+		char* data;
+		size_t size;
+		FILE* file;
+	} sctrace;
 };
 
 static thread_t threads[kMaxThreads];
@@ -492,6 +501,8 @@ static flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id,
 static void parse_execute(const execute_req& req);
 static void parse_handshake(const handshake_req& req);
 
+static void setup_sctrace_logs();
+
 static void mmap_input();
 
 #include "syscalls.h"
@@ -578,6 +589,37 @@ static std::optional<CoverFilter> cover_filter;
 static uint64 sandbox_arg = 0;
 #endif
 
+// Initialize per-thread syscall trace logs using libsclog.
+// Each thread gets its own log file named "sctrace.<pid>.<tid>.log".
+void setup_sctrace_logs()
+{
+	if (!flag_sctrace)
+		return;
+
+	// A reasonably small internal buffer is enough; logs are flushed to FILE*.
+	init_sclog(32 << 10);
+	for (int i = 0; i < kMaxThreads; i++) {
+#if GOOS_windows
+		pid_t pid = getpid();
+		char path[128];
+		snprintf(path, sizeof(path), "sctrace.%d.%d.log", (int)pid, i);
+		FILE* f = fopen(path, "w");
+		char* buf = nullptr;
+#else
+		char* buf = (char*)malloc(kSctraceBufferSize);
+		if (!buf)
+			fail("failed to allocate sctrace buffer");
+		FILE* f = fmemopen(buf, kSctraceBufferSize, "w");
+#endif
+		if (!f)
+			fail("failed to open sctrace log file");
+		threads[i].sctrace.data = buf;
+		threads[i].sctrace.size = 0;
+		threads[i].sctrace.file = f;
+		set_log_file(i, f);
+	}
+}
+
 int main(int argc, char** argv)
 {
 	if (argc == 1) {
@@ -639,6 +681,7 @@ int main(int argc, char** argv)
 
 		setup_control_pipes();
 		receive_handshake();
+		setup_sctrace_logs();
 #if !SYZ_EXECUTOR_USES_FORK_SERVER
 		// We receive/reply handshake when fork server is disabled just to simplify runner logic.
 		// It's a bit suboptimal, but no fork server is much slower anyway.
@@ -847,6 +890,7 @@ void parse_handshake(const handshake_req& req)
 	flag_wifi = (bool)(req.flags & rpc::ExecEnv::EnableWifi);
 	flag_delay_kcov_mmap = (bool)(req.flags & rpc::ExecEnv::DelayKcovMmap);
 	flag_nic_vf = (bool)(req.flags & rpc::ExecEnv::EnableNicVF);
+	flag_sctrace = (bool)(req.flags & rpc::ExecEnv::SyscallTrace);
 }
 
 void receive_execute()
@@ -1373,7 +1417,8 @@ void copyout_call_results(thread_t* th)
 	}
 }
 
-void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bool all_signal)
+void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bool all_signal,
+		  const thread_t* th)
 {
 	CoverAccessScope scope(cov);
 	auto& fbb = *output_builder;
@@ -1382,6 +1427,7 @@ void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bo
 	uint32 signal_off = 0;
 	uint32 cover_off = 0;
 	uint32 comps_off = 0;
+	flatbuffers::Offset<flatbuffers::Vector<uint8_t>> sctrace_off;
 	if (flag_comparisons) {
 		comps_off = write_comparisons(fbb, cov);
 	} else {
@@ -1398,6 +1444,11 @@ void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bo
 				cover_off = write_cover<uint32>(fbb, cov);
 		}
 	}
+	if (flag_sctrace && th && th->sctrace.data && th->sctrace.size) {
+		uint8_t* dst = nullptr;
+		sctrace_off = fbb.CreateUninitializedVector(th->sctrace.size, &dst);
+		memcpy(dst, th->sctrace.data, th->sctrace.size);
+	}
 
 	rpc::CallInfoRawBuilder builder(*output_builder);
 	if (cov->overflow)
@@ -1410,6 +1461,8 @@ void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bo
 		builder.add_cover(cover_off);
 	if (comps_off)
 		builder.add_comps(comps_off);
+	if (!sctrace_off.IsNull())
+		builder.add_sctrace(sctrace_off);
 	auto off = builder.Finish();
 	uint32 slot = output_data->completed.load(std::memory_order_relaxed);
 	if (slot >= kMaxCalls)
@@ -1436,7 +1489,7 @@ void write_call_output(thread_t* th, bool finished)
 			flags |= rpc::CallFlag::FaultInjected;
 	}
 	bool all_signal = th->call_index < 64 ? (all_call_signal & (1ull << th->call_index)) : false;
-	write_output(th->call_index, &th->cov, flags, reserrno, all_signal);
+	write_output(th->call_index, &th->cov, flags, reserrno, all_signal, th);
 }
 
 void write_extra_output()
@@ -1446,7 +1499,7 @@ void write_extra_output()
 	cover_collect(&extra_cov);
 	if (!extra_cov.size)
 		return;
-	write_output(-1, &extra_cov, rpc::CallFlag::NONE, 997, all_extra_signal);
+	write_output(-1, &extra_cov, rpc::CallFlag::NONE, 997, all_extra_signal, nullptr);
 	cover_reset(&extra_cov);
 }
 
@@ -1557,6 +1610,28 @@ void execute_call(thread_t* th)
 		th->soft_fail_state = true;
 	}
 
+	// Log syscall entry via libsclog.
+	// For pseudo-syscalls (call->call != nullptr) we still log them, but
+	// without a kernel syscall number.
+	if (flag_sctrace) {
+		if (th->sctrace.file) {
+			rewind(th->sctrace.file);
+			clearerr(th->sctrace.file);
+		}
+		th->sctrace.size = 0;
+		if (!call->call) {
+			log_syscall_with_index(th->id, th->call_index, call->sys_nr,
+			                       th->num_args, th->args, 0, 0, true);
+		} else {
+			log_syscall_printf(th->id, "%d: %s(", th->call_index, call->name);
+			for (int i = 0; i < th->num_args; i++) {
+				log_syscall_printf(th->id, "%s0x%llx",
+				                   (i ? ", " : ""), (unsigned long long)th->args[i]);
+			}
+			log_syscall_printf(th->id, ") ...\n");
+		}
+	}
+
 	if (flag_coverage)
 		cover_reset(&th->cov);
 	// For pseudo-syscalls and user-space functions NONFAILING can abort before assigning to th->res.
@@ -1582,6 +1657,26 @@ void execute_call(thread_t* th)
 	// But let's still return res, errno and coverage from the first execution.
 	for (int i = 0; i < th->call_props.rerun; i++)
 		NONFAILING(execute_syscall(call, th->args));
+	
+	// Log syscall exit via libsclog.
+	if (flag_sctrace) {
+		if (!call->call) {
+			log_syscall_with_index(th->id, th->call_index, call->sys_nr,
+			                       th->num_args, th->args,
+			                       th->res, th->reserrno, false);
+		} else {
+			log_syscall_printf(th->id, "%d: %s() = %lld {%d}\n",
+			                   th->call_index, call->name,
+			                   (long long)th->res, (int)th->reserrno);
+		}
+		if (th->sctrace.file && th->sctrace.data) {
+			if (fflush(th->sctrace.file) == 0) {
+				long size = ftell(th->sctrace.file);
+				if (size > 0)
+					th->sctrace.size = std::min(static_cast<size_t>(size), kSctraceBufferSize);
+			}
+		}
+	}
 
 	debug("#%d [%llums] <- %s=0x%llx",
 	      th->id, current_time_ms() - start_time_ms, call->name, (uint64)th->res);

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -43,6 +44,7 @@ type Runner struct {
 	requests      map[int64]*queue.Request
 	executing     map[int64]bool
 	hanged        map[int64]bool
+	workdir       string
 	lastExec      *LastExecuting
 	updInfo       dispatcher.UpdateInfo
 	resultCh      chan error
@@ -450,6 +452,7 @@ func (runner *Runner) handleExecResult(msg *flatrpc.ExecResult) error {
 			// filtered out.
 			addFallbackSignal(req.Prog, msg.Info)
 		}
+		runner.saveSctraceLogs(req, msg)
 	}
 	status := queue.Success
 	var resErr error
@@ -475,6 +478,38 @@ func (runner *Runner) handleExecResult(msg *flatrpc.ExecResult) error {
 		Err:    resErr,
 	})
 	return nil
+}
+
+func (runner *Runner) saveSctraceLogs(req *queue.Request, msg *flatrpc.ExecResult) {
+	if msg.Info == nil || req == nil {
+		return
+	}
+	dir := "strace-log"
+	if runner.workdir != "" {
+		dir = filepath.Join(runner.workdir, "strace-log")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Logf(0, "failed to create sctrace directory: %v", err)
+		return
+	}
+	var buf bytes.Buffer
+	for _, call := range msg.Info.Calls {
+		if call == nil || len(call.Sctrace) == 0 {
+			continue
+		}
+		buf.Write(call.Sctrace)
+		if call.Sctrace[len(call.Sctrace)-1] != '\n' {
+			buf.WriteByte('\n')
+		}
+	}
+	if buf.Len() == 0 {
+		return
+	}
+	name := fmt.Sprintf("sctrace.prog%d.vm%d.proc%d.req%d.log", req.ProgID, runner.id, msg.Proc, msg.Id)
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		log.Logf(0, "failed to save sctrace log %q: %v", path, err)
+	}
 }
 
 func (runner *Runner) convertCallInfo(call *flatrpc.CallInfo) {

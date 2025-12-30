@@ -264,6 +264,9 @@ func verifyExecResult(res *ExecResultRaw, rawSize int) error {
 		if call.CompsLength() != 0 {
 			size += min(maxSize, call.CompsLength()) * int(unsafe.Sizeof(call.Comps(&tmp, 0)))
 		}
+		if call.SctraceLength() != 0 {
+			size += min(maxSize, call.SctraceLength()) * int(unsafe.Sizeof(call.Sctrace(0)))
+		}
 		return size
 	}
 	size := 0

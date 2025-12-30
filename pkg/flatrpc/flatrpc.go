@@ -333,6 +333,7 @@ const (
 	ExecEnvEnableWifi          ExecEnv = 65536
 	ExecEnvDelayKcovMmap       ExecEnv = 131072
 	ExecEnvEnableNicVF         ExecEnv = 262144
+	ExecEnvSyscallTrace        ExecEnv = 524288
 )
 
 var EnumNamesExecEnv = map[ExecEnv]string{
@@ -355,6 +356,7 @@ var EnumNamesExecEnv = map[ExecEnv]string{
 	ExecEnvEnableWifi:          "EnableWifi",
 	ExecEnvDelayKcovMmap:       "DelayKcovMmap",
 	ExecEnvEnableNicVF:         "EnableNicVF",
+	ExecEnvSyscallTrace:        "SyscallTrace",
 }
 
 var EnumValuesExecEnv = map[string]ExecEnv{
@@ -377,6 +379,7 @@ var EnumValuesExecEnv = map[string]ExecEnv{
 	"EnableWifi":          ExecEnvEnableWifi,
 	"DelayKcovMmap":       ExecEnvDelayKcovMmap,
 	"EnableNicVF":         ExecEnvEnableNicVF,
+	"SyscallTrace":        ExecEnvSyscallTrace,
 }
 
 func (v ExecEnv) String() string {
@@ -2552,11 +2555,12 @@ func ExecutingMessageRawEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 }
 
 type CallInfoRawT struct {
-	Flags  CallFlag          `json:"flags"`
-	Error  int32             `json:"error"`
-	Signal []uint64          `json:"signal"`
-	Cover  []uint64          `json:"cover"`
-	Comps  []*ComparisonRawT `json:"comps"`
+	Flags   CallFlag          `json:"flags"`
+	Error   int32             `json:"error"`
+	Signal  []uint64          `json:"signal"`
+	Cover   []uint64          `json:"cover"`
+	Comps   []*ComparisonRawT `json:"comps"`
+	Sctrace []byte            `json:"sctrace"`
 }
 
 func (t *CallInfoRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
@@ -2590,12 +2594,17 @@ func (t *CallInfoRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 		}
 		compsOffset = builder.EndVector(compsLength)
 	}
+	sctraceOffset := flatbuffers.UOffsetT(0)
+	if t.Sctrace != nil {
+		sctraceOffset = builder.CreateByteString(t.Sctrace)
+	}
 	CallInfoRawStart(builder)
 	CallInfoRawAddFlags(builder, t.Flags)
 	CallInfoRawAddError(builder, t.Error)
 	CallInfoRawAddSignal(builder, signalOffset)
 	CallInfoRawAddCover(builder, coverOffset)
 	CallInfoRawAddComps(builder, compsOffset)
+	CallInfoRawAddSctrace(builder, sctraceOffset)
 	return CallInfoRawEnd(builder)
 }
 
@@ -2619,6 +2628,7 @@ func (rcv *CallInfoRaw) UnPackTo(t *CallInfoRawT) {
 		rcv.Comps(&x, j)
 		t.Comps[j] = x.UnPack()
 	}
+	t.Sctrace = rcv.SctraceBytes()
 }
 
 func (rcv *CallInfoRaw) UnPack() *CallInfoRawT {
@@ -2752,8 +2762,33 @@ func (rcv *CallInfoRaw) CompsLength() int {
 	return 0
 }
 
+func (rcv *CallInfoRaw) Sctrace(j int) byte {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(14))
+	if o != 0 {
+		a := rcv._tab.Vector(o)
+		return rcv._tab.GetByte(a + flatbuffers.UOffsetT(j*1))
+	}
+	return 0
+}
+
+func (rcv *CallInfoRaw) SctraceLength() int {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(14))
+	if o != 0 {
+		return rcv._tab.VectorLen(o)
+	}
+	return 0
+}
+
+func (rcv *CallInfoRaw) SctraceBytes() []byte {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(14))
+	if o != 0 {
+		return rcv._tab.ByteVector(o + rcv._tab.Pos)
+	}
+	return nil
+}
+
 func CallInfoRawStart(builder *flatbuffers.Builder) {
-	builder.StartObject(5)
+	builder.StartObject(6)
 }
 func CallInfoRawAddFlags(builder *flatbuffers.Builder, flags CallFlag) {
 	builder.PrependByteSlot(0, byte(flags), 0)
@@ -2778,6 +2813,12 @@ func CallInfoRawAddComps(builder *flatbuffers.Builder, comps flatbuffers.UOffset
 }
 func CallInfoRawStartCompsVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
 	return builder.StartVector(32, numElems, 8)
+}
+func CallInfoRawAddSctrace(builder *flatbuffers.Builder, sctrace flatbuffers.UOffsetT) {
+	builder.PrependUOffsetTSlot(5, flatbuffers.UOffsetT(sctrace), 0)
+}
+func CallInfoRawStartSctraceVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
+	return builder.StartVector(1, numElems, 1)
 }
 func CallInfoRawEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	return builder.EndObject()

@@ -34,7 +34,6 @@ type Fuzzer struct {
 	target        *prog.Target
 	hintsLimiter  prog.HintsLimiter
 	runningJobs   map[jobIntrospector]struct{}
-	straceLimiter chan struct{}
 
 	ct           *prog.ChoiceTable
 	ctProgs      int
@@ -65,8 +64,7 @@ func NewFuzzer(ctx context.Context, cfg *Config, rnd *rand.Rand,
 
 		// We're okay to lose some of the messages -- if we are already
 		// regenerating the table, we don't want to repeat it right away.
-		ctRegenerate:  make(chan struct{}),
-		straceLimiter: make(chan struct{}, 1),
+		ctRegenerate: make(chan struct{}),
 	}
 	f.execQueues = newExecQueues(f)
 

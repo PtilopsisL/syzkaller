@@ -153,6 +153,7 @@ enum ExecEnv : uint64 (bit_flags) {
 	EnableWifi,		// setup and use mac80211_hwsim for wifi emulation
 	DelayKcovMmap,		// manage kcov memory in an optimized way
 	EnableNicVF,		// setup NIC VF device
+	SyscallTrace,		// log syscalls via strace
 }
 
 enum ExecFlag : uint64 (bit_flags) {
@@ -228,6 +229,8 @@ table CallInfoRaw {
 	cover			:[uint64];
 	// Comparison operands.
 	comps			:[ComparisonRaw];
+	// Syscall trace output from libsclog.
+	sctrace			:[uint8];
 }
 
 struct ComparisonRaw {

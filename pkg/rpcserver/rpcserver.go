@@ -50,6 +50,7 @@ type Config struct {
 	DebugTimeouts bool
 	Procs         int
 	Slowdown      int
+	Workdir       string
 	pcBase        uint64
 	localModules  []*vminfo.KernelModule
 
@@ -184,6 +185,7 @@ func New(cfg *RemoteConfig) (Server, error) {
 		PrintMachineCheck: true,
 		Procs:             cfg.Procs,
 		Slowdown:          cfg.Timeouts.Slowdown,
+		Workdir:           cfg.Workdir,
 		pcBase:            pcBase,
 		localModules:      cfg.LocalModules,
 	}, cfg.Manager), nil
@@ -549,6 +551,7 @@ func (serv *server) CreateInstance(id int, injectExec chan<- bool, updInfo dispa
 		requests:      make(map[int64]*queue.Request),
 		executing:     make(map[int64]bool),
 		hanged:        make(map[int64]bool),
+		workdir:       serv.cfg.Workdir,
 		// Executor may report proc IDs that are larger than serv.cfg.Procs.
 		lastExec: MakeLastExecuting(prog.MaxPids, 6),
 		stats:    serv.runnerStats,
