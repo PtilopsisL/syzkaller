@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -505,11 +507,38 @@ func (runner *Runner) saveSctraceLogs(req *queue.Request, msg *flatrpc.ExecResul
 	if buf.Len() == 0 {
 		return
 	}
-	name := fmt.Sprintf("sctrace.prog%d.vm%d.proc%d.req%d.log", req.ProgID, runner.id, msg.Proc, msg.Id)
+	count := nextSctraceCount(dir, req.ProgID)
+	name := fmt.Sprintf("strace.prog%d.%d.log", req.ProgID, count)
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
 		log.Logf(0, "failed to save sctrace log %q: %v", path, err)
 	}
+}
+
+func nextSctraceCount(dir string, progID int64) int {
+	pattern := filepath.Join(dir, fmt.Sprintf("strace.prog%d.*.log", progID))
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return 1
+	}
+	prefix := fmt.Sprintf("strace.prog%d.", progID)
+	const suffix = ".log"
+	maxCount := 0
+	for _, match := range matches {
+		base := filepath.Base(match)
+		if !strings.HasPrefix(base, prefix) || !strings.HasSuffix(base, suffix) {
+			continue
+		}
+		value := strings.TrimSuffix(strings.TrimPrefix(base, prefix), suffix)
+		count, err := strconv.Atoi(value)
+		if err != nil {
+			continue
+		}
+		if count > maxCount {
+			maxCount = count
+		}
+	}
+	return maxCount + 1
 }
 
 func (runner *Runner) convertCallInfo(call *flatrpc.CallInfo) {
