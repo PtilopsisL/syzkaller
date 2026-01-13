@@ -105,6 +105,7 @@ type execQueues struct {
 	candidateQueue       *queue.PlainQueue
 	triageQueue          *queue.DynamicOrderer
 	smashQueue           *queue.PlainQueue
+	straceQueue          *queue.PlainQueue
 	genSource            *queue.DynamicSourceCtl
 	source               queue.Source
 }
@@ -115,6 +116,7 @@ func newExecQueues(fuzzer *Fuzzer) execQueues {
 		candidateQueue:       queue.Plain(),
 		triageQueue:          queue.DynamicOrder(),
 		smashQueue:           queue.Plain(),
+		straceQueue:          queue.Plain(),
 	}
 	// Alternate smash jobs with exec/fuzz to spread attention to the wider area.
 	skipQueue := 3
@@ -136,6 +138,7 @@ func newExecQueues(fuzzer *Fuzzer) execQueues {
 		ret.candidateQueue,
 		ret.triageQueue,
 		queue.Alternate(ret.smashQueue, skipQueue),
+		ret.straceQueue,
 		ret.genSource,
 	)
 	return ret
@@ -375,13 +378,17 @@ func (fuzzer *Fuzzer) startJob(stat *stat.Val, newJob job) {
 }
 
 func (fuzzer *Fuzzer) Next() *queue.Request {
-	req := fuzzer.source.Next()
-	if req == nil {
-		// The fuzzer is not supposed to issue nil requests.
-		panic("nil request from the fuzzer")
+	for {
+		req := fuzzer.source.Next()
+		if req == nil {
+			// The fuzzer is not supposed to issue nil requests.
+			panic("nil request from the fuzzer")
+		}
+		if fuzzer.maybeStraceProg(req) {
+			continue
+		}
+		return req
 	}
-	fuzzer.maybeStraceProg(fuzzer.smashQueue, req)
-	return req
 }
 
 func (fuzzer *Fuzzer) Logf(level int, msg string, args ...interface{}) {
