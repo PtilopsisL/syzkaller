@@ -46,10 +46,25 @@ func main() {
 		manager.PatchFocusAreas(newCfg, [][]byte{data}, nil, nil)
 	}
 
+	bugs := make(chan *manager.UniqueBug, 16)
 	ctx := vm.ShutdownCtx()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case bug := <-bugs:
+				if bug == nil || bug.Report == nil {
+					continue
+				}
+				log.Logf(0, "patched-only: %s", bug.Report.Title)
+			}
+		}
+	}()
 	err = manager.RunDiffFuzzer(ctx, baseCfg, newCfg, manager.DiffFuzzerConfig{
-		Store: &manager.DiffFuzzerStore{BasePath: newCfg.Workdir},
-		Debug: *flagDebug,
+		Store:       &manager.DiffFuzzerStore{BasePath: newCfg.Workdir},
+		Debug:       *flagDebug,
+		PatchedOnly: bugs,
 	})
 	if err != nil {
 		log.Fatal(err)
