@@ -169,10 +169,6 @@ func (fuzzer *Fuzzer) prepare(req *queue.Request, flags ProgFlags, attempt int) 
 
 func (fuzzer *Fuzzer) enqueue(executor queue.Executor, req *queue.Request, flags ProgFlags, attempt int) {
 	fuzzer.prepare(req, flags, attempt)
-
-	log.Logf(1, "[ENQUEUE] ID(%v): important=%v exec_opts=%+v prog:\n%s\n",
-		req.ProgID, req.Important, req.ExecOpts, req.ProgID, req.Prog.String())
-
 	executor.Submit(req)
 }
 
