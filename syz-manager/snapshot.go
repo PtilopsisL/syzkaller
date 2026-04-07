@@ -43,7 +43,7 @@ func (mgr *Manager) snapshotLoop(ctx context.Context, inst *vm.Instance) error {
 	cmd := fmt.Sprintf("nohup %v exec snapshot 1>/dev/null 2>/dev/kmsg </dev/null &", executor)
 	ctxTimeout, cancel := context.WithTimeout(ctx, time.Hour)
 	defer cancel()
-	if _, _, err := inst.Run(ctxTimeout, mgr.reporter, cmd); err != nil {
+	if _, _, err := inst.Run(ctxTimeout, mgr.runtime.Reporter(), cmd); err != nil {
 		return err
 	}
 
@@ -70,9 +70,9 @@ func (mgr *Manager) snapshotLoop(ctx context.Context, inst *vm.Instance) error {
 			return err
 		}
 
-		if mgr.reporter.ContainsCrash(output) {
+		if mgr.runtime.Reporter().ContainsCrash(output) {
 			res.Status = queue.Crashed
-			rep := mgr.reporter.Parse(output)
+			rep := mgr.runtime.Reporter().Parse(output)
 			buf := new(bytes.Buffer)
 			fmt.Fprintf(buf, "program:\n%s\n", req.Prog.Serialize())
 			buf.Write(rep.Output)

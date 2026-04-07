@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,11 +31,14 @@ import (
 )
 
 type KernelRuntimeOptions struct {
-	Debug         bool
-	HTTP          *HTTPServer
-	Candidates    <-chan []fuzzer.Candidate
-	Source        queue.Source
-	DuplicateInto queue.Executor
+	Debug           bool
+	HTTP            *HTTPServer
+	Candidates      <-chan []fuzzer.Candidate
+	Source          queue.Source
+	DuplicateInto   queue.Executor
+	RPCManager      rpcserver.Manager
+	InstanceHandler func(context.Context, *vm.Instance, dispatcher.UpdateInfo)
+	Stats           rpcserver.Stats
 }
 
 // KernelRuntime encapsulates per-kernel runtime state: RPC server, VM pool/dispatcher,
@@ -49,9 +53,12 @@ type KernelRuntime struct {
 
 	reporter  *report.Reporter
 	fuzzer    atomic.Pointer[fuzzer.Fuzzer]
+	servMu    sync.RWMutex
 	serv      rpcserver.Server
+	listening bool
 	servStats rpcserver.Stats
 	crashes   chan *report.Report
+	vmPool    *vm.Pool
 	pool      *vm.Dispatcher
 	features  flatrpc.Feature
 
@@ -83,8 +90,12 @@ func NewKernelRuntime(name string, cfg *mgrconfig.Config, opts KernelRuntimeOpti
 		candidates:      candidates,
 		duplicateInto:   opts.DuplicateInto,
 		crashes:         make(chan *report.Report, 128),
-		servStats:       rpcserver.NewNamedStats(name),
 		reportGenerator: ReportGeneratorCache(cfg),
+	}
+	if opts.Stats.StatExecs != nil {
+		runtime.servStats = opts.Stats
+	} else {
+		runtime.servStats = rpcserver.NewNamedStats(name)
 	}
 
 	var err error
@@ -93,9 +104,13 @@ func NewKernelRuntime(name string, cfg *mgrconfig.Config, opts KernelRuntimeOpti
 		return nil, fmt.Errorf("failed to create reporter for %q: %w", name, err)
 	}
 
+	rpcManager := opts.RPCManager
+	if rpcManager == nil {
+		rpcManager = runtime
+	}
 	runtime.serv, err = rpcserver.New(&rpcserver.RemoteConfig{
 		Config:  cfg,
-		Manager: runtime,
+		Manager: rpcManager,
 		Stats:   runtime.servStats,
 		Debug:   opts.Debug,
 	})
@@ -103,12 +118,18 @@ func NewKernelRuntime(name string, cfg *mgrconfig.Config, opts KernelRuntimeOpti
 		return nil, fmt.Errorf("failed to create rpc server for %q: %w", name, err)
 	}
 
-	vmPool, err := vm.Create(cfg, opts.Debug)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create vm.Pool for %q: %w", name, err)
+	if !cfg.VMLess {
+		vmPool, err := vm.Create(cfg, opts.Debug)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create vm.Pool for %q: %w", name, err)
+		}
+		runtime.vmPool = vmPool
+		instanceHandler := opts.InstanceHandler
+		if instanceHandler == nil {
+			instanceHandler = runtime.fuzzerInstance
+		}
+		runtime.pool = vm.NewDispatcher(vmPool, instanceHandler)
 	}
-
-	runtime.pool = vm.NewDispatcher(vmPool, runtime.fuzzerInstance)
 	return runtime, nil
 }
 
@@ -124,6 +145,12 @@ func (runtime *KernelRuntime) Pool() *vm.Dispatcher {
 	return runtime.pool
 }
 
+func (runtime *KernelRuntime) Server() rpcserver.Server {
+	runtime.servMu.RLock()
+	defer runtime.servMu.RUnlock()
+	return runtime.serv
+}
+
 func (runtime *KernelRuntime) Reporter() *report.Reporter {
 	return runtime.reporter
 }
@@ -136,6 +163,45 @@ func (runtime *KernelRuntime) Crashes() <-chan *report.Report {
 	return runtime.crashes
 }
 
+func (runtime *KernelRuntime) CloseServer() error {
+	runtime.servMu.Lock()
+	serv := runtime.serv
+	listening := runtime.listening
+	runtime.serv = nil
+	runtime.listening = false
+	runtime.servMu.Unlock()
+	if serv == nil || !listening {
+		return nil
+	}
+	return serv.Close()
+}
+
+func (runtime *KernelRuntime) ListenServer() error {
+	runtime.servMu.Lock()
+	defer runtime.servMu.Unlock()
+	if runtime.serv == nil {
+		return fmt.Errorf("runtime server is not available")
+	}
+	if runtime.listening {
+		return nil
+	}
+	if err := runtime.serv.Listen(); err != nil {
+		return err
+	}
+	runtime.listening = true
+	return nil
+}
+
+func (runtime *KernelRuntime) Close() error {
+	if err := runtime.CloseServer(); err != nil {
+		return err
+	}
+	if runtime.vmPool != nil {
+		return runtime.vmPool.Close()
+	}
+	return nil
+}
+
 func (runtime *KernelRuntime) coverageFiltersSnapshot() CoverageFilters {
 	return runtime.coverFilters
 }
@@ -143,37 +209,43 @@ func (runtime *KernelRuntime) coverageFiltersSnapshot() CoverageFilters {
 func (runtime *KernelRuntime) Loop(baseCtx context.Context) error {
 	defer log.Logf(1, "%s: kernel runtime loop terminated", runtime.name)
 
-	if err := runtime.serv.Listen(); err != nil {
+	serv := runtime.Server()
+	if serv == nil {
+		return fmt.Errorf("runtime server is not available")
+	}
+	if err := runtime.ListenServer(); err != nil {
 		return fmt.Errorf("failed to start rpc server: %w", err)
 	}
 	eg, ctx := errgroup.WithContext(baseCtx)
 	runtime.ctx = ctx
 	eg.Go(func() error {
 		defer log.Logf(1, "%s: rpc server terminaled", runtime.name)
-		return runtime.serv.Serve(ctx)
+		return serv.Serve(ctx)
 	})
-	eg.Go(func() error {
-		defer log.Logf(1, "%s: pool terminated", runtime.name)
-		runtime.pool.Loop(ctx)
-		return nil
-	})
-	eg.Go(func() error {
-		for {
-			select {
-			case <-ctx.Done():
-				return nil
-			case err := <-runtime.pool.BootErrors:
-				title := "unknown"
-				var bootErr vm.BootErrorer
-				if errors.As(err, &bootErr) {
-					title, _ = bootErr.BootError()
+	if runtime.pool != nil {
+		eg.Go(func() error {
+			defer log.Logf(1, "%s: pool terminated", runtime.name)
+			runtime.pool.Loop(ctx)
+			return nil
+		})
+		eg.Go(func() error {
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case err := <-runtime.pool.BootErrors:
+					title := "unknown"
+					var bootErr vm.BootErrorer
+					if errors.As(err, &bootErr) {
+						title, _ = bootErr.BootError()
+					}
+					// Boot errors are not useful for patch fuzzing (at least yet).
+					// Fetch them to not block the channel and print them to the logs.
+					log.Logf(0, "%s: boot error: %s", runtime.name, title)
 				}
-				// Boot errors are not useful for patch fuzzing (at least yet).
-				// Fetch them to not block the channel and print them to the logs.
-				log.Logf(0, "%s: boot error: %s", runtime.name, title)
 			}
-		}
-	})
+		})
+	}
 	return eg.Wait()
 }
 
@@ -299,11 +371,15 @@ func (runtime *KernelRuntime) CoverageFilter(modules []*vminfo.KernelModule) ([]
 }
 
 func (runtime *KernelRuntime) fuzzerInstance(ctx context.Context, inst *vm.Instance, updInfo dispatcher.UpdateInfo) {
+	serv := runtime.Server()
+	if serv == nil {
+		return
+	}
 	index := inst.Index()
 	injectExec := make(chan bool, 10)
-	runtime.serv.CreateInstance(index, injectExec, updInfo)
+	serv.CreateInstance(index, injectExec, updInfo)
 	rep, err := runtime.runInstance(ctx, inst, injectExec)
-	lastExec, _ := runtime.serv.ShutdownInstance(index, rep != nil)
+	lastExec, _ := serv.ShutdownInstance(index, rep != nil)
 	if rep != nil {
 		rpcserver.PrependExecuting(rep, lastExec)
 		select {
@@ -318,7 +394,11 @@ func (runtime *KernelRuntime) fuzzerInstance(ctx context.Context, inst *vm.Insta
 
 func (runtime *KernelRuntime) runInstance(ctx context.Context, inst *vm.Instance,
 	injectExec <-chan bool) (*report.Report, error) {
-	fwdAddr, err := inst.Forward(runtime.serv.Port())
+	serv := runtime.Server()
+	if serv == nil {
+		return nil, fmt.Errorf("runtime server is not available")
+	}
+	fwdAddr, err := inst.Forward(serv.Port())
 	if err != nil {
 		return nil, fmt.Errorf("failed to setup port forwarding: %w", err)
 	}
@@ -333,14 +413,14 @@ func (runtime *KernelRuntime) runInstance(ctx context.Context, inst *vm.Instance
 	cmd := fmt.Sprintf("%v runner %v %v %v", executorBin, inst.Index(), host, port)
 	ctxTimeout, cancel := context.WithTimeout(ctx, runtime.cfg.Timeouts.VMRunningTime)
 	defer cancel()
-	_, reps, err := inst.Run(ctxTimeout, runtime.reporter, cmd,
+	_, reps, err := inst.Run(ctxTimeout, runtime.Reporter(), cmd,
 		vm.WithExitCondition(vm.ExitTimeout),
 		vm.WithInjectExecuting(injectExec),
 		vm.WithEarlyFinishCb(func() {
 			// Depending on the crash type and kernel config, fuzzing may continue
 			// running for several seconds even after kernel has printed a crash report.
 			// This litters the log and we want to prevent it.
-			runtime.serv.StopFuzzing(inst.Index())
+			serv.StopFuzzing(inst.Index())
 		}),
 	)
 	if len(reps) > 0 {

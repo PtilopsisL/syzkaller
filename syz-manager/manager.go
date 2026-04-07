@@ -62,13 +62,10 @@ var (
 type Manager struct {
 	cfg             *mgrconfig.Config
 	mode            *Mode
-	vmPool          *vm.Pool
-	pool            *vm.Dispatcher
+	runtime         *manager.KernelRuntime
 	target          *prog.Target
 	sysTarget       *targets.Target
-	reporter        *report.Reporter
 	crashStore      *manager.CrashStore
-	serv            rpcserver.Server
 	http            *manager.HTTPServer
 	servStats       rpcserver.Stats
 	corpus          *corpus.Corpus
@@ -255,31 +252,14 @@ func main() {
 }
 
 func RunManager(mode *Mode, cfg *mgrconfig.Config) {
-	var vmPool *vm.Pool
-	if !cfg.VMLess {
-		var err error
-		vmPool, err = vm.Create(cfg, *flagDebug)
-		if err != nil {
-			log.Fatalf("%v", err)
-		}
-		defer vmPool.Close()
-	}
-
 	osutil.MkdirAll(cfg.Workdir)
-
-	reporter, err := report.NewReporter(cfg)
-	if err != nil {
-		log.Fatalf("%v", err)
-	}
 
 	mgr := &Manager{
 		cfg:                cfg,
 		mode:               mode,
-		vmPool:             vmPool,
 		corpusPreload:      make(chan []fuzzer.Candidate),
 		target:             cfg.Target,
 		sysTarget:          cfg.SysTarget,
-		reporter:           reporter,
 		crashStore:         manager.NewCrashStore(cfg),
 		crashTypes:         make(map[string]bool),
 		disabledHashes:     make(map[string]struct{}),
@@ -294,6 +274,11 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 	if *flagDebug {
 		mgr.cfg.Procs = 1
 	}
+	if err := mgr.initRuntime(*flagDebug); err != nil {
+		log.Fatalf("failed to create runtime: %v", err)
+	}
+	defer mgr.runtime.Close()
+
 	mgr.http = &manager.HTTPServer{
 		// Note that if cfg.HTTP == "", we don't start the server.
 		Cfg:        cfg,
@@ -309,29 +294,20 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 	}
 
 	// Create RPC server for fuzzers.
-	mgr.servStats = rpcserver.NewStats()
-	rpcCfg := &rpcserver.RemoteConfig{
-		Config:  mgr.cfg,
-		Manager: mgr,
-		Stats:   mgr.servStats,
-		Debug:   *flagDebug,
-	}
-	mgr.serv, err = rpcserver.New(rpcCfg)
-	if err != nil {
-		log.Fatalf("failed to create rpc server: %v", err)
-	}
-	if err := mgr.serv.Listen(); err != nil {
+	serv := mgr.runtime.Server()
+	if err := mgr.runtime.ListenServer(); err != nil {
 		log.Fatalf("failed to start rpc server: %v", err)
 	}
 	ctx := vm.ShutdownCtx()
 	go func() {
-		err := mgr.serv.Serve(ctx)
+		err := serv.Serve(ctx)
 		if err != nil {
 			log.Fatalf("%s", err)
 		}
 	}()
-	log.Logf(0, "serving rpc on tcp://%v", mgr.serv.Port())
+	log.Logf(0, "serving rpc on tcp://%v", serv.Port())
 
+	var err error
 	if cfg.DashboardAddr != "" {
 		opts := []dashapi.DashboardOpts{}
 		if cfg.DashboardUserAgent != "" {
@@ -362,19 +338,18 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 	if mgr.mode != ModeSmokeTest {
 		osutil.HandleInterrupts(vm.Shutdown)
 	}
-	if mgr.vmPool == nil {
+	if mgr.runtime.Pool() == nil {
 		log.Logf(0, "no VMs started (type=none)")
 		log.Logf(0, "you are supposed to start syz-executor manually as:")
-		log.Logf(0, "syz-executor runner local manager.ip %v", mgr.serv.Port())
+		log.Logf(0, "syz-executor runner local manager.ip %v", mgr.runtime.Server().Port())
 		<-vm.Shutdown
 		return
 	}
-	mgr.pool = vm.NewDispatcher(mgr.vmPool, mgr.fuzzerInstance)
-	mgr.http.Pool = mgr.pool
-	reproVMs := max(0, mgr.vmPool.Count()-mgr.cfg.FuzzingVMs)
+	mgr.http.Pool = mgr.runtime.Pool()
+	reproVMs := max(0, mgr.runtime.Pool().Total()-mgr.cfg.FuzzingVMs)
 	mgr.reproLoop = manager.NewReproLoop(mgr, reproVMs, mgr.cfg.DashboardOnlyRepro)
 	mgr.http.ReproLoop = mgr.reproLoop
-	mgr.http.TogglePause = mgr.pool.TogglePause
+	mgr.http.TogglePause = mgr.runtime.Pool().TogglePause
 
 	if mgr.cfg.HTTP != "" {
 		go func() {
@@ -386,7 +361,22 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 	}
 	go mgr.trackUsedFiles()
 	go mgr.processFuzzingResults(ctx)
-	mgr.pool.Loop(ctx)
+	mgr.runtime.Pool().Loop(ctx)
+}
+
+func (mgr *Manager) initRuntime(debug bool) error {
+	mgr.servStats = rpcserver.NewStats()
+	runtime, err := manager.NewKernelRuntime("main", mgr.cfg, manager.KernelRuntimeOptions{
+		Debug:           debug,
+		RPCManager:      mgr,
+		InstanceHandler: mgr.fuzzerInstance,
+		Stats:           mgr.servStats,
+	})
+	if err != nil {
+		return err
+	}
+	mgr.runtime = runtime
+	return nil
 }
 
 // Exit successfully in special operation modes.
@@ -448,6 +438,10 @@ func (mgr *Manager) writeBench() {
 }
 
 func (mgr *Manager) processFuzzingResults(ctx context.Context) {
+	var bootErrors <-chan error
+	if pool := mgr.runtime.Pool(); pool != nil {
+		bootErrors = pool.BootErrors
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -457,7 +451,7 @@ func (mgr *Manager) processFuzzingResults(ctx context.Context) {
 			if mgr.cfg.Reproduce && needRepro {
 				mgr.reproLoop.Enqueue(crash)
 			}
-		case err := <-mgr.pool.BootErrors:
+		case err := <-bootErrors:
 			crash := mgr.convertBootError(err)
 			if crash != nil {
 				mgr.saveCrash(crash)
@@ -474,10 +468,10 @@ func (mgr *Manager) convertBootError(err error) *manager.Crash {
 	var bootErr vm.BootErrorer
 	if errors.As(err, &bootErr) {
 		title, output := bootErr.BootError()
-		rep := mgr.reporter.Parse(output)
+		rep := mgr.runtime.Reporter().Parse(output)
 		if rep != nil && rep.Type == crash_pkg.UnexpectedReboot {
 			// Avoid detecting any boot crash as "unexpected kernel reboot".
-			rep = mgr.reporter.ParseFrom(output, rep.SkipPos)
+			rep = mgr.runtime.Reporter().ParseFrom(output, rep.SkipPos)
 		}
 		if rep == nil {
 			rep = &report.Report{
@@ -518,8 +512,8 @@ func (mgr *Manager) RunRepro(ctx context.Context, crash *manager.Crash) *manager
 	res, stats, err := repro.Run(ctx, crash.Output, repro.Environment{
 		Config:   mgr.cfg,
 		Features: mgr.enabledFeatures,
-		Reporter: mgr.reporter,
-		Pool:     mgr.pool,
+		Reporter: mgr.runtime.Reporter(),
+		Pool:     mgr.runtime.Pool(),
 	})
 	ret := &manager.ReproResult{
 		Crash: crash,
@@ -530,7 +524,7 @@ func (mgr *Manager) RunRepro(ctx context.Context, crash *manager.Crash) *manager
 	if err == nil && res != nil && mgr.cfg.StraceBin != "" {
 		const straceAttempts = 2
 		for i := 1; i <= straceAttempts; i++ {
-			strace := repro.RunStrace(res, mgr.cfg, mgr.reporter, mgr.pool)
+			strace := repro.RunStrace(res, mgr.cfg, mgr.runtime.Reporter(), mgr.runtime.Pool())
 			sameBug := strace.IsSameBug(res)
 			log.Logf(0, "strace run attempt %d/%d for '%s': same bug %v, error %v",
 				i, straceAttempts, res.Report.Title, sameBug, strace.Error)
@@ -597,9 +591,7 @@ func (mgr *Manager) loadCorpus(enabledSyscalls map[*prog.Syscall]bool) []fuzzer.
 }
 
 func (mgr *Manager) fuzzerInstance(ctx context.Context, inst *vm.Instance, updInfo dispatcher.UpdateInfo) {
-	mgr.mu.Lock()
-	serv := mgr.serv
-	mgr.mu.Unlock()
+	serv := mgr.runtime.Server()
 	if serv == nil {
 		// We're in the process of switching off the RPCServer.
 		return
@@ -646,7 +638,11 @@ func (mgr *Manager) fuzzerInstance(ctx context.Context, inst *vm.Instance, updIn
 
 func (mgr *Manager) runInstanceInner(ctx context.Context, inst *vm.Instance, opts ...func(*vm.RunOptions),
 ) ([]*report.Report, []byte, error) {
-	fwdAddr, err := inst.Forward(mgr.serv.Port())
+	serv := mgr.runtime.Server()
+	if serv == nil {
+		return nil, nil, fmt.Errorf("runtime server is not available")
+	}
+	fwdAddr, err := inst.Forward(serv.Port())
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to setup port forwarding: %w", err)
 	}
@@ -671,7 +667,7 @@ func (mgr *Manager) runInstanceInner(ctx context.Context, inst *vm.Instance, opt
 	cmd := fmt.Sprintf("%v runner %v %v %v", executorBin, inst.Index(), host, port)
 	ctxTimeout, cancel := context.WithTimeout(ctx, mgr.cfg.Timeouts.VMRunningTime)
 	defer cancel()
-	_, reps, err := inst.Run(ctxTimeout, mgr.reporter, cmd, opts...)
+	_, reps, err := inst.Run(ctxTimeout, mgr.runtime.Reporter(), cmd, opts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to run fuzzer: %w", err)
 	}
@@ -703,7 +699,7 @@ func (mgr *Manager) emailCrash(crash *manager.Crash) {
 }
 
 func (mgr *Manager) saveCrash(crash *manager.Crash) bool {
-	if err := mgr.reporter.Symbolize(crash.Report); err != nil {
+	if err := mgr.runtime.Reporter().Symbolize(crash.Report); err != nil {
 		log.Errorf("failed to symbolize report: %v", err)
 	}
 	if crash.Type == crash_pkg.MemoryLeak {
@@ -939,7 +935,7 @@ func (mgr *Manager) saveRepro(res *manager.ReproResult) {
 }
 
 func (mgr *Manager) ResizeReproPool(size int) {
-	mgr.pool.ReserveForRun(size)
+	mgr.runtime.Pool().ReserveForRun(size)
 }
 
 func (mgr *Manager) uploadReproAssets(repro *repro.Result) []dashapi.NewAsset {
@@ -1207,13 +1203,7 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 		source := queue.DefaultOpts(fuzzerObj, opts)
 		if mgr.cfg.Snapshot {
 			log.Logf(0, "restarting VMs for snapshot mode")
-			mgr.snapshotSource = queue.Distribute(source)
-			mgr.pool.SetDefault(mgr.snapshotInstance)
-			mgr.serv.Close()
-			mgr.serv = nil
-			return queue.Callback(func() *queue.Request {
-				return nil
-			}), nil
+			return mgr.switchToSnapshot(source), nil
 		}
 		return source, nil
 	case ModeCorpusRun:
@@ -1303,6 +1293,17 @@ func (mgr *Manager) MaxSignal() signal.Signal {
 	return nil
 }
 
+func (mgr *Manager) switchToSnapshot(source queue.Source) queue.Source {
+	mgr.snapshotSource = queue.Distribute(source)
+	mgr.runtime.Pool().SetDefault(mgr.snapshotInstance)
+	if err := mgr.runtime.CloseServer(); err != nil {
+		log.Errorf("failed to close rpc server for snapshot mode: %v", err)
+	}
+	return queue.Callback(func() *queue.Request {
+		return nil
+	})
+}
+
 func (mgr *Manager) fuzzerLoop(fuzzer *fuzzer.Fuzzer) {
 	for ; ; time.Sleep(time.Second / 2) {
 		if mgr.cfg.Cover && !mgr.cfg.Snapshot {
@@ -1312,7 +1313,9 @@ func (mgr *Manager) fuzzerLoop(fuzzer *fuzzer.Fuzzer) {
 				log.Logf(3, "distributing %d new signal", len(newSignal))
 			}
 			if len(newSignal) != 0 {
-				mgr.serv.DistributeSignalDelta(newSignal)
+				if serv := mgr.runtime.Server(); serv != nil {
+					serv.DistributeSignalDelta(newSignal)
+				}
 			}
 		}
 
@@ -1325,7 +1328,9 @@ func (mgr *Manager) fuzzerLoop(fuzzer *fuzzer.Fuzzer) {
 			switch mgr.phase {
 			case phaseLoadedCorpus:
 				if !mgr.cfg.Snapshot {
-					mgr.serv.TriagedCorpus()
+					if serv := mgr.runtime.Server(); serv != nil {
+						serv.TriagedCorpus()
+					}
 				}
 				if mgr.cfg.HubClient != "" {
 					mgr.setPhaseLocked(phaseTriagedCorpus)

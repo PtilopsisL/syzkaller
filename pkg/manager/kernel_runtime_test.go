@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	mathrand "math/rand"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +18,8 @@ import (
 	"github.com/google/syzkaller/pkg/report"
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
+	"github.com/google/syzkaller/vm"
+	"github.com/google/syzkaller/vm/dispatcher"
 	"github.com/google/syzkaller/vm/vmimpl"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -47,6 +50,27 @@ func TestNewKernelRuntimeWrapsVMPoolError(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorContains(t, err, `failed to create vm.Pool for "broken"`)
 	assert.ErrorContains(t, err, "unknown instance type")
+}
+
+func TestNewKernelRuntimeVMLess(t *testing.T) {
+	cfg := testKernelRuntimeConfig(t, "none")
+	cfg.Derived.VMLess = true
+
+	runtime, err := NewKernelRuntime("vmless", cfg, KernelRuntimeOptions{})
+	require.NoError(t, err)
+	assert.NotNil(t, runtime.Server())
+	assert.Nil(t, runtime.Pool())
+}
+
+func TestNewKernelRuntimeUsesCustomInstanceHandler(t *testing.T) {
+	cfg := testKernelRuntimeConfig(t, testKernelRuntimeVM)
+	handler := func(context.Context, *vm.Instance, dispatcher.UpdateInfo) {}
+
+	runtime, err := NewKernelRuntime("custom-handler", cfg, KernelRuntimeOptions{
+		InstanceHandler: handler,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, reflect.ValueOf(handler).Pointer(), dispatcherDefaultJobPtr(t, runtime.Pool()))
 }
 
 func TestKernelRuntimeMachineCheckedUsesProvidedSource(t *testing.T) {
@@ -158,6 +182,13 @@ func testKernelRuntimeSyscalls(target *prog.Target) map[*prog.Syscall]bool {
 
 func testKernelRuntimeProg(target *prog.Target) *prog.Prog {
 	return target.Generate(mathrand.NewSource(0), 1, target.DefaultChoiceTable())
+}
+
+func dispatcherDefaultJobPtr(t *testing.T, pool *vm.Dispatcher) uintptr {
+	t.Helper()
+	field := reflect.ValueOf(pool).Elem().FieldByName("defaultJob")
+	require.True(t, field.IsValid())
+	return field.Pointer()
 }
 
 type singleSource struct {
