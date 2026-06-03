@@ -194,7 +194,7 @@ func (r *Result) clone() *Result {
 
 func (r *Result) Stop() bool {
 	switch r.Status {
-	case Success, Restarted:
+	case Success, Restarted, Unsupported:
 		return false
 	case ExecFailure, Crashed, Hanged:
 		return true
@@ -221,6 +221,7 @@ const (
 	Crashed            // The VM crashed holding the request.
 	Restarted          // The VM was restarted holding the request.
 	Hanged             // The program has hanged (can't be killed/waited).
+	Unsupported        // The program is not executable in the current environment.
 )
 
 // Executor describes the interface wanted by the producers of requests.

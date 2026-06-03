@@ -26,6 +26,7 @@ type ReproResult struct {
 
 type Crash struct {
 	InstanceIndex int
+	Runtime       string
 	FromHub       bool // this crash was created based on a repro from syz-hub
 	FromDashboard bool // .. or from dashboard
 	Manual        bool

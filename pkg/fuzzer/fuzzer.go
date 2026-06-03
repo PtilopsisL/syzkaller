@@ -28,12 +28,12 @@ type Fuzzer struct {
 	Config *Config
 	Cover  *Cover
 
-	ctx           context.Context
-	mu            sync.Mutex
-	rnd           *rand.Rand
-	target        *prog.Target
-	hintsLimiter  prog.HintsLimiter
-	runningJobs   map[jobIntrospector]struct{}
+	ctx          context.Context
+	mu           sync.Mutex
+	rnd          *rand.Rand
+	target       *prog.Target
+	hintsLimiter prog.HintsLimiter
+	runningJobs  map[jobIntrospector]struct{}
 
 	ct           *prog.ChoiceTable
 	ctProgs      int
@@ -242,6 +242,7 @@ type Config struct {
 	Debug                 bool
 	Corpus                *corpus.Corpus
 	Logf                  func(level int, msg string, args ...interface{})
+	GeneratedProgram      func(*queue.Request)
 	Snapshot              bool
 	Coverage              bool
 	FaultInjection        bool
@@ -341,6 +342,9 @@ func (fuzzer *Fuzzer) genFuzz() *queue.Request {
 	if fuzzer.distributed != nil && fuzzer.distributed.role == DistributedRoleServer &&
 		req != nil && req.Prog != nil {
 		fuzzer.distributed.registerProgFromServer(req)
+	}
+	if fuzzer.Config.GeneratedProgram != nil && req != nil && req.Prog != nil {
+		fuzzer.Config.GeneratedProgram(req)
 	}
 
 	// Install processResult callback.

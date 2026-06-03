@@ -79,3 +79,8 @@ func TestTee(t *testing.T) {
 	assert.Empty(t, copy.ReturnOutput)
 	assert.Empty(t, copy.Important)
 }
+
+func TestUnsupportedDoesNotStop(t *testing.T) {
+	res := &Result{Status: Unsupported}
+	assert.False(t, res.Stop())
+}

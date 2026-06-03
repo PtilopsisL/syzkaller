@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	_ "net/http/pprof"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -52,8 +53,10 @@ type HTTPServer struct {
 	Cfg         *mgrconfig.Config
 	StartTime   time.Time
 	CrashStore  *CrashStore
+	CrashStores map[string]*CrashStore
 	DiffStore   *DiffFuzzerStore
 	ReproLoop   *ReproLoop
+	ReproLoops  map[string]*ReproLoop
 	Pool        *vm.Dispatcher
 	Pools       map[string]*vm.Dispatcher
 	TogglePause func(paused bool)
@@ -107,7 +110,7 @@ func (serv *HTTPServer) Serve(ctx context.Context) error {
 	handle("/vm", serv.httpVM)
 	handle("/vms", serv.httpVMs)
 	// keep-sorted end
-	if serv.CrashStore != nil {
+	if len(serv.crashStores()) != 0 {
 		handle("/crash", serv.httpCrash)
 		handle("/report", serv.httpReport)
 	}
@@ -128,6 +131,54 @@ func (serv *HTTPServer) Serve(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func (serv *HTTPServer) crashStores() map[string]*CrashStore {
+	if len(serv.CrashStores) != 0 {
+		return serv.CrashStores
+	}
+	if serv.CrashStore == nil {
+		return nil
+	}
+	return map[string]*CrashStore{"": serv.CrashStore}
+}
+
+func (serv *HTTPServer) crashStore(name string) *CrashStore {
+	stores := serv.crashStores()
+	if len(stores) == 0 {
+		return nil
+	}
+	if store, ok := stores[name]; ok {
+		return store
+	}
+	if name == "" && len(stores) == 1 {
+		for _, store := range stores {
+			return store
+		}
+	}
+	return nil
+}
+
+func (serv *HTTPServer) reproLoops() map[string]*ReproLoop {
+	if len(serv.ReproLoops) != 0 {
+		return serv.ReproLoops
+	}
+	if serv.ReproLoop == nil {
+		return nil
+	}
+	return map[string]*ReproLoop{"": serv.ReproLoop}
+}
+
+func (serv *HTTPServer) reproducing() map[string]map[string]bool {
+	loops := serv.reproLoops()
+	if len(loops) == 0 {
+		return nil
+	}
+	ret := make(map[string]map[string]bool, len(loops))
+	for name, loop := range loops {
+		ret[name] = loop.Reproducing()
+	}
+	return ret
 }
 
 func (serv *HTTPServer) httpAction(w http.ResponseWriter, r *http.Request) {
@@ -163,9 +214,9 @@ func (serv *HTTPServer) httpMain(w http.ResponseWriter, r *http.Request) {
 			Link:  stat.Link,
 		})
 	}
-	if serv.CrashStore != nil {
+	if len(serv.crashStores()) != 0 {
 		var err error
-		if data.Crashes, err = serv.collectCrashes(serv.Cfg.Workdir); err != nil {
+		if data.Crashes, err = serv.collectCrashes(); err != nil {
 			http.Error(w, fmt.Sprintf("failed to collect crashes: %v", err), http.StatusInternalServerError)
 			return
 		}
@@ -275,8 +326,8 @@ func (serv *HTTPServer) httpStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (serv *HTTPServer) httpVMs(w http.ResponseWriter, r *http.Request) {
-	pool := serv.Pools[r.FormValue("pool")]
-	if pool == nil {
+	pools := serv.vmPools(r.FormValue("pool"))
+	if len(pools) == 0 {
 		http.Error(w, "no such VM pool is known (yet)", http.StatusInternalServerError)
 		return
 	}
@@ -285,39 +336,45 @@ func (serv *HTTPServer) httpVMs(w http.ResponseWriter, r *http.Request) {
 	}
 	// TODO: we could also query vmLoop for VMs that are idle (waiting to start reproducing),
 	// and query the exact bug that is being reproduced by a VM.
-	for id, state := range pool.State() {
-		name := fmt.Sprintf("#%d", id)
-		info := UIVMInfo{
-			Name:  name,
-			State: "unknown",
-			Since: time.Since(state.LastUpdate),
+	showPool := len(pools) > 1
+	for _, item := range pools {
+		for id, state := range item.pool.State() {
+			name := fmt.Sprintf("#%d", id)
+			if showPool {
+				name = fmt.Sprintf("%s/%s", item.name, name)
+			}
+			info := UIVMInfo{
+				Name:  name,
+				State: "unknown",
+				Since: time.Since(state.LastUpdate),
+			}
+			switch state.State {
+			case dispatcher.StateOffline:
+				info.State = "offline"
+			case dispatcher.StateBooting:
+				info.State = "booting"
+			case dispatcher.StateWaiting:
+				info.State = "waiting"
+			case dispatcher.StateRunning:
+				info.State = "running: " + state.Status
+			}
+			if state.Reserved {
+				info.State = "[reserved] " + info.State
+			}
+			if state.MachineInfo != nil {
+				info.MachineInfo = vmInfoLink("machine-info", item.name, id)
+			}
+			if state.DetailedStatus != nil {
+				info.DetailedStatus = vmInfoLink("detailed-status", item.name, id)
+			}
+			data.VMs = append(data.VMs, info)
 		}
-		switch state.State {
-		case dispatcher.StateOffline:
-			info.State = "offline"
-		case dispatcher.StateBooting:
-			info.State = "booting"
-		case dispatcher.StateWaiting:
-			info.State = "waiting"
-		case dispatcher.StateRunning:
-			info.State = "running: " + state.Status
-		}
-		if state.Reserved {
-			info.State = "[reserved] " + info.State
-		}
-		if state.MachineInfo != nil {
-			info.MachineInfo = fmt.Sprintf("/vm?type=machine-info&id=%d", id)
-		}
-		if state.DetailedStatus != nil {
-			info.DetailedStatus = fmt.Sprintf("/vm?type=detailed-status&id=%v", id)
-		}
-		data.VMs = append(data.VMs, info)
 	}
 	executeTemplate(w, vmsTemplate, data)
 }
 
 func (serv *HTTPServer) httpVM(w http.ResponseWriter, r *http.Request) {
-	pool := serv.Pools[r.FormValue("pool")]
+	pool := serv.vmPool(r.FormValue("pool"))
 	if pool == nil {
 		http.Error(w, "no such VM pool is known (yet)", http.StatusInternalServerError)
 		return
@@ -343,6 +400,52 @@ func (serv *HTTPServer) httpVM(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.Write([]byte("unknown info type"))
 	}
+}
+
+type namedVMPool struct {
+	name string
+	pool *vm.Dispatcher
+}
+
+func (serv *HTTPServer) vmPools(name string) []namedVMPool {
+	if pool := serv.Pools[name]; pool != nil {
+		return []namedVMPool{{name: name, pool: pool}}
+	}
+	if name != "" {
+		return nil
+	}
+	names := make([]string, 0, len(serv.Pools))
+	for name := range serv.Pools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	ret := make([]namedVMPool, 0, len(names))
+	for _, name := range names {
+		ret = append(ret, namedVMPool{name: name, pool: serv.Pools[name]})
+	}
+	return ret
+}
+
+func (serv *HTTPServer) vmPool(name string) *vm.Dispatcher {
+	if pool := serv.Pools[name]; pool != nil {
+		return pool
+	}
+	if name == "" && len(serv.Pools) == 1 {
+		for _, pool := range serv.Pools {
+			return pool
+		}
+	}
+	return nil
+}
+
+func vmInfoLink(infoType, pool string, id int) string {
+	values := url.Values{}
+	values.Set("id", strconv.Itoa(id))
+	if pool != "" {
+		values.Set("pool", pool)
+	}
+	values.Set("type", infoType)
+	return "/vm?" + values.Encode()
 }
 
 func makeUICrashType(info *BugInfo, startTime time.Time, repros map[string]bool) UICrashType {
@@ -393,7 +496,12 @@ func (serv *HTTPServer) httpCrash(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid crash ID", http.StatusBadRequest)
 		return
 	}
-	info, err := serv.CrashStore.BugInfo(crashID, true)
+	store := serv.crashStore(r.FormValue("runtime"))
+	if store == nil {
+		http.Error(w, "unknown runtime", http.StatusBadRequest)
+		return
+	}
+	info, err := store.BugInfo(crashID, true)
 	if err != nil {
 		http.Error(w, "failed to read crash info", http.StatusInternalServerError)
 		return
@@ -883,7 +991,12 @@ func (serv *HTTPServer) httpReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	info, err := serv.CrashStore.Report(crashID)
+	store := serv.crashStore(r.FormValue("runtime"))
+	if store == nil {
+		http.Error(w, "unknown runtime", http.StatusBadRequest)
+		return
+	}
+	info, err := store.Report(crashID)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("%v", err), http.StatusBadRequest)
 		return
@@ -942,7 +1055,10 @@ func (serv *HTTPServer) collectDiffCrashes() (patchedOnly, both, inProgress *UID
 }
 
 func (serv *HTTPServer) allDiffCrashes() []UIDiffBug {
-	repros := serv.ReproLoop.Reproducing()
+	repros := map[string]bool{}
+	if serv.ReproLoop != nil {
+		repros = serv.ReproLoop.Reproducing()
+	}
 	var list []UIDiffBug
 	for _, bug := range serv.DiffStore.List() {
 		list = append(list, UIDiffBug{
@@ -961,16 +1077,25 @@ func (serv *HTTPServer) allDiffCrashes() []UIDiffBug {
 	return list
 }
 
-func (serv *HTTPServer) collectCrashes(workdir string) ([]UICrashType, error) {
-	list, err := serv.CrashStore.BugList()
-	if err != nil {
-		return nil, err
-	}
-	repros := serv.ReproLoop.Reproducing()
+func (serv *HTTPServer) collectCrashes() ([]UICrashType, error) {
+	repros := serv.reproducing()
 	var ret []UICrashType
-	for _, info := range list {
-		ret = append(ret, makeUICrashType(info, serv.StartTime, repros))
+	for name, store := range serv.crashStores() {
+		list, err := store.BugList()
+		if err != nil {
+			return nil, err
+		}
+		for _, info := range list {
+			ret = append(ret, makeUICrashType(info, serv.StartTime, repros[name]))
+		}
 	}
+	sort.Slice(ret, func(i, j int) bool {
+		first, second := strings.ToLower(ret[i].Title), strings.ToLower(ret[j].Title)
+		if first != second {
+			return first < second
+		}
+		return ret[i].Runtime < ret[j].Runtime
+	})
 	return ret, nil
 }
 

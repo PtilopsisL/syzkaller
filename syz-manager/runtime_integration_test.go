@@ -13,6 +13,7 @@ import (
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/pkg/stat"
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm"
@@ -40,7 +41,8 @@ func TestInitRuntimeCreatesKernelRuntime(t *testing.T) {
 	require.NotNil(t, mgr.runtime)
 	require.NotNil(t, mgr.runtime.Server())
 	require.NotNil(t, mgr.runtime.Pool())
-	assert.Equal(t, reflect.ValueOf(mgr.fuzzerInstance).Pointer(), dispatcherDefaultJobPtr(t, mgr.runtime.Pool()))
+	require.NotNil(t, mgr.primary)
+	assert.NotZero(t, dispatcherDefaultJobPtr(t, mgr.runtime.Pool()))
 }
 
 func TestSwitchToSnapshotChangesDispatcherAndClosesServer(t *testing.T) {
@@ -69,6 +71,86 @@ func TestSwitchToSnapshotChangesDispatcherAndClosesServer(t *testing.T) {
 	after := dispatcherDefaultJobPtr(t, mgr.runtime.Pool())
 	assert.NotEqual(t, before, after)
 	assert.Equal(t, reflect.ValueOf(mgr.snapshotInstance).Pointer(), after)
+}
+
+func TestInitRuntimeCreatesPrimaryAndShadowRuntimes(t *testing.T) {
+	primaryCfg := testManagerConfig(t)
+	shadowCfg := testManagerConfig(t)
+	shadowCfg.Workdir = t.TempDir()
+	shadowCfg.Cover = false
+
+	displayCfg := testManagerConfig(t)
+	displayCfg.PrimaryRuntime = "primary"
+	displayCfg.Runtimes = []mgrconfig.Runtime{
+		{Name: "primary"},
+		{Name: "shadow"},
+	}
+	displayCfg.RuntimeConfigs = map[string]*mgrconfig.Config{
+		"primary": primaryCfg,
+		"shadow":  shadowCfg,
+	}
+
+	mgr := &Manager{
+		cfg:        primaryCfg,
+		displayCfg: displayCfg,
+		mode:       ModeFuzzing,
+	}
+
+	require.NoError(t, mgr.initRuntime(false))
+	t.Cleanup(func() {
+		require.NoError(t, mgr.closeRuntimes())
+	})
+
+	require.NotNil(t, mgr.primary)
+	require.NotNil(t, mgr.runtime)
+	require.NotNil(t, mgr.programRegistry)
+	require.Len(t, mgr.shadows, 1)
+	require.Len(t, mgr.allRuntimes, 2)
+	assert.Equal(t, mgr.primary.runtime, mgr.runtime)
+	assert.Equal(t, "primary", mgr.primary.name)
+	assert.Equal(t, "shadow", mgr.shadows["shadow"].name)
+	assert.Equal(t, "primary", mgr.primary.crashStore.Namespace)
+	assert.Equal(t, "shadow", mgr.shadows["shadow"].crashStore.Namespace)
+}
+
+func TestInitRuntimeUsesPrimaryNamedStatsInMultiRuntimeMode(t *testing.T) {
+	primaryName := "primary-stats"
+	shadowName := "shadow-stats"
+	primaryCfg := testManagerConfig(t)
+	shadowCfg := testManagerConfig(t)
+	shadowCfg.Workdir = t.TempDir()
+	shadowCfg.Cover = false
+
+	displayCfg := testManagerConfig(t)
+	displayCfg.PrimaryRuntime = primaryName
+	displayCfg.Runtimes = []mgrconfig.Runtime{
+		{Name: primaryName},
+		{Name: shadowName},
+	}
+	displayCfg.RuntimeConfigs = map[string]*mgrconfig.Config{
+		primaryName: primaryCfg,
+		shadowName:  shadowCfg,
+	}
+
+	mgr := &Manager{
+		cfg:        primaryCfg,
+		displayCfg: displayCfg,
+		mode:       ModeFuzzing,
+	}
+
+	require.NoError(t, mgr.initRuntime(false))
+	t.Cleanup(func() {
+		require.NoError(t, mgr.closeRuntimes())
+	})
+
+	mgr.servStats.StatExecs.Add(7)
+
+	statsByName := map[string]int{}
+	for _, item := range stat.Collect(stat.Console) {
+		statsByName[item.Name] = item.V
+	}
+	assert.Equal(t, 7, statsByName["exec total ["+primaryName+"]"])
+	assert.Zero(t, statsByName["exec total ["+shadowName+"]"])
 }
 
 func testManagerConfig(t *testing.T) *mgrconfig.Config {

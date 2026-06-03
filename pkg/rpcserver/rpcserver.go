@@ -131,7 +131,7 @@ func NewNamedStats(name string) Stats {
 	}
 	return Stats{
 		StatExecs: stat.New("exec total"+suffix, "Total test program executions",
-			stat.Console, stat.Rate{}, stat.Prometheus("syz_exec_total"+name),
+			stat.Console, stat.Rate{}, stat.Prometheus(prometheusMetricName("syz_exec_total", name)),
 		),
 		StatNumFuzzing: stat.New("fuzzing VMs"+suffix,
 			"Number of VMs that are currently fuzzing", stat.Graph("fuzzing VMs"),
@@ -144,6 +144,27 @@ func NewNamedStats(name string) Stats {
 		StatExecutorRestarts: stat.New("executor restarts"+suffix,
 			"Number of times executor process was restarted", stat.Rate{}, stat.Graph("executor")),
 	}
+}
+
+func prometheusMetricName(base, suffix string) string {
+	if suffix == "" {
+		return base
+	}
+	var ret strings.Builder
+	ret.WriteString(base)
+	ret.WriteByte('_')
+	for _, ch := range suffix {
+		switch {
+		case ch >= 'a' && ch <= 'z',
+			ch >= 'A' && ch <= 'Z',
+			ch >= '0' && ch <= '9',
+			ch == '_':
+			ret.WriteRune(ch)
+		default:
+			ret.WriteByte('_')
+		}
+	}
+	return ret.String()
 }
 
 func New(cfg *RemoteConfig) (Server, error) {

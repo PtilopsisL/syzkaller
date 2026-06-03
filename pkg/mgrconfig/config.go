@@ -19,6 +19,10 @@ type Config struct {
 	HTTP string `json:"http"`
 	// TCP address to serve RPC for fuzzer processes (optional).
 	RPC string `json:"rpc,omitempty"`
+	// Fixed primary runtime name in multi-runtime mode.
+	PrimaryRuntime string `json:"primary,omitempty"`
+	// Optional per-runtime overrides in multi-runtime mode.
+	Runtimes []Runtime `json:"runtimes,omitempty"`
 	// Distributed fuzzer mode (optional).
 	// If set, syz-manager will pass this address to the fuzzer so that fuzzer instances
 	// can auto-elect a role:
@@ -240,7 +244,24 @@ type Config struct {
 	Experimental Experimental
 
 	// Implementation details beyond this point. Filled after parsing.
-	Derived `json:"-"`
+	Derived        `json:"-"`
+	RuntimeConfigs map[string]*Config `json:"-"`
+}
+
+type Runtime struct {
+	Name           string          `json:"name"`
+	KernelObj      string          `json:"kernel_obj,omitempty"`
+	KernelSrc      string          `json:"kernel_src,omitempty"`
+	KernelBuildSrc string          `json:"kernel_build_src,omitempty"`
+	Image          string          `json:"image,omitempty"`
+	SSHKey         string          `json:"sshkey,omitempty"`
+	Tag            string          `json:"tag,omitempty"`
+	Type           string          `json:"type,omitempty"`
+	VM             json.RawMessage `json:"vm,omitempty"`
+}
+
+func (cfg *Config) IsMultiRuntime() bool {
+	return len(cfg.RuntimeConfigs) != 0
 }
 
 // These options are not guaranteed to be backward/forward compatible and

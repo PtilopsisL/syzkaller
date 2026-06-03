@@ -35,6 +35,12 @@ func getTestDefaultCfg() mgrconfig.Config {
 	}
 }
 
+func TestPrometheusMetricName(t *testing.T) {
+	assert.Equal(t, "syz_exec_total", prometheusMetricName("syz_exec_total", ""))
+	assert.Equal(t, "syz_exec_total_v6_2", prometheusMetricName("syz_exec_total", "v6.2"))
+	assert.Equal(t, "syz_exec_total_linux_next", prometheusMetricName("syz_exec_total", "linux-next"))
+}
+
 func TestNew(t *testing.T) {
 	defaultCfg := getTestDefaultCfg()
 

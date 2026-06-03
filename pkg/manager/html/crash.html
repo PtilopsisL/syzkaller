@@ -4,9 +4,16 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 */}}
 
 <b>{{.Title}}</b>
+{{if .Runtime}}
+<br>
+Runtime: <b>{{.Runtime}}</b>
+{{else}}
+<br>
+Runtime: <b>main</b>
+{{end}}
 
 {{if .Triaged}}
-Report: <a href="/report?id={{.ID}}">{{.Triaged}}</a>
+Report: <a href="/report?id={{.ID}}&runtime={{.Runtime}}">{{.Triaged}}</a>
 {{end}}
 
 <table class="list_table">
