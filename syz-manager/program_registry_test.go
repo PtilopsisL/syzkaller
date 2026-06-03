@@ -7,6 +7,7 @@ import (
 	mathrand "math/rand"
 	"testing"
 
+	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
@@ -28,6 +29,7 @@ func TestShadowProgramRegistryDistributesPrograms(t *testing.T) {
 	shadowReq := source.Next()
 	require.NotNil(t, shadowReq)
 	assert.Equal(t, primaryReq.ProgID, shadowReq.ProgID)
+	assert.NotZero(t, shadowReq.ExecOpts.EnvFlags&flatrpc.ExecEnvSyscallTrace)
 	shadowReq.Done(&queue.Result{Status: queue.Success})
 
 	status, ok := registry.status("primary", primaryReq.ProgID)

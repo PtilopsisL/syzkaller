@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/google/syzkaller/pkg/flatrpc"
+	"github.com/google/syzkaller/pkg/fuzzer"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/manager"
@@ -230,6 +231,7 @@ func (source *shadowProgramSource) Next() *queue.Request {
 			Prog:      program,
 			Important: item.Important,
 		}
+		fuzzer.EnableSyscallTrace(req)
 		req.OnDone(func(r *queue.Request, res *queue.Result) bool {
 			source.registry.record(source.name, r.ProgID, res.Status)
 			return true

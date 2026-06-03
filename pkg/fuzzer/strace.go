@@ -8,7 +8,8 @@ import (
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
 )
 
-func (fuzzer *Fuzzer) maybeStraceProg(req *queue.Request) bool {
+// EnableSyscallTrace marks logical syzlang program requests for syscall trace collection.
+func EnableSyscallTrace(req *queue.Request) bool {
 	if req == nil || req.Prog == nil || req.ProgID == 0 {
 		return false
 	}
@@ -16,6 +17,13 @@ func (fuzzer *Fuzzer) maybeStraceProg(req *queue.Request) bool {
 		return false
 	}
 	req.ExecOpts.EnvFlags |= flatrpc.ExecEnvSyscallTrace
+	return true
+}
+
+func (fuzzer *Fuzzer) maybeStraceProg(req *queue.Request) bool {
+	if !EnableSyscallTrace(req) {
+		return false
+	}
 	fuzzer.straceQueue.Submit(req)
 	return true
 }
