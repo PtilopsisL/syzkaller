@@ -1356,7 +1356,7 @@ func (mgr *Manager) machineChecked(slot *managedRuntime, features flatrpc.Featur
 			Coverage:       mgr.cfg.Cover,
 			FaultInjection: features&flatrpc.FeatureFault != 0,
 			Comparisons:    features&flatrpc.FeatureComparisons != 0,
-			Collide:        true,
+			Collide:        mgr.cfg.Collide,
 			EnabledCalls:   enabledSyscalls,
 			NoMutateCalls:  mgr.cfg.NoMutateCalls,
 			FetchRawCover:  mgr.cfg.RawCover,

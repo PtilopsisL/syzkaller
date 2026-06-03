@@ -291,7 +291,7 @@ func (runtime *KernelRuntime) setupFuzzer(features flatrpc.Feature,
 		// Fault injection may bring instaibility into bug reproducibility, which may lead to false positives.
 		FaultInjection: false,
 		Comparisons:    features&flatrpc.FeatureComparisons != 0,
-		Collide:        true,
+		Collide:        runtime.cfg.Collide,
 		EnabledCalls:   syscalls,
 		NoMutateCalls:  runtime.cfg.NoMutateCalls,
 		PatchTest:      true,

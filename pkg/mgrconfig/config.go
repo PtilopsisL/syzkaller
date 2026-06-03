@@ -148,6 +148,8 @@ type Config struct {
 
 	// Use KCOV coverage (default: true).
 	Cover bool `json:"cover"`
+	// Enable random collide/async transformations during normal fuzzing.
+	Collide bool `json:"collide"`
 
 	// CovFilter used to restrict the area of the kernel visible to syzkaller.
 	// DEPRECATED! Use the FocusAreas parameter instead.
