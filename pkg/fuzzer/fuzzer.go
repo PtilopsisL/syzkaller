@@ -16,7 +16,6 @@ import (
 	"github.com/google/syzkaller/pkg/csource"
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
-	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/pkg/stat"
@@ -39,8 +38,6 @@ type Fuzzer struct {
 	ctProgs      int
 	ctMu         sync.Mutex // TODO: use RWLock.
 	ctRegenerate chan struct{}
-
-	distributed *distributedState
 
 	execQueues
 }
@@ -68,23 +65,6 @@ func NewFuzzer(ctx context.Context, cfg *Config, rnd *rand.Rand,
 	}
 	f.execQueues = newExecQueues(f)
 
-	// Server or client
-	if cfg.DistributedAddr == "" {
-		log.Logf(0, "fuzzer mode: standalone")
-	} else {
-		if err := f.initDistributed(cfg.DistributedAddr, cfg.DistributedID); err != nil {
-			log.Logf(0, "fuzzer mode: distributed init failed (addr=%s): %v", cfg.DistributedAddr, err)
-			panic(fmt.Sprintf("init distributed mode failed: %v", err))
-		}
-		// client mode
-		if f.distributed != nil && f.distributed.role == DistributedRoleClient {
-			log.Logf(0, "fuzzer mode: distributed client (addr=%s, id=%s)", cfg.DistributedAddr, f.distributed.clientID)
-			f.execQueues.genSource.Store(queue.Callback(f.distributedNextRequest))
-		} else {
-			log.Logf(0, "fuzzer mode: distributed server (addr=%s)", cfg.DistributedAddr)
-		}
-	}
-
 	f.updateChoiceTable(nil)
 	go f.choiceTableUpdater()
 	if cfg.Debug {
@@ -106,7 +86,6 @@ type execQueues struct {
 	triageQueue          *queue.DynamicOrderer
 	smashQueue           *queue.PlainQueue
 	straceQueue          *queue.PlainQueue
-	genSource            *queue.DynamicSourceCtl
 	source               queue.Source
 }
 
@@ -127,11 +106,6 @@ func newExecQueues(fuzzer *Fuzzer) execQueues {
 		skipQueue = 2
 	}
 
-	// The last stage is a switchable generator:
-	// - standalone/server: genFuzz
-	// - distributed client: distributedNextRequest
-	ret.genSource = queue.DynamicSource(queue.Callback(fuzzer.genFuzz))
-
 	// Sources are listed in the order, in which they will be polled.
 	ret.source = queue.Order(
 		ret.triageCandidateQueue,
@@ -139,7 +113,7 @@ func newExecQueues(fuzzer *Fuzzer) execQueues {
 		ret.triageQueue,
 		queue.Alternate(ret.smashQueue, skipQueue),
 		ret.straceQueue,
-		ret.genSource,
+		queue.Callback(fuzzer.genFuzz),
 	)
 	return ret
 }
@@ -239,25 +213,22 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 }
 
 type Config struct {
-	Debug                 bool
-	Corpus                *corpus.Corpus
-	Logf                  func(level int, msg string, args ...interface{})
-	GeneratedProgram      func(*queue.Request)
-	Snapshot              bool
-	Coverage              bool
-	FaultInjection        bool
-	Comparisons           bool
-	Collide               bool
-	EnabledCalls          map[*prog.Syscall]bool
-	NoMutateCalls         map[int]bool
-	FetchRawCover         bool
-	NewInputFilter        func(call string) bool
-	PatchTest             bool
-	ModeKFuzzTest         bool
-	DistributedAddr       string
-	DistributedID         string
-	DistributedDumpPeriod time.Duration
-	Workdir               string
+	Debug            bool
+	Corpus           *corpus.Corpus
+	Logf             func(level int, msg string, args ...interface{})
+	GeneratedProgram func(*queue.Request)
+	Snapshot         bool
+	Coverage         bool
+	FaultInjection   bool
+	Comparisons      bool
+	Collide          bool
+	EnabledCalls     map[*prog.Syscall]bool
+	NoMutateCalls    map[int]bool
+	FetchRawCover    bool
+	NewInputFilter   func(call string) bool
+	PatchTest        bool
+	ModeKFuzzTest    bool
+	Workdir          string
 }
 
 func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call int, triage *map[int]*triageCall) {
@@ -337,12 +308,6 @@ func (fuzzer *Fuzzer) genFuzz() *queue.Request {
 		}
 	}
 
-	// If this fuzzer is a distributed server, register the new prog
-	// so that all clients will also execute it (with a global ProgID).
-	if fuzzer.distributed != nil && fuzzer.distributed.role == DistributedRoleServer &&
-		req != nil && req.Prog != nil {
-		fuzzer.distributed.registerProgFromServer(req)
-	}
 	if fuzzer.Config.GeneratedProgram != nil && req != nil && req.Prog != nil {
 		fuzzer.Config.GeneratedProgram(req)
 	}

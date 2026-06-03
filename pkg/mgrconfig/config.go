@@ -5,7 +5,6 @@ package mgrconfig
 
 import (
 	"encoding/json"
-	"time"
 
 	"github.com/google/syzkaller/pkg/asset"
 )
@@ -23,16 +22,6 @@ type Config struct {
 	PrimaryRuntime string `json:"primary,omitempty"`
 	// Optional per-runtime overrides in multi-runtime mode.
 	Runtimes []Runtime `json:"runtimes,omitempty"`
-	// Distributed fuzzer mode (optional).
-	// If set, syz-manager will pass this address to the fuzzer so that fuzzer instances
-	// can auto-elect a role:
-	//   - Server: the first instance that successfully listens on this address.
-	//   - Client: subsequent instances that connect to the existing server.
-	// Empty means standalone (local generation).
-	DistributedAddr string `json:"distributed_addr,omitempty"`
-	// Optional period for the distributed server to dump client debug logs.
-	// If unset, a reasonable default is used.
-	DistributedDumpPeriod time.Duration `json:"distributed_dump_period,omitempty"`
 	// Location of a working directory for the syz-manager process. Outputs here include:
 	// - <workdir>/crashes/*: crash output files
 	// - <workdir>/corpus.db: corpus with interesting programs

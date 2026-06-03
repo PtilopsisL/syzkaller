@@ -280,8 +280,6 @@ func (cfg *Config) completeRuntimes() error {
 			runtimeCfg.DashboardUserAgent = ""
 			runtimeCfg.DashboardOnlyRepro = false
 			runtimeCfg.AssetStorage = nil
-			runtimeCfg.DistributedAddr = ""
-			runtimeCfg.DistributedDumpPeriod = 0
 			runtimeCfg.Cover = false
 		}
 		if err := Complete(runtimeCfg); err != nil {
