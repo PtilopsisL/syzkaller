@@ -66,7 +66,7 @@ type Manager struct {
 	primary         *managedRuntime
 	shadows         map[string]*managedRuntime
 	allRuntimes     map[string]*managedRuntime
-	programRegistry *shadowProgramRegistry
+	programRegistry *multiRuntimeCoordinator
 	runtime         *manager.KernelRuntime
 	target          *prog.Target
 	sysTarget       *targets.Target
@@ -424,7 +424,7 @@ func (mgr *Manager) initRuntime(debug bool) error {
 	mgr.allRuntimes = make(map[string]*managedRuntime)
 	mgr.shadows = make(map[string]*managedRuntime)
 	if mgr.displayCfg.IsMultiRuntime() {
-		mgr.programRegistry = newShadowProgramRegistry()
+		mgr.programRegistry = newMultiRuntimeCoordinator(mgr.displayCfg.Workdir)
 	}
 
 	createSlot := func(name string, runtimeCfg *mgrconfig.Config, shadow bool) error {
@@ -1392,7 +1392,11 @@ func (mgr *Manager) machineChecked(slot *managedRuntime, features flatrpc.Featur
 				go mgr.dashboardReproTasks()
 			}
 		}
-		source := queue.DefaultOpts(fuzzerObj, opts)
+		var source queue.Source = fuzzerObj
+		if mgr.programRegistry != nil {
+			source = mgr.programRegistry.sourceForRuntime(slot.name, source)
+		}
+		source = queue.DefaultOpts(source, opts)
 		if mgr.cfg.Snapshot {
 			log.Logf(0, "restarting VMs for snapshot mode")
 			return mgr.switchToSnapshot(source), nil

@@ -87,12 +87,34 @@ type storedProgram struct {
 	Important bool
 }
 
-type shadowProgramRegistry struct {
+type runStage int
+
+const (
+	runStageFuzz runStage = iota
+	runStageRepro
+)
+
+type programRun struct {
+	ID             int64
+	ParentID       int64
+	Stage          runStage
+	Prog           *prog.Prog
+	ProgData       []byte
+	Important      bool
+	Expected       map[string]bool
+	Results        map[string]*runtimeResult
+	InitialResults map[string]*runtimeResult
+}
+
+type multiRuntimeCoordinator struct {
 	nextID atomic.Int64
 
-	mu        sync.Mutex
-	consumers map[string]*shadowConsumer
-	statuses  map[string]map[int64]queue.Status
+	mu          sync.Mutex
+	consumers   map[string]*shadowConsumer
+	reproQueues map[string]*queue.PlainQueue
+	statuses    map[string]map[int64]queue.Status
+	runs        map[int64]*programRun
+	store       *mismatchStore
 }
 
 type shadowConsumer struct {
@@ -105,11 +127,18 @@ type shadowConsumer struct {
 	closed bool
 }
 
-func newShadowProgramRegistry() *shadowProgramRegistry {
-	return &shadowProgramRegistry{
-		consumers: map[string]*shadowConsumer{},
-		statuses:  map[string]map[int64]queue.Status{},
+func newMultiRuntimeCoordinator(workdir string) *multiRuntimeCoordinator {
+	return &multiRuntimeCoordinator{
+		consumers:   map[string]*shadowConsumer{},
+		reproQueues: map[string]*queue.PlainQueue{},
+		statuses:    map[string]map[int64]queue.Status{},
+		runs:        map[int64]*programRun{},
+		store:       newMismatchStore(workdir),
 	}
+}
+
+func newShadowProgramRegistry() *multiRuntimeCoordinator {
+	return newMultiRuntimeCoordinator("")
 }
 
 func newShadowConsumer(target *prog.Target, enabledSyscalls map[*prog.Syscall]bool) *shadowConsumer {
@@ -125,48 +154,75 @@ func newShadowConsumer(target *prog.Target, enabledSyscalls map[*prog.Syscall]bo
 	return consumer
 }
 
-func (registry *shadowProgramRegistry) EnsureRuntime(name string, target *prog.Target,
+func (coord *multiRuntimeCoordinator) EnsureRuntime(name string, target *prog.Target,
 	enabledSyscalls map[*prog.Syscall]bool) queue.Source {
-	registry.mu.Lock()
-	defer registry.mu.Unlock()
-	if _, ok := registry.consumers[name]; ok {
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	if _, ok := coord.consumers[name]; ok {
 		panic(fmt.Sprintf("shadow runtime %q registered twice", name))
 	}
-	registry.statuses[name] = map[int64]queue.Status{}
+	coord.statuses[name] = map[int64]queue.Status{}
 	consumer := newShadowConsumer(target, enabledSyscalls)
-	registry.consumers[name] = consumer
-	return &shadowProgramSource{
-		registry: registry,
+	coord.consumers[name] = consumer
+	source := &shadowProgramSource{
+		coord:    coord,
 		name:     name,
 		consumer: consumer,
 		target:   target,
 	}
+	return queue.Order(coord.runtimeQueueLocked(name), source)
 }
 
-func (registry *shadowProgramRegistry) Close() {
-	registry.mu.Lock()
-	defer registry.mu.Unlock()
-	for _, consumer := range registry.consumers {
+func (coord *multiRuntimeCoordinator) Close() {
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	for _, consumer := range coord.consumers {
 		consumer.close()
 	}
 }
 
-func (registry *shadowProgramRegistry) registerPrimary(runtimeName string, req *queue.Request) {
+func (coord *multiRuntimeCoordinator) sourceForRuntime(name string, source queue.Source) queue.Source {
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	return queue.Order(coord.runtimeQueueLocked(name), source)
+}
+
+func (coord *multiRuntimeCoordinator) runtimeQueueLocked(name string) *queue.PlainQueue {
+	if q := coord.reproQueues[name]; q != nil {
+		return q
+	}
+	q := queue.Plain()
+	coord.reproQueues[name] = q
+	return q
+}
+
+func (coord *multiRuntimeCoordinator) registerPrimary(runtimeName string, req *queue.Request) {
 	if req == nil || req.Prog == nil {
 		return
 	}
 	if req.ProgID == 0 {
-		req.ProgID = registry.nextID.Add(1)
+		req.ProgID = coord.nextID.Add(1)
 	}
-	registry.mu.Lock()
-	if registry.statuses[runtimeName] == nil {
-		registry.statuses[runtimeName] = map[int64]queue.Status{}
+	coord.mu.Lock()
+	if coord.statuses[runtimeName] == nil {
+		coord.statuses[runtimeName] = map[int64]queue.Status{}
 	}
-	consumers := make([]*shadowConsumer, 0, len(registry.consumers))
-	for _, consumer := range registry.consumers {
-		consumers = append(consumers, consumer)
+	expected := map[string]bool{runtimeName: true}
+	consumers := make(map[string]*shadowConsumer, len(coord.consumers))
+	for name, consumer := range coord.consumers {
+		expected[name] = true
+		consumers[name] = consumer
 	}
-	registry.mu.Unlock()
+	coord.runs[req.ProgID] = &programRun{
+		ID:        req.ProgID,
+		Stage:     runStageFuzz,
+		Prog:      req.Prog.Clone(),
+		ProgData:  req.Prog.Serialize(),
+		Important: req.Important,
+		Expected:  expected,
+		Results:   map[string]*runtimeResult{},
+	}
+	coord.mu.Unlock()
 
 	program := storedProgram{
 		ID:        req.ProgID,
@@ -177,24 +233,52 @@ func (registry *shadowProgramRegistry) registerPrimary(runtimeName string, req *
 		consumer.enqueue(program)
 	}
 	req.OnDone(func(r *queue.Request, res *queue.Result) bool {
-		registry.record(runtimeName, r.ProgID, res.Status)
+		coord.recordResult(runtimeName, r, res)
 		return true
 	})
 }
 
-func (registry *shadowProgramRegistry) record(runtimeName string, progID int64, status queue.Status) {
-	registry.mu.Lock()
-	defer registry.mu.Unlock()
-	if registry.statuses[runtimeName] == nil {
-		registry.statuses[runtimeName] = map[int64]queue.Status{}
-	}
-	registry.statuses[runtimeName][progID] = status
+func (coord *multiRuntimeCoordinator) recordStatus(runtimeName string, progID int64, status queue.Status) {
+	coord.recordRuntimeResult(runtimeName, progID, &runtimeResult{
+		Runtime:    runtimeName,
+		Status:     status,
+		StatusName: status.String(),
+	})
 }
 
-func (registry *shadowProgramRegistry) status(runtimeName string, progID int64) (queue.Status, bool) {
-	registry.mu.Lock()
-	defer registry.mu.Unlock()
-	statuses := registry.statuses[runtimeName]
+func (coord *multiRuntimeCoordinator) recordResult(runtimeName string, req *queue.Request, res *queue.Result) {
+	if req == nil || res == nil {
+		return
+	}
+	coord.recordRuntimeResult(runtimeName, req.ProgID, summarizeRuntimeResult(runtimeName, req, res))
+}
+
+func (coord *multiRuntimeCoordinator) recordRuntimeResult(runtimeName string, progID int64,
+	result *runtimeResult) {
+	var completed *programRun
+	coord.mu.Lock()
+	if coord.statuses[runtimeName] == nil {
+		coord.statuses[runtimeName] = map[int64]queue.Status{}
+	}
+	coord.statuses[runtimeName][progID] = result.Status
+	run := coord.runs[progID]
+	if run != nil && run.Expected[runtimeName] {
+		run.Results[runtimeName] = result
+		if len(run.Results) == len(run.Expected) {
+			completed = run
+			delete(coord.runs, progID)
+		}
+	}
+	coord.mu.Unlock()
+	if completed != nil {
+		coord.handleCompletedRun(completed)
+	}
+}
+
+func (coord *multiRuntimeCoordinator) status(runtimeName string, progID int64) (queue.Status, bool) {
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	statuses := coord.statuses[runtimeName]
 	if statuses == nil {
 		return 0, false
 	}
@@ -202,8 +286,18 @@ func (registry *shadowProgramRegistry) status(runtimeName string, progID int64) 
 	return status, ok
 }
 
+func (coord *multiRuntimeCoordinator) reproQueueLen(runtimeName string) int {
+	coord.mu.Lock()
+	queue := coord.reproQueues[runtimeName]
+	coord.mu.Unlock()
+	if queue == nil {
+		return 0
+	}
+	return queue.Len()
+}
+
 type shadowProgramSource struct {
-	registry *shadowProgramRegistry
+	coord    *multiRuntimeCoordinator
 	name     string
 	consumer *shadowConsumer
 	target   *prog.Target
@@ -219,11 +313,11 @@ func (source *shadowProgramSource) Next() *queue.Request {
 		if err != nil {
 			log.Logf(0, "shadow runtime %q failed to deserialize program %d: %v",
 				source.name, item.ID, err)
-			source.registry.record(source.name, item.ID, queue.ExecFailure)
+			source.coord.recordStatus(source.name, item.ID, queue.ExecFailure)
 			continue
 		}
 		if !source.consumer.supports(program) {
-			source.registry.record(source.name, item.ID, queue.Unsupported)
+			source.coord.recordStatus(source.name, item.ID, queue.Unsupported)
 			continue
 		}
 		req := &queue.Request{
@@ -233,7 +327,7 @@ func (source *shadowProgramSource) Next() *queue.Request {
 		}
 		fuzzer.EnableSyscallTrace(req)
 		req.OnDone(func(r *queue.Request, res *queue.Result) bool {
-			source.registry.record(source.name, r.ProgID, res.Status)
+			source.coord.recordResult(source.name, r, res)
 			return true
 		})
 		return req

@@ -5,6 +5,8 @@ package main
 
 import (
 	mathrand "math/rand"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/syzkaller/pkg/flatrpc"
@@ -71,6 +73,99 @@ func TestShadowProgramRegistryMarksUnsupported(t *testing.T) {
 	status, ok := registry.status("shadow", req.ProgID)
 	require.True(t, ok)
 	assert.Equal(t, queue.Unsupported, status)
+}
+
+func TestMultiRuntimeCoordinatorSchedulesMismatchRepro(t *testing.T) {
+	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
+	require.NoError(t, err)
+
+	coord := newMultiRuntimeCoordinator(t.TempDir())
+	primaryBase := queue.Plain()
+	primarySource := coord.sourceForRuntime("primary", primaryBase)
+	shadowSource := coord.EnsureRuntime("shadow", target, allSyscalls(target))
+
+	primaryReq := &queue.Request{Prog: testRegistryProg(target)}
+	coord.registerPrimary("primary", primaryReq)
+	shadowReq := shadowSource.Next()
+	require.NotNil(t, shadowReq)
+
+	primaryReq.Done(testResult(0, "0: test() = 0 {0}\n"))
+	shadowReq.Done(testResult(1, "0: test() = -1 {1}\n"))
+
+	primaryRepro := primarySource.Next()
+	require.NotNil(t, primaryRepro)
+	shadowRepro := shadowSource.Next()
+	require.NotNil(t, shadowRepro)
+	assert.NotEqual(t, primaryReq.ProgID, primaryRepro.ProgID)
+	assert.Equal(t, primaryRepro.ProgID, shadowRepro.ProgID)
+	assert.NotZero(t, primaryRepro.ExecOpts.EnvFlags&flatrpc.ExecEnvSyscallTrace)
+	assert.NotZero(t, shadowRepro.ExecOpts.EnvFlags&flatrpc.ExecEnvSyscallTrace)
+
+	primaryRepro.Done(testResult(0, "0: test() = 0 {0}\n"))
+	shadowRepro.Done(testResult(1, "0: test() = -1 {1}\n"))
+
+	entries, err := os.ReadDir(filepath.Join(coord.store.baseDir))
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.FileExists(t, filepath.Join(coord.store.baseDir, entries[0].Name(), "report.json"))
+	assert.FileExists(t, filepath.Join(coord.store.baseDir, entries[0].Name(), "repro.prog"))
+}
+
+func TestMultiRuntimeCoordinatorIgnoresMatchingResults(t *testing.T) {
+	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
+	require.NoError(t, err)
+
+	coord := newMultiRuntimeCoordinator(t.TempDir())
+	primaryBase := queue.Plain()
+	primarySource := coord.sourceForRuntime("primary", primaryBase)
+	shadowSource := coord.EnsureRuntime("shadow", target, allSyscalls(target))
+
+	primaryReq := &queue.Request{Prog: testRegistryProg(target)}
+	coord.registerPrimary("primary", primaryReq)
+	shadowReq := shadowSource.Next()
+	require.NotNil(t, shadowReq)
+
+	primaryReq.Done(testResult(0, "0: test() = 0 {0}\n"))
+	shadowReq.Done(testResult(0, "0: test() = 0 {0}\n"))
+
+	assert.Nil(t, primarySource.Next())
+	assert.Equal(t, 0, coord.reproQueueLen("shadow"))
+	assert.NoFileExists(t, coord.store.baseDir)
+}
+
+func TestMultiRuntimeCoordinatorDoesNotReproUnsupported(t *testing.T) {
+	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
+	require.NoError(t, err)
+
+	coord := newMultiRuntimeCoordinator(t.TempDir())
+	primaryBase := queue.Plain()
+	primarySource := coord.sourceForRuntime("primary", primaryBase)
+	shadowSource := coord.EnsureRuntime("shadow", target, nil)
+
+	primaryReq := &queue.Request{Prog: testRegistryProg(target)}
+	coord.registerPrimary("primary", primaryReq)
+	coord.Close()
+
+	assert.Nil(t, shadowSource.Next())
+	primaryReq.Done(testResult(0, "0: test() = 0 {0}\n"))
+
+	assert.Nil(t, primarySource.Next())
+	assert.NoFileExists(t, coord.store.baseDir)
+}
+
+func testResult(errno int32, sctrace string) *queue.Result {
+	return &queue.Result{
+		Status: queue.Success,
+		Info: &flatrpc.ProgInfo{
+			Calls: []*flatrpc.CallInfo{
+				{
+					Flags:   flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished,
+					Error:   errno,
+					Sctrace: []byte(sctrace),
+				},
+			},
+		},
+	}
 }
 
 func testRegistryProg(target *prog.Target) *prog.Prog {
