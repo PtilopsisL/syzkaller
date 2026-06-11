@@ -4,6 +4,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -15,7 +16,9 @@ import (
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
+	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/prog"
 )
 
 type runtimeResult struct {
@@ -27,6 +30,40 @@ type runtimeResult struct {
 }
 
 type runtimeCallResult struct {
+	Index   int               `json:"index"`
+	Name    string            `json:"name,omitempty"`
+	Args    []*runtimeCallArg `json:"args,omitempty"`
+	Flags   flatrpc.CallFlag  `json:"flags"`
+	Error   int32             `json:"error"`
+	Sctrace string            `json:"sctrace,omitempty"`
+}
+
+type runtimeCallArg struct {
+	Name        string              `json:"name,omitempty"`
+	Type        string              `json:"type,omitempty"`
+	Dir         string              `json:"dir,omitempty"`
+	Kind        string              `json:"kind"`
+	Value       *uint64             `json:"value,omitempty"`
+	ValueNames  []string            `json:"value_names,omitempty"`
+	Size        uint64              `json:"size,omitempty"`
+	Address     *uint64             `json:"address,omitempty"`
+	Args        []*runtimeCallArg   `json:"args,omitempty"`
+	Selected    string              `json:"selected,omitempty"`
+	DataSummary *runtimeDataSummary `json:"data_summary,omitempty"`
+	Ref         string              `json:"ref,omitempty"`
+	OpDiv       *uint64             `json:"op_div,omitempty"`
+	OpAdd       *uint64             `json:"op_add,omitempty"`
+}
+
+type runtimeDataSummary struct {
+	Size       uint64 `json:"size"`
+	Hash       string `json:"hash,omitempty"`
+	PreviewHex string `json:"preview_hex,omitempty"`
+	Truncated  bool   `json:"truncated,omitempty"`
+	Output     bool   `json:"output,omitempty"`
+}
+
+type normalizedRuntimeCallResult struct {
 	Index   int              `json:"index"`
 	Name    string           `json:"name,omitempty"`
 	Flags   flatrpc.CallFlag `json:"flags"`
@@ -35,9 +72,9 @@ type runtimeCallResult struct {
 }
 
 type normalizedRuntimeResult struct {
-	Status queue.Status        `json:"status"`
-	Err    string              `json:"err,omitempty"`
-	Calls  []runtimeCallResult `json:"calls,omitempty"`
+	Status queue.Status                  `json:"status"`
+	Err    string                        `json:"err,omitempty"`
+	Calls  []normalizedRuntimeCallResult `json:"calls,omitempty"`
 }
 
 type runtimeMismatch struct {
@@ -62,6 +99,7 @@ func summarizeRuntimeResult(runtimeName string, req *queue.Request, res *queue.R
 		callResult := runtimeCallResult{Index: i}
 		if req.Prog != nil && i < len(req.Prog.Calls) {
 			callResult.Name = req.Prog.CallName(i)
+			callResult.Args = summarizeCallArgs(req.Prog, i)
 		}
 		if call != nil {
 			callResult.Flags = call.Flags
@@ -127,12 +165,246 @@ func compareRuntimeResults(results map[string]*runtimeResult) *runtimeMismatch {
 }
 
 func normalizeRuntimeResult(result *runtimeResult) *normalizedRuntimeResult {
-	// Intentionally a no-op placeholder for now. Future noise filters should be added here.
-	return &normalizedRuntimeResult{
+	ret := &normalizedRuntimeResult{
 		Status: result.Status,
 		Err:    result.Err,
-		Calls:  append([]runtimeCallResult(nil), result.Calls...),
 	}
+	for _, call := range result.Calls {
+		ret.Calls = append(ret.Calls, normalizedRuntimeCallResult{
+			Index:   call.Index,
+			Name:    call.Name,
+			Flags:   call.Flags,
+			Error:   call.Error,
+			Sctrace: call.Sctrace,
+		})
+	}
+	return ret
+}
+
+func summarizeCallArgs(p *prog.Prog, callIndex int) []*runtimeCallArg {
+	call := p.Calls[callIndex]
+	refs := resultRefs(p)
+	ret := make([]*runtimeCallArg, 0, len(call.Args))
+	for i, arg := range call.Args {
+		name := ""
+		if i < len(call.Meta.Args) {
+			name = call.Meta.Args[i].Name
+		}
+		ret = append(ret, summarizeArg(p.Target, refs, name, arg))
+	}
+	return ret
+}
+
+func resultRefs(p *prog.Prog) map[*prog.ResultArg]string {
+	refs := make(map[*prog.ResultArg]string)
+	for i, call := range p.Calls {
+		if call.Ret != nil {
+			refs[call.Ret] = fmt.Sprintf("call%d.ret", i)
+		}
+	}
+	return refs
+}
+
+func summarizeArg(target *prog.Target, refs map[*prog.ResultArg]string,
+	name string, arg prog.Arg) *runtimeCallArg {
+	if arg == nil {
+		return &runtimeCallArg{Name: name, Kind: "nil"}
+	}
+	ret := &runtimeCallArg{
+		Name: name,
+		Type: arg.Type().String(),
+		Dir:  arg.Dir().String(),
+		Kind: runtimeArgKind(arg),
+		Size: arg.Size(),
+	}
+	switch a := arg.(type) {
+	case *prog.ConstArg:
+		val, _ := a.Value()
+		ret.Value = uint64Ptr(val)
+		ret.ValueNames = valueNames(target, arg.Type(), val)
+	case *prog.ResultArg:
+		ret.Value = uint64Ptr(a.Val)
+		ret.ValueNames = valueNames(target, arg.Type(), a.Val)
+		if a.Res != nil {
+			ret.Ref = refs[a.Res]
+			ret.Value = nil
+		}
+		if a.OpDiv != 0 {
+			ret.OpDiv = uint64Ptr(a.OpDiv)
+		}
+		if a.OpAdd != 0 {
+			ret.OpAdd = uint64Ptr(a.OpAdd)
+		}
+	case *prog.PointerArg:
+		ret.Address = uint64Ptr(a.Address)
+		if a.Res != nil {
+			ret.Args = append(ret.Args, summarizeArg(target, refs, "", a.Res))
+		}
+	case *prog.DataArg:
+		ret.DataSummary = summarizeDataArg(a)
+	case *prog.GroupArg:
+		ret.Args = summarizeGroupArgs(target, refs, a)
+	case *prog.UnionArg:
+		typ := a.Type().(*prog.UnionType)
+		if a.Index >= 0 && a.Index < len(typ.Fields) {
+			ret.Selected = typ.Fields[a.Index].Name
+		}
+		if a.Option != nil {
+			ret.Args = append(ret.Args, summarizeArg(target, refs, ret.Selected, a.Option))
+		}
+	}
+	return ret
+}
+
+func summarizeGroupArgs(target *prog.Target, refs map[*prog.ResultArg]string,
+	arg *prog.GroupArg) []*runtimeCallArg {
+	ret := make([]*runtimeCallArg, 0, len(arg.Inner))
+	switch typ := arg.Type().(type) {
+	case *prog.StructType:
+		for i, inner := range arg.Inner {
+			name := ""
+			if i < len(typ.Fields) {
+				name = typ.Fields[i].Name
+			}
+			ret = append(ret, summarizeArg(target, refs, name, inner))
+		}
+	case *prog.ArrayType:
+		for i, inner := range arg.Inner {
+			ret = append(ret, summarizeArg(target, refs, fmt.Sprintf("[%d]", i), inner))
+		}
+	}
+	return ret
+}
+
+func summarizeDataArg(arg *prog.DataArg) *runtimeDataSummary {
+	ret := &runtimeDataSummary{Size: arg.Size()}
+	if arg.Dir() == prog.DirOut {
+		ret.Output = true
+		return ret
+	}
+	data := arg.Data()
+	ret.Hash = hash.String(data)
+	preview := data
+	const maxPreviewBytes = 32
+	if len(preview) > maxPreviewBytes {
+		preview = preview[:maxPreviewBytes]
+		ret.Truncated = true
+	}
+	ret.PreviewHex = hex.EncodeToString(preview)
+	return ret
+}
+
+func runtimeArgKind(arg prog.Arg) string {
+	switch arg.(type) {
+	case *prog.ConstArg:
+		switch arg.Type().(type) {
+		case *prog.ConstType:
+			return "const"
+		case *prog.FlagsType:
+			return "flags"
+		case *prog.IntType:
+			return "int"
+		case *prog.LenType:
+			return "len"
+		case *prog.ProcType:
+			return "proc"
+		case *prog.CsumType:
+			return "csum"
+		default:
+			return "const"
+		}
+	case *prog.ResultArg:
+		return "result"
+	case *prog.PointerArg:
+		if _, ok := arg.Type().(*prog.VmaType); ok {
+			return "vma"
+		}
+		return "ptr"
+	case *prog.DataArg:
+		return "data"
+	case *prog.GroupArg:
+		switch arg.Type().(type) {
+		case *prog.StructType:
+			return "struct"
+		case *prog.ArrayType:
+			return "array"
+		default:
+			return "group"
+		}
+	case *prog.UnionArg:
+		return "union"
+	default:
+		return "unknown"
+	}
+}
+
+func valueNames(target *prog.Target, typ prog.Type, value uint64) []string {
+	switch t := typ.(type) {
+	case *prog.FlagsType:
+		return flagValueNames(target, t, value)
+	case *prog.ConstType:
+		if t.Val == value {
+			return exactConstValueNames(target, value)
+		}
+	case *prog.ResourceType:
+		return exactConstValueNames(target, value)
+	}
+	return nil
+}
+
+func flagValueNames(target *prog.Target, typ *prog.FlagsType, value uint64) []string {
+	names := target.FlagsMap[typ.Name()]
+	if len(names) == 0 {
+		return nil
+	}
+	var ret []string
+	if !typ.BitMask {
+		for _, name := range names {
+			if target.ConstMap[name] == value {
+				ret = append(ret, name)
+			}
+		}
+		return ret
+	}
+	remaining := value
+	for _, name := range names {
+		val := target.ConstMap[name]
+		if val == 0 {
+			if value == 0 {
+				ret = append(ret, name)
+			}
+			continue
+		}
+		if remaining&val == val {
+			ret = append(ret, name)
+			remaining &^= val
+		}
+	}
+	if len(ret) != 0 {
+		return ret
+	}
+	return exactConstValueNames(target, value)
+}
+
+func exactConstValueNames(target *prog.Target, value uint64) []string {
+	if value == 0 {
+		return nil
+	}
+	const maxNames = 16
+	var ret []string
+	for _, c := range target.Consts {
+		if c.Value == value {
+			ret = append(ret, c.Name)
+			if len(ret) == maxNames {
+				break
+			}
+		}
+	}
+	return ret
+}
+
+func uint64Ptr(v uint64) *uint64 {
+	return &v
 }
 
 func (coord *multiRuntimeCoordinator) enqueueMismatchRepro(initial *programRun) {
@@ -195,7 +467,44 @@ func copyRuntimeResults(results map[string]*runtimeResult) map[string]*runtimeRe
 	for name, result := range results {
 		copyResult := *result
 		copyResult.Calls = append([]runtimeCallResult(nil), result.Calls...)
+		for i := range copyResult.Calls {
+			copyResult.Calls[i].Args = cloneRuntimeCallArgs(result.Calls[i].Args)
+		}
 		ret[name] = &copyResult
+	}
+	return ret
+}
+
+func cloneRuntimeCallArgs(args []*runtimeCallArg) []*runtimeCallArg {
+	if len(args) == 0 {
+		return nil
+	}
+	ret := make([]*runtimeCallArg, 0, len(args))
+	for _, arg := range args {
+		if arg == nil {
+			ret = append(ret, nil)
+			continue
+		}
+		copyArg := *arg
+		copyArg.ValueNames = append([]string(nil), arg.ValueNames...)
+		if arg.Value != nil {
+			copyArg.Value = uint64Ptr(*arg.Value)
+		}
+		if arg.Address != nil {
+			copyArg.Address = uint64Ptr(*arg.Address)
+		}
+		if arg.OpDiv != nil {
+			copyArg.OpDiv = uint64Ptr(*arg.OpDiv)
+		}
+		if arg.OpAdd != nil {
+			copyArg.OpAdd = uint64Ptr(*arg.OpAdd)
+		}
+		if arg.DataSummary != nil {
+			dataSummary := *arg.DataSummary
+			copyArg.DataSummary = &dataSummary
+		}
+		copyArg.Args = cloneRuntimeCallArgs(arg.Args)
+		ret = append(ret, &copyArg)
 	}
 	return ret
 }

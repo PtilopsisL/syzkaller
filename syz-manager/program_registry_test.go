@@ -4,6 +4,7 @@
 package main
 
 import (
+	"encoding/json"
 	mathrand "math/rand"
 	"os"
 	"path/filepath"
@@ -84,7 +85,7 @@ func TestMultiRuntimeCoordinatorSchedulesMismatchRepro(t *testing.T) {
 	primarySource := coord.sourceForRuntime("primary", primaryBase)
 	shadowSource := coord.EnsureRuntime("shadow", target, allSyscalls(target))
 
-	primaryReq := &queue.Request{Prog: testRegistryProg(target)}
+	primaryReq := &queue.Request{Prog: mustDeserializeProg(t, target, `ptrace(0x10, 0x17)`)}
 	coord.registerPrimary("primary", primaryReq)
 	shadowReq := shadowSource.Next()
 	require.NotNil(t, shadowReq)
@@ -107,8 +108,18 @@ func TestMultiRuntimeCoordinatorSchedulesMismatchRepro(t *testing.T) {
 	entries, err := os.ReadDir(filepath.Join(coord.store.baseDir))
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
-	assert.FileExists(t, filepath.Join(coord.store.baseDir, entries[0].Name(), "report.json"))
+	reportPath := filepath.Join(coord.store.baseDir, entries[0].Name(), "report.json")
+	assert.FileExists(t, reportPath)
 	assert.FileExists(t, filepath.Join(coord.store.baseDir, entries[0].Name(), "repro.prog"))
+	data, err := os.ReadFile(reportPath)
+	require.NoError(t, err)
+	var report storedMismatchReport
+	require.NoError(t, json.Unmarshal(data, &report))
+	require.NotEmpty(t, report.ReproResults)
+	for _, result := range report.ReproResults {
+		require.NotEmpty(t, result.Calls)
+		assert.NotEmpty(t, result.Calls[0].Args)
+	}
 }
 
 func TestMultiRuntimeCoordinatorIgnoresMatchingResults(t *testing.T) {
