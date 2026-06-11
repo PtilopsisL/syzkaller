@@ -24,14 +24,16 @@ import (
 )
 
 type managedRuntime struct {
-	name       string
-	cfg        *mgrconfig.Config
-	runtime    *manager.KernelRuntime
-	controller *runtimeController
-	crashStore *manager.CrashStore
-	reproLoop  *manager.ReproLoop
-	features   flatrpc.Feature
-	shadow     bool
+	name           string
+	cfg            *mgrconfig.Config
+	runtime        *manager.KernelRuntime
+	controller     *runtimeController
+	crashStore     *manager.CrashStore
+	reproLoop      *manager.ReproLoop
+	features       flatrpc.Feature
+	stats          rpcserver.Stats
+	snapshotSource *queue.Distributor
+	shadow         bool
 }
 
 type runtimeController struct {

@@ -70,8 +70,8 @@ func TestLoadDataMultiRuntime(t *testing.T) {
 	assert.Equal(t, "/linux-v6.1", shadow.KernelObj)
 }
 
-func TestLoadDataRejectsMultiRuntimeSnapshot(t *testing.T) {
-	_, err := LoadData([]byte(fmt.Sprintf(`{
+func TestLoadDataMultiRuntimeSnapshot(t *testing.T) {
+	cfg, err := LoadData([]byte(fmt.Sprintf(`{
 		"name": "multi-manager",
 		"target": "linux/amd64",
 		"http": "localhost:0",
@@ -88,7 +88,13 @@ func TestLoadDataRejectsMultiRuntimeSnapshot(t *testing.T) {
 			"kernel": "/linux/arch/x86/boot/bzImage"
 		},
 		"primary": "main",
-		"runtimes": [{"name": "main"}]
+		"runtimes": [
+			{"name": "main"},
+			{"name": "shadow", "kernel_obj": "/linux-shadow"}
+		]
 	}`, t.TempDir())))
-	require.ErrorContains(t, err, "multi-runtime mode does not support snapshot")
+	require.NoError(t, err)
+	require.True(t, cfg.Snapshot)
+	require.True(t, cfg.RuntimeConfigs["main"].Snapshot)
+	require.True(t, cfg.RuntimeConfigs["shadow"].Snapshot)
 }

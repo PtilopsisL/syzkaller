@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/report"
@@ -60,17 +61,66 @@ func TestSwitchToSnapshotChangesDispatcherAndClosesServer(t *testing.T) {
 	})
 
 	before := dispatcherDefaultJobPtr(t, mgr.runtime.Pool())
-	ret := mgr.switchToSnapshot(queue.Callback(func() *queue.Request {
+	ret := mgr.switchToSnapshot(mgr.primary, queue.Callback(func() *queue.Request {
 		return nil
 	}))
 
-	require.NotNil(t, mgr.snapshotSource)
+	require.NotNil(t, mgr.primary.snapshotSource)
 	assert.Nil(t, mgr.runtime.Server())
 	assert.Nil(t, ret.Next())
 
 	after := dispatcherDefaultJobPtr(t, mgr.runtime.Pool())
 	assert.NotEqual(t, before, after)
-	assert.Equal(t, reflect.ValueOf(mgr.snapshotInstance).Pointer(), after)
+}
+
+func TestSwitchToSnapshotChangesAllRuntimeDispatchers(t *testing.T) {
+	primaryCfg := testManagerConfig(t)
+	primaryCfg.Snapshot = true
+	shadowCfg := testManagerConfig(t)
+	shadowCfg.Snapshot = true
+	shadowCfg.Workdir = t.TempDir()
+	shadowCfg.Cover = false
+
+	displayCfg := testManagerConfig(t)
+	displayCfg.Snapshot = true
+	displayCfg.PrimaryRuntime = "primary"
+	displayCfg.Runtimes = []mgrconfig.Runtime{
+		{Name: "primary"},
+		{Name: "shadow"},
+	}
+	displayCfg.RuntimeConfigs = map[string]*mgrconfig.Config{
+		"primary": primaryCfg,
+		"shadow":  shadowCfg,
+	}
+
+	mgr := &Manager{
+		cfg:        primaryCfg,
+		displayCfg: displayCfg,
+		mode:       ModeFuzzing,
+	}
+	require.NoError(t, mgr.initRuntime(false))
+	t.Cleanup(func() {
+		require.NoError(t, mgr.closeRuntimes())
+	})
+
+	before := map[string]uintptr{}
+	for _, slot := range mgr.runtimeList() {
+		before[slot.name] = dispatcherDefaultJobPtr(t, slot.runtime.Pool())
+		ret := mgr.switchToSnapshot(slot, queue.Callback(func() *queue.Request {
+			return nil
+		}))
+		require.NotNil(t, slot.snapshotSource)
+		assert.Nil(t, slot.runtime.Server())
+		assert.Nil(t, ret.Next())
+	}
+	for _, slot := range mgr.runtimeList() {
+		assert.NotEqual(t, before[slot.name], dispatcherDefaultJobPtr(t, slot.runtime.Pool()))
+	}
+}
+
+func TestSnapshotEnvFlagsDropSyscallTrace(t *testing.T) {
+	flags := flatrpc.ExecEnvSandboxNone | flatrpc.ExecEnvSyscallTrace
+	assert.Equal(t, flatrpc.ExecEnvSandboxNone, snapshotEnvFlags(flags))
 }
 
 func TestInitRuntimeCreatesPrimaryAndShadowRuntimes(t *testing.T) {

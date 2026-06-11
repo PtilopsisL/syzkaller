@@ -205,9 +205,6 @@ func Complete(cfg *Config) error {
 		return fmt.Errorf("if config param type is none, reproduce must be false")
 	}
 	if len(cfg.Runtimes) != 0 {
-		if cfg.Snapshot {
-			return fmt.Errorf("multi-runtime mode does not support snapshot")
-		}
 		return cfg.completeRuntimes()
 	}
 

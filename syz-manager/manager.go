@@ -90,10 +90,9 @@ type Manager struct {
 	// cfg.DashboardOnlyRepro is set, so that we don't accidentially use dash for anything.
 	dashRepro *dashapi.Dashboard
 
-	mu             sync.Mutex
-	fuzzer         atomic.Pointer[fuzzer.Fuzzer]
-	snapshotSource *queue.Distributor
-	phase          int
+	mu     sync.Mutex
+	fuzzer atomic.Pointer[fuzzer.Fuzzer]
+	phase  int
 
 	disabledHashes   map[string]struct{}
 	newRepros        [][]byte
@@ -446,6 +445,7 @@ func (mgr *Manager) initRuntime(debug bool) error {
 		if !shadow {
 			mgr.servStats = stats
 		}
+		slot.stats = stats
 		runtime, err := manager.NewKernelRuntime(name, runtimeCfg, manager.KernelRuntimeOptions{
 			Debug:           debug,
 			RPCManager:      slot.controller,
@@ -1302,7 +1302,12 @@ func (mgr *Manager) machineChecked(slot *managedRuntime, features flatrpc.Featur
 		}
 		opts := fuzzer.DefaultExecOpts(slot.cfg, features, *flagDebug)
 		source := mgr.programRegistry.EnsureRuntime(slot.name, slot.cfg.Target, enabledSyscalls)
-		return queue.DefaultOpts(source, opts), nil
+		source = queue.DefaultOpts(source, opts)
+		if slot.cfg.Snapshot {
+			log.Logf(0, "%s: restarting VMs for snapshot mode", slot.name)
+			return mgr.switchToSnapshot(slot, source), nil
+		}
+		return source, nil
 	}
 	if mgr.mode.ExitAfterMachineCheck {
 		mgr.exit(mgr.mode.Name)
@@ -1397,9 +1402,9 @@ func (mgr *Manager) machineChecked(slot *managedRuntime, features flatrpc.Featur
 			source = mgr.programRegistry.sourceForRuntime(slot.name, source)
 		}
 		source = queue.DefaultOpts(source, opts)
-		if mgr.cfg.Snapshot {
-			log.Logf(0, "restarting VMs for snapshot mode")
-			return mgr.switchToSnapshot(source), nil
+		if slot.cfg.Snapshot {
+			log.Logf(0, "%s: restarting VMs for snapshot mode", slot.name)
+			return mgr.switchToSnapshot(slot, source), nil
 		}
 		return source, nil
 	case ModeCorpusRun:
@@ -1489,11 +1494,13 @@ func (mgr *Manager) MaxSignal() signal.Signal {
 	return nil
 }
 
-func (mgr *Manager) switchToSnapshot(source queue.Source) queue.Source {
-	mgr.snapshotSource = queue.Distribute(source)
-	mgr.runtime.Pool().SetDefault(mgr.snapshotInstance)
-	if err := mgr.runtime.CloseServer(); err != nil {
-		log.Errorf("failed to close rpc server for snapshot mode: %v", err)
+func (mgr *Manager) switchToSnapshot(slot *managedRuntime, source queue.Source) queue.Source {
+	slot.snapshotSource = queue.Distribute(source)
+	slot.runtime.Pool().SetDefault(func(ctx context.Context, inst *vm.Instance, updInfo dispatcher.UpdateInfo) {
+		mgr.snapshotInstance(slot, ctx, inst, updInfo)
+	})
+	if err := slot.runtime.CloseServer(); err != nil {
+		log.Errorf("%s: failed to close rpc server for snapshot mode: %v", slot.name, err)
 	}
 	return queue.Callback(func() *queue.Request {
 		return nil
