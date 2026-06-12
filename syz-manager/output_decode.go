@@ -100,7 +100,7 @@ func decodeOutputArg(target *prog.Target, root prog.Arg, rootPath string,
 			// The pointee has its own capture and address space.
 			return
 		default:
-			if arg.Dir() == prog.DirIn {
+			if arg.Dir() == prog.DirIn || prog.IsPad(arg.Type()) {
 				return
 			}
 			ret = append(ret, decodeOutputValue(target, arg, path, offset, data))

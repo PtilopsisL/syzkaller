@@ -1443,7 +1443,7 @@ void copyout_call_results(thread_t* th)
 				failmsg("output capture is too large", "size=%llu", size);
 			if (id > UINT32_MAX)
 				failmsg("output capture id is too large", "id=%llu", id);
-			if (!flag_collect_outputs)
+			if (!flag_collect_outputs || !succeeded)
 				break;
 			output_capture_t output = {};
 			output.id = static_cast<uint32>(id);

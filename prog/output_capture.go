@@ -83,6 +83,9 @@ func outputCapturePlan(target *Target, call *Call) []OutputCapture {
 }
 
 func hasDirectOutputArg(arg Arg) bool {
+	if IsPad(arg.Type()) {
+		return false
+	}
 	switch a := arg.(type) {
 	case *PointerArg:
 		return a.Dir() != DirIn

@@ -147,21 +147,39 @@ func summarizeRuntimeResult(runtimeName string, req *queue.Request, res *queue.R
 }
 
 func (coord *multiRuntimeCoordinator) handleCompletedRun(run *programRun) {
-	mismatch := compareRuntimeResults(run.Results)
-	if mismatch == nil {
-		return
-	}
 	switch run.Stage {
 	case runStageFuzz:
+		mismatch := compareRuntimeResultsWithRules(run.Results, coord.noise.snapshot())
+		if mismatch == nil {
+			return
+		}
 		log.Logf(1, "program %d has cross-runtime result mismatch; scheduling repro", run.ID)
 		coord.enqueueMismatchRepro(run)
 	case runStageRepro:
+		changed, err := coord.noise.learn(run.Samples)
+		if err != nil {
+			log.Logf(0, "failed to update runtime noise rules for program %d: %v",
+				run.ParentID, err)
+		} else if changed {
+			log.Logf(1, "updated runtime noise rules after repro of program %d", run.ParentID)
+		}
+		rules := coord.noise.snapshot()
+		results, unstableRuntime := stableRuntimeResults(run.Samples, rules)
+		if unstableRuntime != "" {
+			log.Logf(1, "program %d remains unstable within runtime %q after denoise",
+				run.ParentID, unstableRuntime)
+			return
+		}
+		mismatch := compareRuntimeResultsWithRules(results, rules)
+		if mismatch == nil {
+			return
+		}
 		if coord.store == nil {
 			log.Logf(1, "confirmed runtime mismatch for program %d; no mismatch store configured",
 				run.ParentID)
 			return
 		}
-		path, err := coord.store.Save(run, mismatch)
+		path, err := coord.store.Save(run, mismatch, rules)
 		if err != nil {
 			log.Logf(0, "failed to save runtime mismatch for program %d: %v", run.ParentID, err)
 			return
@@ -174,6 +192,11 @@ func (coord *multiRuntimeCoordinator) handleCompletedRun(run *programRun) {
 }
 
 func compareRuntimeResults(results map[string]*runtimeResult) *runtimeMismatch {
+	return compareRuntimeResultsWithRules(results, noiseRuleFile{})
+}
+
+func compareRuntimeResultsWithRules(results map[string]*runtimeResult,
+	rules noiseRuleFile) *runtimeMismatch {
 	if len(results) < 2 {
 		return nil
 	}
@@ -184,7 +207,7 @@ func compareRuntimeResults(results map[string]*runtimeResult) *runtimeMismatch {
 		if result.Status == queue.Unsupported {
 			return nil
 		}
-		compared[name] = comparisonRuntimeResultFor(result)
+		compared[name] = comparisonRuntimeResultForRules(result, rules)
 	}
 	reference := compared[names[0]]
 	for _, name := range names[1:] {
@@ -200,21 +223,82 @@ func compareRuntimeResults(results map[string]*runtimeResult) *runtimeMismatch {
 }
 
 func comparisonRuntimeResultFor(result *runtimeResult) *comparisonRuntimeResult {
+	return comparisonRuntimeResultForRules(result, noiseRuleFile{})
+}
+
+func comparisonRuntimeResultForRules(result *runtimeResult,
+	rules noiseRuleFile) *comparisonRuntimeResult {
 	ret := &comparisonRuntimeResult{
 		Status: result.Status,
 		Err:    result.Err,
 	}
 	for _, call := range result.Calls {
+		rule := rules.Syscalls[call.Name]
+		errno := call.Error
+		if rule.Ignore.Errno {
+			errno = 0
+		}
+		var returnValue *int64
+		if !rule.Ignore.ReturnValue {
+			returnValue = cloneInt64(call.ReturnValue)
+		}
 		ret.Calls = append(ret.Calls, comparisonRuntimeCallResult{
 			Index:       call.Index,
 			Name:        call.Name,
 			Flags:       call.Flags,
-			Error:       call.Error,
-			ReturnValue: cloneInt64(call.ReturnValue),
-			Outputs:     cloneRuntimeOutputCaptures(call.Outputs),
+			Error:       errno,
+			ReturnValue: returnValue,
+			Outputs:     filterRuntimeOutputCaptures(call.Outputs, rule.Ignore.Outputs),
 		})
 	}
 	return ret
+}
+
+func filterRuntimeOutputCaptures(captures []*runtimeOutputCapture,
+	ignoredPaths []string) []*runtimeOutputCapture {
+	ret := cloneRuntimeOutputCaptures(captures)
+	if len(ret) == 0 || len(ignoredPaths) == 0 {
+		return ret
+	}
+	ignored := make(map[string]bool, len(ignoredPaths))
+	for _, path := range ignoredPaths {
+		ignored[path] = true
+	}
+	for _, capture := range ret {
+		if capture == nil {
+			continue
+		}
+		values := capture.Values[:0]
+		for _, value := range capture.Values {
+			if value == nil || !ignored[value.Path] {
+				values = append(values, value)
+			}
+		}
+		if len(values) == 0 {
+			capture.Values = nil
+		} else {
+			capture.Values = values
+		}
+	}
+	return ret
+}
+
+func stableRuntimeResults(samples map[string][]*runtimeResult,
+	rules noiseRuleFile) (map[string]*runtimeResult, string) {
+	ret := make(map[string]*runtimeResult, len(samples))
+	for runtimeName, runtimeSamples := range samples {
+		if len(runtimeSamples) == 0 {
+			return nil, runtimeName
+		}
+		baseline := comparisonRuntimeResultForRules(runtimeSamples[0], rules)
+		for _, sample := range runtimeSamples[1:] {
+			if !reflect.DeepEqual(baseline, comparisonRuntimeResultForRules(sample, rules)) {
+				return nil, runtimeName
+			}
+		}
+		ret[runtimeName] = runtimeSamples[0]
+	}
+	return ret, ""
 }
 
 func summarizeCallArgs(p *prog.Prog, callIndex int) []*runtimeCallArg {
@@ -465,7 +549,8 @@ func (coord *multiRuntimeCoordinator) enqueueMismatchRepro(initial *programRun) 
 		ProgData:       append([]byte(nil), initial.ProgData...),
 		Important:      true,
 		Expected:       expected,
-		Results:        map[string]*runtimeResult{},
+		Samples:        map[string][]*runtimeResult{},
+		ReproRuns:      mismatchReproRuns,
 		InitialResults: copyRuntimeResults(initial.Results),
 	}
 
@@ -478,19 +563,24 @@ func (coord *multiRuntimeCoordinator) enqueueMismatchRepro(initial *programRun) 
 	coord.mu.Unlock()
 
 	for runtimeName, runtimeQueue := range queues {
-		req := &queue.Request{
-			ProgID:    reproID,
-			Prog:      reproRun.Prog.Clone(),
-			Important: true,
-		}
-		fuzzer.EnableSyscallTrace(req)
-		fuzzer.EnableSyscallOutputs(req)
-		req.OnDone(func(r *queue.Request, res *queue.Result) bool {
-			coord.recordResult(runtimeName, r, res)
-			return true
-		})
-		runtimeQueue.Submit(req)
+		coord.submitReproSample(reproRun, runtimeName, runtimeQueue)
 	}
+}
+
+func (coord *multiRuntimeCoordinator) submitReproSample(run *programRun, runtimeName string,
+	runtimeQueue *queue.PlainQueue) {
+	req := &queue.Request{
+		ProgID:    run.ID,
+		Prog:      run.Prog.Clone(),
+		Important: true,
+	}
+	fuzzer.EnableSyscallTrace(req)
+	fuzzer.EnableSyscallOutputs(req)
+	req.OnDone(func(r *queue.Request, res *queue.Result) bool {
+		coord.recordResult(runtimeName, r, res)
+		return true
+	})
+	runtimeQueue.Submit(req)
 }
 
 func sortedRuntimeNames(results map[string]*runtimeResult) []string {
@@ -578,11 +668,13 @@ type storedMismatchReport struct {
 	Reason         string                              `json:"reason"`
 	Runtimes       []string                            `json:"runtimes"`
 	InitialResults map[string]*runtimeResult           `json:"initial_results"`
-	ReproResults   map[string]*runtimeResult           `json:"repro_results"`
+	ReproSamples   map[string][]*runtimeResult         `json:"repro_samples"`
+	NoiseRules     noiseRuleFile                       `json:"noise_rules"`
 	Compared       map[string]*comparisonRuntimeResult `json:"compared"`
 }
 
-func (store *mismatchStore) Save(run *programRun, mismatch *runtimeMismatch) (string, error) {
+func (store *mismatchStore) Save(run *programRun, mismatch *runtimeMismatch,
+	rules noiseRuleFile) (string, error) {
 	if store == nil {
 		return "", nil
 	}
@@ -599,7 +691,8 @@ func (store *mismatchStore) Save(run *programRun, mismatch *runtimeMismatch) (st
 		Reason:         mismatch.Reason,
 		Runtimes:       mismatch.Runtimes,
 		InitialResults: run.InitialResults,
-		ReproResults:   run.Results,
+		ReproSamples:   run.Samples,
+		NoiseRules:     rules,
 		Compared:       mismatch.Compared,
 	}
 	data, err := json.MarshalIndent(report, "", "  ")
@@ -609,23 +702,27 @@ func (store *mismatchStore) Save(run *programRun, mismatch *runtimeMismatch) (st
 	if err := os.WriteFile(filepath.Join(dir, "report.json"), data, 0o644); err != nil {
 		return "", err
 	}
-	for runtimeName, result := range run.Results {
-		var text strings.Builder
-		for _, call := range result.Calls {
-			if call.Sctrace == "" {
+	for runtimeName, samples := range run.Samples {
+		for sampleIndex, result := range samples {
+			var text strings.Builder
+			for _, call := range result.Calls {
+				if call.Sctrace == "" {
+					continue
+				}
+				text.WriteString(call.Sctrace)
+				if !strings.HasSuffix(call.Sctrace, "\n") {
+					text.WriteByte('\n')
+				}
+			}
+			if text.Len() == 0 {
 				continue
 			}
-			text.WriteString(call.Sctrace)
-			if !strings.HasSuffix(call.Sctrace, "\n") {
-				text.WriteByte('\n')
+			name := fmt.Sprintf("%s.sample%d.strace.log",
+				sanitizeFileName(runtimeName), sampleIndex+1)
+			if err := os.WriteFile(filepath.Join(dir, "logs", name),
+				[]byte(text.String()), 0o644); err != nil {
+				return "", err
 			}
-		}
-		if text.Len() == 0 {
-			continue
-		}
-		name := sanitizeFileName(runtimeName) + ".strace.log"
-		if err := os.WriteFile(filepath.Join(dir, "logs", name), []byte(text.String()), 0o644); err != nil {
-			return "", err
 		}
 	}
 	return dir, nil

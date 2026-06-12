@@ -93,17 +93,31 @@ func TestMultiRuntimeCoordinatorSchedulesMismatchRepro(t *testing.T) {
 	primaryReq.Done(testResult(0, "0: test() = 0 {0}\n"))
 	shadowReq.Done(testResult(1, "0: test() = -1 {1}\n"))
 
-	primaryRepro := primarySource.Next()
-	require.NotNil(t, primaryRepro)
-	shadowRepro := shadowSource.Next()
-	require.NotNil(t, shadowRepro)
-	assert.NotEqual(t, primaryReq.ProgID, primaryRepro.ProgID)
-	assert.Equal(t, primaryRepro.ProgID, shadowRepro.ProgID)
-	assert.NotZero(t, primaryRepro.ExecOpts.EnvFlags&flatrpc.ExecEnvSyscallTrace)
-	assert.NotZero(t, shadowRepro.ExecOpts.EnvFlags&flatrpc.ExecEnvSyscallTrace)
-
-	primaryRepro.Done(testResult(0, "0: test() = 0 {0}\n"))
-	shadowRepro.Done(testResult(1, "0: test() = -1 {1}\n"))
+	var reproID int64
+	for i := range mismatchReproRuns {
+		primaryRepro := primarySource.Next()
+		require.NotNil(t, primaryRepro)
+		shadowRepro := shadowSource.Next()
+		require.NotNil(t, shadowRepro)
+		if i == 0 {
+			reproID = primaryRepro.ProgID
+			assert.NotEqual(t, primaryReq.ProgID, reproID)
+		}
+		assert.Equal(t, reproID, primaryRepro.ProgID)
+		assert.Equal(t, reproID, shadowRepro.ProgID)
+		assert.NotZero(t, primaryRepro.ExecOpts.EnvFlags&flatrpc.ExecEnvSyscallTrace)
+		assert.NotZero(t, shadowRepro.ExecOpts.EnvFlags&flatrpc.ExecEnvSyscallTrace)
+		assert.Equal(t, 0, coord.reproQueueLen("primary"))
+		assert.Equal(t, 0, coord.reproQueueLen("shadow"))
+		primaryRepro.Done(testResult(0, "0: test() = 0 {0}\n"))
+		if i+1 < mismatchReproRuns {
+			assert.Equal(t, 1, coord.reproQueueLen("primary"))
+		}
+		shadowRepro.Done(testResult(1, "0: test() = -1 {1}\n"))
+		if i+1 < mismatchReproRuns {
+			assert.Equal(t, 1, coord.reproQueueLen("shadow"))
+		}
+	}
 
 	entries, err := os.ReadDir(filepath.Join(coord.store.baseDir))
 	require.NoError(t, err)
@@ -115,11 +129,49 @@ func TestMultiRuntimeCoordinatorSchedulesMismatchRepro(t *testing.T) {
 	require.NoError(t, err)
 	var report storedMismatchReport
 	require.NoError(t, json.Unmarshal(data, &report))
-	require.NotEmpty(t, report.ReproResults)
-	for _, result := range report.ReproResults {
-		require.NotEmpty(t, result.Calls)
-		assert.NotEmpty(t, result.Calls[0].Args)
+	require.NotEmpty(t, report.ReproSamples)
+	for _, samples := range report.ReproSamples {
+		require.Len(t, samples, mismatchReproRuns)
+		for _, result := range samples {
+			require.NotEmpty(t, result.Calls)
+			assert.NotEmpty(t, result.Calls[0].Args)
+		}
 	}
+}
+
+func TestMultiRuntimeCoordinatorLearnsAndAppliesNoise(t *testing.T) {
+	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
+	require.NoError(t, err)
+
+	workdir := t.TempDir()
+	coord := newMultiRuntimeCoordinator(workdir)
+	primaryBase := queue.Plain()
+	primarySource := coord.sourceForRuntime("primary", primaryBase)
+	shadowSource := coord.EnsureRuntime("shadow", target, allSyscalls(target))
+
+	primaryReq := &queue.Request{Prog: mustDeserializeProg(t, target, `ptrace(0x10, 0x17)`)}
+	coord.registerPrimary("primary", primaryReq)
+	shadowReq := shadowSource.Next()
+	require.NotNil(t, shadowReq)
+
+	primaryReq.Done(testResult(1, ""))
+	shadowReq.Done(testResult(9, ""))
+
+	primaryErrnos := []int32{1, 2, 3}
+	for i := range mismatchReproRuns {
+		primaryRepro := primarySource.Next()
+		require.NotNil(t, primaryRepro)
+		shadowRepro := shadowSource.Next()
+		require.NotNil(t, shadowRepro)
+		primaryRepro.Done(testResult(primaryErrnos[i], ""))
+		shadowRepro.Done(testResult(9, ""))
+	}
+
+	rules := coord.noise.snapshot()
+	require.Contains(t, rules.Syscalls, "ptrace")
+	assert.True(t, rules.Syscalls["ptrace"].Ignore.Errno)
+	assert.FileExists(t, filepath.Join(workdir, noiseRuleFileName))
+	assert.NoFileExists(t, coord.store.baseDir)
 }
 
 func TestMultiRuntimeCoordinatorIgnoresMatchingResults(t *testing.T) {

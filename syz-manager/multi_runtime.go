@@ -96,6 +96,8 @@ const (
 	runStageRepro
 )
 
+const mismatchReproRuns = 3
+
 type programRun struct {
 	ID             int64
 	ParentID       int64
@@ -105,6 +107,8 @@ type programRun struct {
 	Important      bool
 	Expected       map[string]bool
 	Results        map[string]*runtimeResult
+	Samples        map[string][]*runtimeResult
+	ReproRuns      int
 	InitialResults map[string]*runtimeResult
 }
 
@@ -117,6 +121,7 @@ type multiRuntimeCoordinator struct {
 	statuses    map[string]map[int64]queue.Status
 	runs        map[int64]*programRun
 	store       *mismatchStore
+	noise       *noiseFilter
 }
 
 type shadowConsumer struct {
@@ -136,6 +141,7 @@ func newMultiRuntimeCoordinator(workdir string) *multiRuntimeCoordinator {
 		statuses:    map[string]map[int64]queue.Status{},
 		runs:        map[int64]*programRun{},
 		store:       newMismatchStore(workdir),
+		noise:       newNoiseFilter(workdir),
 	}
 }
 
@@ -258,6 +264,8 @@ func (coord *multiRuntimeCoordinator) recordResult(runtimeName string, req *queu
 func (coord *multiRuntimeCoordinator) recordRuntimeResult(runtimeName string, progID int64,
 	result *runtimeResult) {
 	var completed *programRun
+	var nextSample *programRun
+	var nextQueue *queue.PlainQueue
 	coord.mu.Lock()
 	if coord.statuses[runtimeName] == nil {
 		coord.statuses[runtimeName] = map[int64]queue.Status{}
@@ -265,15 +273,45 @@ func (coord *multiRuntimeCoordinator) recordRuntimeResult(runtimeName string, pr
 	coord.statuses[runtimeName][progID] = result.Status
 	run := coord.runs[progID]
 	if run != nil && run.Expected[runtimeName] {
-		run.Results[runtimeName] = result
-		if len(run.Results) == len(run.Expected) {
+		switch run.Stage {
+		case runStageFuzz:
+			run.Results[runtimeName] = result
+		case runStageRepro:
+			if len(run.Samples[runtimeName]) < run.ReproRuns {
+				run.Samples[runtimeName] = append(run.Samples[runtimeName], result)
+			}
+			if len(run.Samples[runtimeName]) < run.ReproRuns {
+				nextSample = run
+				nextQueue = coord.runtimeQueueLocked(runtimeName)
+			}
+		}
+		if runComplete(run) {
 			completed = run
 			delete(coord.runs, progID)
 		}
 	}
 	coord.mu.Unlock()
+	if nextSample != nil {
+		coord.submitReproSample(nextSample, runtimeName, nextQueue)
+	}
 	if completed != nil {
 		coord.handleCompletedRun(completed)
+	}
+}
+
+func runComplete(run *programRun) bool {
+	switch run.Stage {
+	case runStageFuzz:
+		return len(run.Results) == len(run.Expected)
+	case runStageRepro:
+		for runtimeName := range run.Expected {
+			if len(run.Samples[runtimeName]) != run.ReproRuns {
+				return false
+			}
+		}
+		return true
+	default:
+		panic(fmt.Sprintf("unknown multi-runtime run stage %d", run.Stage))
 	}
 }
 

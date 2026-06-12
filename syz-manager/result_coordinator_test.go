@@ -178,6 +178,20 @@ func TestSummarizeOutputDataKeepsPartialCapture(t *testing.T) {
 	assert.Equal(t, "6162636465666768696a6b6c6d6e6f70", summary.PreviewHex)
 }
 
+func TestDecodeOutputArgSkipsPadding(t *testing.T) {
+	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
+	require.NoError(t, err)
+	var padding prog.Type
+	prog.ForeachType(target.Syscalls, func(typ prog.Type, _ *prog.TypeCtx) {
+		if padding == nil && prog.IsPad(typ) {
+			padding = typ
+		}
+	})
+	require.NotNil(t, padding)
+	arg := padding.DefaultArg(prog.DirOut)
+	assert.Empty(t, decodeOutputArg(target, arg, "arg[0].pad", make([]byte, arg.Size())))
+}
+
 func mustDeserializeProg(t *testing.T, target *prog.Target, text string) *prog.Prog {
 	t.Helper()
 	p, err := target.Deserialize([]byte(strings.TrimSpace(text)), prog.NonStrict)
