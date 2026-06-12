@@ -615,6 +615,7 @@ test$res1(r0)
 			[]any{
 				callID("test$res3"), ExecNoCopyout, 1, execArgAddr64, 0x10,
 				execInstrCopyout, 0, 0x10, 4,
+				execInstrObserve, 0, 0x10, 4, 0,
 				callID("test$res1"), ExecNoCopyout, 1, execArgResult, 4, 0, 0, 0, 0xffff,
 				execInstrEOF,
 			},
@@ -634,6 +635,13 @@ test$res1(r0)
 								Index: 0,
 								Addr:  dataOffset + 0x10,
 								Size:  4,
+							},
+						},
+						Observe: []ExecObserve{
+							{
+								ID:   0,
+								Addr: dataOffset + 0x10,
+								Size: 4,
 							},
 						},
 					},

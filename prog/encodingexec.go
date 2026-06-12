@@ -18,6 +18,7 @@
 //  - execInstrCopyin: copies its second argument into address specified by first argument
 //  - execInstrCopyout: reads value at address specified by first argument (result can be referenced by execArgResult)
 //  - execInstrSetProps: sets special properties for the previous call
+//  - execInstrObserve: captures an output memory range after the previous call
 
 package prog
 
@@ -33,6 +34,7 @@ const (
 	execInstrCopyin
 	execInstrCopyout
 	execInstrSetProps
+	execInstrObserve
 )
 
 const (
@@ -126,6 +128,7 @@ func (w *execContext) serializeCall(c *Call) error {
 
 	// Generate copyout instructions that persist interesting return values.
 	w.writeCopyout(c)
+	w.writeOutputCaptures(c)
 	return nil
 }
 
@@ -319,6 +322,20 @@ func (w *execContext) writeCopyout(c *Call) {
 			w.write(arg.Size())
 		}
 	})
+}
+
+func (w *execContext) writeOutputCaptures(c *Call) {
+	for _, capture := range outputCapturePlan(w.target, c) {
+		w.write(execInstrObserve)
+		w.write(uint64(capture.ID))
+		w.write(capture.Addr - w.target.DataOffset)
+		w.write(capture.Size)
+		if capture.Truncated {
+			w.write(1)
+		} else {
+			w.write(0)
+		}
+	}
 }
 
 func (w *execContext) write(v uint64) {

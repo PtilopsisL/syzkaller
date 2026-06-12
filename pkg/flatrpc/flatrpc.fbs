@@ -162,6 +162,7 @@ enum ExecFlag : uint64 (bit_flags) {
 	DedupCover,		// deduplicate coverage in executor
 	CollectComps,		// collect KCOV comparisons
 	Threaded,		// use multiple threads to mitigate blocked syscalls
+	CollectOutputs,		// collect syscall return values and output arguments
 }
 
 struct ExecOptsRaw {
@@ -231,6 +232,16 @@ table CallInfoRaw {
 	comps			:[ComparisonRaw];
 	// Syscall trace output from libsclog.
 	sctrace			:[uint8];
+	return_value		:int64;
+	return_value_valid	:bool;
+	outputs			:[OutputCaptureRaw];
+}
+
+table OutputCaptureRaw {
+	id			:uint32;
+	data			:[uint8];
+	faulted			:bool;
+	truncated		:bool;
 }
 
 struct ComparisonRaw {

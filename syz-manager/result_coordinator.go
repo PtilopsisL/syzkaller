@@ -30,12 +30,14 @@ type runtimeResult struct {
 }
 
 type runtimeCallResult struct {
-	Index   int               `json:"index"`
-	Name    string            `json:"name,omitempty"`
-	Args    []*runtimeCallArg `json:"args,omitempty"`
-	Flags   flatrpc.CallFlag  `json:"flags"`
-	Error   int32             `json:"error"`
-	Sctrace string            `json:"sctrace,omitempty"`
+	Index       int                     `json:"index"`
+	Name        string                  `json:"name,omitempty"`
+	Args        []*runtimeCallArg       `json:"args,omitempty"`
+	Flags       flatrpc.CallFlag        `json:"flags"`
+	Error       int32                   `json:"error"`
+	ReturnValue *int64                  `json:"return_value,omitempty"`
+	Outputs     []*runtimeOutputCapture `json:"outputs,omitempty"`
+	Sctrace     string                  `json:"sctrace,omitempty"`
 }
 
 type runtimeCallArg struct {
@@ -56,31 +58,58 @@ type runtimeCallArg struct {
 }
 
 type runtimeDataSummary struct {
-	Size       uint64 `json:"size"`
-	Hash       string `json:"hash,omitempty"`
-	PreviewHex string `json:"preview_hex,omitempty"`
-	Truncated  bool   `json:"truncated,omitempty"`
-	Output     bool   `json:"output,omitempty"`
+	Size         uint64 `json:"size"`
+	CapturedSize uint64 `json:"captured_size,omitempty"`
+	Hash         string `json:"hash,omitempty"`
+	PreviewHex   string `json:"preview_hex,omitempty"`
+	Truncated    bool   `json:"truncated,omitempty"`
+	Output       bool   `json:"output,omitempty"`
 }
 
-type normalizedRuntimeCallResult struct {
-	Index   int              `json:"index"`
-	Name    string           `json:"name,omitempty"`
-	Flags   flatrpc.CallFlag `json:"flags"`
-	Error   int32            `json:"error"`
-	Sctrace string           `json:"sctrace,omitempty"`
+type runtimeOutputCapture struct {
+	ID           uint32                  `json:"id"`
+	Path         string                  `json:"path,omitempty"`
+	Type         string                  `json:"type,omitempty"`
+	Size         uint64                  `json:"size,omitempty"`
+	CapturedSize uint64                  `json:"captured_size,omitempty"`
+	Missing      bool                    `json:"missing,omitempty"`
+	Faulted      bool                    `json:"faulted,omitempty"`
+	Truncated    bool                    `json:"truncated,omitempty"`
+	Values       []*runtimeDecodedOutput `json:"values,omitempty"`
 }
 
-type normalizedRuntimeResult struct {
+type runtimeDecodedOutput struct {
+	Path        string              `json:"path"`
+	Type        string              `json:"type"`
+	Dir         string              `json:"dir"`
+	Kind        string              `json:"kind"`
+	Size        uint64              `json:"size,omitempty"`
+	Value       *uint64             `json:"value,omitempty"`
+	ValueNames  []string            `json:"value_names,omitempty"`
+	RawHex      string              `json:"raw_hex,omitempty"`
+	Truncated   bool                `json:"truncated,omitempty"`
+	DataSummary *runtimeDataSummary `json:"data_summary,omitempty"`
+}
+
+type comparisonRuntimeCallResult struct {
+	Index       int                     `json:"index"`
+	Name        string                  `json:"name,omitempty"`
+	Flags       flatrpc.CallFlag        `json:"flags"`
+	Error       int32                   `json:"error"`
+	ReturnValue *int64                  `json:"return_value,omitempty"`
+	Outputs     []*runtimeOutputCapture `json:"outputs,omitempty"`
+}
+
+type comparisonRuntimeResult struct {
 	Status queue.Status                  `json:"status"`
 	Err    string                        `json:"err,omitempty"`
-	Calls  []normalizedRuntimeCallResult `json:"calls,omitempty"`
+	Calls  []comparisonRuntimeCallResult `json:"calls,omitempty"`
 }
 
 type runtimeMismatch struct {
-	Reason     string                              `json:"reason"`
-	Runtimes   []string                            `json:"runtimes"`
-	Normalized map[string]*normalizedRuntimeResult `json:"normalized"`
+	Reason   string                              `json:"reason"`
+	Runtimes []string                            `json:"runtimes"`
+	Compared map[string]*comparisonRuntimeResult `json:"compared"`
 }
 
 func summarizeRuntimeResult(runtimeName string, req *queue.Request, res *queue.Result) *runtimeResult {
@@ -104,6 +133,12 @@ func summarizeRuntimeResult(runtimeName string, req *queue.Request, res *queue.R
 		if call != nil {
 			callResult.Flags = call.Flags
 			callResult.Error = call.Error
+			if call.ReturnValueValid {
+				callResult.ReturnValue = int64Ptr(call.ReturnValue)
+			}
+			if req.Prog != nil && req.ExecOpts.ExecFlags&flatrpc.ExecFlagCollectOutputs != 0 {
+				callResult.Outputs = summarizeCallOutputs(req.Prog, i, call.Outputs)
+			}
 			callResult.Sctrace = string(call.Sctrace)
 		}
 		ret.Calls = append(ret.Calls, callResult)
@@ -143,39 +178,40 @@ func compareRuntimeResults(results map[string]*runtimeResult) *runtimeMismatch {
 		return nil
 	}
 	names := sortedRuntimeNames(results)
-	normalized := make(map[string]*normalizedRuntimeResult, len(results))
+	compared := make(map[string]*comparisonRuntimeResult, len(results))
 	for _, name := range names {
 		result := results[name]
 		if result.Status == queue.Unsupported {
 			return nil
 		}
-		normalized[name] = normalizeRuntimeResult(result)
+		compared[name] = comparisonRuntimeResultFor(result)
 	}
-	reference := normalized[names[0]]
+	reference := compared[names[0]]
 	for _, name := range names[1:] {
-		if !reflect.DeepEqual(reference, normalized[name]) {
+		if !reflect.DeepEqual(reference, compared[name]) {
 			return &runtimeMismatch{
-				Reason:     "runtime results differ after normalization",
-				Runtimes:   names,
-				Normalized: normalized,
+				Reason:   "runtime results differ",
+				Runtimes: names,
+				Compared: compared,
 			}
 		}
 	}
 	return nil
 }
 
-func normalizeRuntimeResult(result *runtimeResult) *normalizedRuntimeResult {
-	ret := &normalizedRuntimeResult{
+func comparisonRuntimeResultFor(result *runtimeResult) *comparisonRuntimeResult {
+	ret := &comparisonRuntimeResult{
 		Status: result.Status,
 		Err:    result.Err,
 	}
 	for _, call := range result.Calls {
-		ret.Calls = append(ret.Calls, normalizedRuntimeCallResult{
-			Index:   call.Index,
-			Name:    call.Name,
-			Flags:   call.Flags,
-			Error:   call.Error,
-			Sctrace: call.Sctrace,
+		ret.Calls = append(ret.Calls, comparisonRuntimeCallResult{
+			Index:       call.Index,
+			Name:        call.Name,
+			Flags:       call.Flags,
+			Error:       call.Error,
+			ReturnValue: cloneInt64(call.ReturnValue),
+			Outputs:     cloneRuntimeOutputCaptures(call.Outputs),
 		})
 	}
 	return ret
@@ -407,6 +443,17 @@ func uint64Ptr(v uint64) *uint64 {
 	return &v
 }
 
+func int64Ptr(v int64) *int64 {
+	return &v
+}
+
+func cloneInt64(v *int64) *int64 {
+	if v == nil {
+		return nil
+	}
+	return int64Ptr(*v)
+}
+
 func (coord *multiRuntimeCoordinator) enqueueMismatchRepro(initial *programRun) {
 	reproID := coord.nextID.Add(1)
 	expected := copyExpectedRuntimes(initial.Expected)
@@ -437,6 +484,7 @@ func (coord *multiRuntimeCoordinator) enqueueMismatchRepro(initial *programRun) 
 			Important: true,
 		}
 		fuzzer.EnableSyscallTrace(req)
+		fuzzer.EnableSyscallOutputs(req)
 		req.OnDone(func(r *queue.Request, res *queue.Result) bool {
 			coord.recordResult(runtimeName, r, res)
 			return true
@@ -469,6 +517,8 @@ func copyRuntimeResults(results map[string]*runtimeResult) map[string]*runtimeRe
 		copyResult.Calls = append([]runtimeCallResult(nil), result.Calls...)
 		for i := range copyResult.Calls {
 			copyResult.Calls[i].Args = cloneRuntimeCallArgs(result.Calls[i].Args)
+			copyResult.Calls[i].ReturnValue = cloneInt64(result.Calls[i].ReturnValue)
+			copyResult.Calls[i].Outputs = cloneRuntimeOutputCaptures(result.Calls[i].Outputs)
 		}
 		ret[name] = &copyResult
 	}
@@ -529,7 +579,7 @@ type storedMismatchReport struct {
 	Runtimes       []string                            `json:"runtimes"`
 	InitialResults map[string]*runtimeResult           `json:"initial_results"`
 	ReproResults   map[string]*runtimeResult           `json:"repro_results"`
-	Normalized     map[string]*normalizedRuntimeResult `json:"normalized"`
+	Compared       map[string]*comparisonRuntimeResult `json:"compared"`
 }
 
 func (store *mismatchStore) Save(run *programRun, mismatch *runtimeMismatch) (string, error) {
@@ -550,7 +600,7 @@ func (store *mismatchStore) Save(run *programRun, mismatch *runtimeMismatch) (st
 		Runtimes:       mismatch.Runtimes,
 		InitialResults: run.InitialResults,
 		ReproResults:   run.Results,
-		Normalized:     mismatch.Normalized,
+		Compared:       mismatch.Compared,
 	}
 	data, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {

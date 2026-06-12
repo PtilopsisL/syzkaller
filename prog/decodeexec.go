@@ -22,6 +22,7 @@ type ExecCall struct {
 	Args    []ExecArg
 	Copyin  []ExecCopyin
 	Copyout []ExecCopyout
+	Observe []ExecObserve
 }
 
 type ExecCopyin struct {
@@ -33,6 +34,13 @@ type ExecCopyout struct {
 	Index uint64
 	Addr  uint64
 	Size  uint64
+}
+
+type ExecObserve struct {
+	ID        uint64
+	Addr      uint64
+	Size      uint64
+	Truncated bool
 }
 
 type ExecArg interface{} // one of ExecArg*
@@ -126,6 +134,13 @@ func (dec *execDecoder) parse() {
 				Index: dec.read("instr/copyout/index"),
 				Addr:  dec.read("instr/copyout/addr") + dec.target.DataOffset,
 				Size:  dec.read("instr/copyout/size"),
+			})
+		case execInstrObserve:
+			dec.call.Observe = append(dec.call.Observe, ExecObserve{
+				ID:        dec.read("instr/observe/id"),
+				Addr:      dec.read("instr/observe/addr") + dec.target.DataOffset,
+				Size:      dec.read("instr/observe/size"),
+				Truncated: dec.read("instr/observe/truncated") != 0,
 			})
 		case execInstrEOF:
 			dec.commitCall()

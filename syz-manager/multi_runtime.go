@@ -328,6 +328,7 @@ func (source *shadowProgramSource) Next() *queue.Request {
 			Important: item.Important,
 		}
 		fuzzer.EnableSyscallTrace(req)
+		fuzzer.EnableSyscallOutputs(req)
 		req.OnDone(func(r *queue.Request, res *queue.Result) bool {
 			source.coord.recordResult(source.name, r, res)
 			return true
