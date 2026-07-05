@@ -76,6 +76,48 @@ func TestShadowProgramRegistryMarksUnsupported(t *testing.T) {
 	assert.Equal(t, queue.Unsupported, status)
 }
 
+func TestMultiRuntimeCoordinatorContinuesProgIDFromReservedState(t *testing.T) {
+	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
+	require.NoError(t, err)
+
+	workdir := t.TempDir()
+	coord := newMultiRuntimeCoordinator(workdir)
+	first := &queue.Request{Prog: testRegistryProg(target)}
+	coord.registerPrimary("primary", first)
+	require.EqualValues(t, 1, first.ProgID)
+
+	reserved, err := loadProgIDState(progIDStatePath(workdir))
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, reserved, int64(progIDReserveBatch))
+
+	restarted := newMultiRuntimeCoordinator(workdir)
+	next := &queue.Request{Prog: testRegistryProg(target)}
+	restarted.registerPrimary("primary", next)
+	assert.Equal(t, reserved+1, next.ProgID)
+}
+
+func TestMultiRuntimeCoordinatorContinuesProgIDFromArtifacts(t *testing.T) {
+	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
+	require.NoError(t, err)
+
+	workdir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(workdir, "runtime-mismatches", "prog12-repro15"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(workdir, "runtime-mismatches", "custom"), 0o755))
+	report := []byte(`{"parent_prog_id":48,"repro_prog_id":49}`)
+	require.NoError(t, os.WriteFile(filepath.Join(workdir, "runtime-mismatches", "custom", "report.json"),
+		report, 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(workdir, "strace-log"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(workdir, "strace-log", "strace.prog31.2.log"), nil, 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(workdir, "runtimes", "shadow", "strace-log"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(workdir, "runtimes", "shadow", "strace-log",
+		"strace.prog42.1.log"), nil, 0o644))
+
+	coord := newMultiRuntimeCoordinator(workdir)
+	req := &queue.Request{Prog: testRegistryProg(target)}
+	coord.registerPrimary("primary", req)
+	assert.EqualValues(t, 50, req.ProgID)
+}
+
 func TestMultiRuntimeCoordinatorSchedulesMismatchRepro(t *testing.T) {
 	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
 	require.NoError(t, err)

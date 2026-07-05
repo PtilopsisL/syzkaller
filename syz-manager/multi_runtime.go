@@ -115,6 +115,10 @@ type programRun struct {
 type multiRuntimeCoordinator struct {
 	nextID atomic.Int64
 
+	progIDMu       sync.Mutex
+	progIDState    string
+	reservedProgID int64
+
 	mu          sync.Mutex
 	consumers   map[string]*shadowConsumer
 	reproQueues map[string]*queue.PlainQueue
@@ -135,18 +139,43 @@ type shadowConsumer struct {
 }
 
 func newMultiRuntimeCoordinator(workdir string) *multiRuntimeCoordinator {
-	return &multiRuntimeCoordinator{
-		consumers:   map[string]*shadowConsumer{},
-		reproQueues: map[string]*queue.PlainQueue{},
-		statuses:    map[string]map[int64]queue.Status{},
-		runs:        map[int64]*programRun{},
-		store:       newMismatchStore(workdir),
-		noise:       newNoiseFilter(workdir),
+	maxID := maxPersistedProgID(workdir)
+	coord := &multiRuntimeCoordinator{
+		progIDState:    progIDStatePath(workdir),
+		reservedProgID: maxID,
+		consumers:      map[string]*shadowConsumer{},
+		reproQueues:    map[string]*queue.PlainQueue{},
+		statuses:       map[string]map[int64]queue.Status{},
+		runs:           map[int64]*programRun{},
+		store:          newMismatchStore(workdir),
+		noise:          newNoiseFilter(workdir),
 	}
+	coord.nextID.Store(maxID)
+	return coord
 }
 
 func newShadowProgramRegistry() *multiRuntimeCoordinator {
 	return newMultiRuntimeCoordinator("")
+}
+
+func (coord *multiRuntimeCoordinator) allocateProgID() int64 {
+	coord.progIDMu.Lock()
+	defer coord.progIDMu.Unlock()
+
+	id := coord.nextID.Load() + 1
+	if id > coord.reservedProgID {
+		reserved := id + progIDReserveBatch - 1
+		if reserved < id {
+			reserved = maxProgID
+		}
+		if err := saveProgIDState(coord.progIDState, reserved); err != nil {
+			log.Logf(0, "failed to save runtime program ID state: %v", err)
+		} else {
+			coord.reservedProgID = reserved
+		}
+	}
+	coord.nextID.Store(id)
+	return id
 }
 
 func newShadowConsumer(target *prog.Target, enabledSyscalls map[*prog.Syscall]bool) *shadowConsumer {
@@ -209,7 +238,7 @@ func (coord *multiRuntimeCoordinator) registerPrimary(runtimeName string, req *q
 		return
 	}
 	if req.ProgID == 0 {
-		req.ProgID = coord.nextID.Add(1)
+		req.ProgID = coord.allocateProgID()
 	}
 	coord.mu.Lock()
 	if coord.statuses[runtimeName] == nil {

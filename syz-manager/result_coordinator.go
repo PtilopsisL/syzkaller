@@ -539,7 +539,7 @@ func cloneInt64(v *int64) *int64 {
 }
 
 func (coord *multiRuntimeCoordinator) enqueueMismatchRepro(initial *programRun) {
-	reproID := coord.nextID.Add(1)
+	reproID := coord.allocateProgID()
 	expected := copyExpectedRuntimes(initial.Expected)
 	reproRun := &programRun{
 		ID:             reproID,
