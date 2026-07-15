@@ -1721,14 +1721,15 @@ void execute_call(thread_t* th)
 	
 	// Log syscall exit via libsclog.
 	if (flag_sctrace) {
+		const int trace_errno = th->res == -1 ? th->reserrno : 0;
 		if (!call->call) {
 			log_syscall_with_index(th->id, th->call_index, call->sys_nr,
 			                       th->num_args, th->args,
-			                       th->res, th->reserrno, false);
+			                       th->res, trace_errno, false);
 		} else {
 			log_syscall_printf(th->id, "%d: %s() = %lld {%d}\n",
 			                   th->call_index, call->name,
-			                   (long long)th->res, (int)th->reserrno);
+			                   (long long)th->res, trace_errno);
 		}
 		if (th->sctrace.file && th->sctrace.data) {
 			if (fflush(th->sctrace.file) == 0) {
