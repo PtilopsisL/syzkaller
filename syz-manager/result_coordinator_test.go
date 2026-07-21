@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -162,9 +163,408 @@ func TestCompareRuntimeResultsUsesDecodedValuesNotSctrace(t *testing.T) {
 	different.Calls = append([]runtimeCallResult(nil), same.Calls...)
 	different.Calls[0].Outputs = cloneRuntimeOutputCaptures(same.Calls[0].Outputs)
 	different.Calls[0].Outputs[0].Values[0].Value = uint64Ptr(12)
+	assert.Nil(t, compareRuntimeResults(map[string]*runtimeResult{
+		"a": base,
+		"b": &different,
+	}))
+
+	different.Calls[0].Outputs[0].Values[0].Kind = "int"
 	assert.NotNil(t, compareRuntimeResults(map[string]*runtimeResult{
 		"a": base,
 		"b": &different,
+	}))
+}
+
+func TestComparisonRuntimeResultUsesCallExecutionState(t *testing.T) {
+	output := []*runtimeOutputCapture{{ID: 1}}
+	tests := []struct {
+		name       string
+		call       runtimeCallResult
+		state      runtimeCallExecutionState
+		errno      *int32
+		wantReturn bool
+		wantOutput bool
+	}{
+		{
+			name: "not executed",
+			call: runtimeCallResult{
+				Error: 998, ReturnValue: int64Ptr(-1), Outputs: output,
+			},
+			state: callNotExecuted,
+		},
+		{
+			name: "started but unfinished",
+			call: runtimeCallResult{
+				Flags: flatrpc.CallFlagExecuted, Error: 38,
+				ReturnValue: int64Ptr(-1), Outputs: output,
+			},
+			state: callStarted,
+		},
+		{
+			name: "finished with error",
+			call: runtimeCallResult{
+				Flags: flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished,
+				Error: 22, ReturnValue: int64Ptr(-1), Outputs: output,
+			},
+			state: callFinishedError,
+			errno: int32Ptr(22),
+		},
+		{
+			name: "finished successfully",
+			call: runtimeCallResult{
+				Flags:       flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished,
+				ReturnValue: int64Ptr(7), Outputs: output,
+			},
+			state:      callFinishedOK,
+			wantReturn: true,
+			wantOutput: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := comparisonRuntimeResultFor(&runtimeResult{
+				Status: queue.Success,
+				Calls:  []runtimeCallResult{test.call},
+			})
+			require.Len(t, result.Calls, 1)
+			call := result.Calls[0]
+			assert.Equal(t, test.state, call.State)
+			assert.Equal(t, test.errno, call.Error)
+			assert.Equal(t, test.wantReturn, call.ReturnValue != nil)
+			assert.Equal(t, test.wantOutput, call.Outputs != nil)
+		})
+	}
+}
+
+func TestCompareRuntimeResultsIgnoresBlockedFlag(t *testing.T) {
+	base := &runtimeResult{
+		Status: queue.Success,
+		Calls: []runtimeCallResult{{
+			Name:        "read",
+			Flags:       flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished,
+			ReturnValue: int64Ptr(0),
+		}},
+	}
+	blocked := *base
+	blocked.Calls = append([]runtimeCallResult(nil), base.Calls...)
+	blocked.Calls[0].Flags |= flatrpc.CallFlagBlocked
+
+	assert.Nil(t, compareRuntimeResults(map[string]*runtimeResult{
+		"a": base,
+		"b": &blocked,
+	}))
+}
+
+func TestCompareRuntimeResultsKeepsSuccessFailureDifference(t *testing.T) {
+	success := &runtimeResult{
+		Status: queue.Success,
+		Calls: []runtimeCallResult{{
+			Name:        "mremap",
+			Flags:       flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished,
+			ReturnValue: int64Ptr(0),
+		}},
+	}
+	failure := *success
+	failure.Calls = append([]runtimeCallResult(nil), success.Calls...)
+	failure.Calls[0].Error = 12
+
+	assert.NotNil(t, compareRuntimeResults(map[string]*runtimeResult{
+		"v6.1": &failure,
+		"v6.2": success,
+	}))
+}
+
+func TestCompareRuntimeResultsKeepsProgramStatusDifference(t *testing.T) {
+	for _, status := range []queue.Status{queue.Crashed, queue.Hanged} {
+		t.Run(status.String(), func(t *testing.T) {
+			assert.NotNil(t, compareRuntimeResults(map[string]*runtimeResult{
+				"a": {Status: queue.Success},
+				"b": {Status: status},
+			}))
+		})
+	}
+}
+
+func TestCompareRuntimeResultsTreatsMissingResultAsInconclusive(t *testing.T) {
+	analysis := compareRuntimeResults(map[string]*runtimeResult{
+		"a": nil,
+		"b": {Status: queue.Success},
+	})
+
+	require.NotNil(t, analysis)
+	assert.Equal(t, comparisonOutcomeInconclusive, analysis.Outcome)
+}
+
+func TestCompareRuntimeSamplesRejectsInvalidSamples(t *testing.T) {
+	valid := &runtimeResult{
+		Status: queue.Success,
+		Calls: []runtimeCallResult{{
+			Name:        "read",
+			Flags:       flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished,
+			ReturnValue: int64Ptr(0),
+		}},
+	}
+	tests := []struct {
+		name   string
+		mutate func(*runtimeResult)
+	}{
+		{
+			name: "fault injected",
+			mutate: func(result *runtimeResult) {
+				result.Calls[0].Flags |= flatrpc.CallFlagFaultInjected
+			},
+		},
+		{
+			name: "fault injected crash",
+			mutate: func(result *runtimeResult) {
+				result.Status = queue.Crashed
+				result.Calls[0].Flags |= flatrpc.CallFlagFaultInjected
+			},
+		},
+		{
+			name: "missing successful return",
+			mutate: func(result *runtimeResult) {
+				result.Calls[0].ReturnValue = nil
+			},
+		},
+		{
+			name: "missing successful output capture",
+			mutate: func(result *runtimeResult) {
+				result.Calls[0].Outputs = []*runtimeOutputCapture{{Missing: true}}
+			},
+		},
+		{
+			name: "faulted successful output capture",
+			mutate: func(result *runtimeResult) {
+				result.Calls[0].Outputs = []*runtimeOutputCapture{{Faulted: true}}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			invalid := *valid
+			invalid.Calls = append([]runtimeCallResult(nil), valid.Calls...)
+			test.mutate(&invalid)
+			analysis := compareRuntimeSamples(map[string][]*runtimeResult{
+				"v6.1": {valid, &invalid, valid},
+				"v6.2": {valid, valid, valid},
+			})
+			require.NotNil(t, analysis)
+			assert.Equal(t, comparisonOutcomeInconclusive, analysis.Outcome)
+			assert.NotEmpty(t, analysis.InvalidSamples["v6.1"])
+		})
+	}
+}
+
+func TestCompareRuntimeSamplesDoesNotMaskStableStatusDifference(t *testing.T) {
+	crashed := func(flags flatrpc.CallFlag) *runtimeResult {
+		return &runtimeResult{
+			Status: queue.Crashed,
+			Calls:  []runtimeCallResult{{Name: "read", Flags: flags}},
+		}
+	}
+	success := &runtimeResult{Status: queue.Success}
+	analysis := compareRuntimeSamples(map[string][]*runtimeResult{
+		"crashing": {
+			crashed(0),
+			crashed(flatrpc.CallFlagExecuted),
+			crashed(flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished),
+		},
+		"working": {success, success, success},
+	})
+	require.NotNil(t, analysis)
+	assert.Equal(t, comparisonOutcomeMismatch, analysis.Outcome)
+	require.Len(t, analysis.StableDifferences, 1)
+	assert.Equal(t, "status", analysis.StableDifferences[0].Kind)
+}
+
+func TestCompareRuntimeSamplesDoesNotMaskStableCallStateDifference(t *testing.T) {
+	result := func(firstErrno int32, secondReturn int64) *runtimeResult {
+		return &runtimeResult{
+			Status: queue.Success,
+			Calls: []runtimeCallResult{
+				{
+					Index: 0, Name: "mremap",
+					Flags: flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished,
+					Error: firstErrno, ReturnValue: int64Ptr(0),
+				},
+				{
+					Index: 1, Name: "open",
+					Flags:       flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished,
+					ReturnValue: int64Ptr(secondReturn),
+				},
+			},
+		}
+	}
+	analysis := compareRuntimeSamples(map[string][]*runtimeResult{
+		"v6.1": {result(12, 3), result(12, 4), result(12, 5)},
+		"v6.2": {result(0, 6), result(0, 7), result(0, 8)},
+	})
+	require.NotNil(t, analysis)
+	assert.Equal(t, comparisonOutcomeMismatch, analysis.Outcome)
+	assert.Contains(t, analysis.UnstableFields["v6.1"], "calls[1].return_value")
+	assert.Contains(t, analysis.UnstableFields["v6.2"], "calls[1].return_value")
+	require.NotEmpty(t, analysis.StableDifferences)
+	assert.Equal(t, "call_state", analysis.StableDifferences[0].Kind)
+}
+
+func TestCompareRuntimeSamplesSavesOnlyInstabilityAsInconclusive(t *testing.T) {
+	result := func(errno int32) *runtimeResult {
+		return &runtimeResult{
+			Status: queue.Success,
+			Calls: []runtimeCallResult{{
+				Name:  "ptrace",
+				Flags: flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished,
+				Error: errno,
+			}},
+		}
+	}
+	analysis := compareRuntimeSamples(map[string][]*runtimeResult{
+		"v6.1": {result(1), result(2), result(3)},
+		"v6.2": {result(1), result(1), result(1)},
+	})
+	require.NotNil(t, analysis)
+	assert.Equal(t, comparisonOutcomeInconclusive, analysis.Outcome)
+	assert.Empty(t, analysis.StableDifferences)
+	assert.Contains(t, analysis.UnstableFields["v6.1"], "calls[0].error")
+}
+
+func TestCompareRuntimeSamplesReportsStableLeafDifferences(t *testing.T) {
+	result := func(errno int32, ret int64, output uint64) *runtimeResult {
+		call := runtimeCallResult{
+			Name:        "read",
+			Flags:       flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished,
+			Error:       errno,
+			ReturnValue: int64Ptr(ret),
+		}
+		if errno == 0 {
+			call.Outputs = []*runtimeOutputCapture{{
+				ID: 0,
+				Values: []*runtimeDecodedOutput{{
+					Path: "arg[1].value", Kind: "int", Value: uint64Ptr(output),
+				}},
+			}}
+		}
+		return &runtimeResult{Status: queue.Success, Calls: []runtimeCallResult{call}}
+	}
+	tests := []struct {
+		name  string
+		left  *runtimeResult
+		right *runtimeResult
+		kind  string
+	}{
+		{name: "errno", left: result(1, -1, 0), right: result(2, -1, 0), kind: "errno"},
+		{name: "return", left: result(0, 1, 7), right: result(0, 2, 7), kind: "return_value"},
+		{name: "output", left: result(0, 1, 7), right: result(0, 1, 8), kind: "output"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			analysis := compareRuntimeSamples(map[string][]*runtimeResult{
+				"a": {test.left, test.left, test.left},
+				"b": {test.right, test.right, test.right},
+			})
+
+			require.NotNil(t, analysis)
+			assert.Equal(t, comparisonOutcomeMismatch, analysis.Outcome)
+			require.Len(t, analysis.StableDifferences, 1)
+			assert.Equal(t, test.kind, analysis.StableDifferences[0].Kind)
+		})
+	}
+
+	stable := result(0, 1, 7)
+	assert.Nil(t, compareRuntimeSamples(map[string][]*runtimeResult{
+		"a": {stable, stable, stable},
+		"b": {stable, stable, stable},
+	}))
+}
+
+func TestCompareRuntimeSamplesKeepsStableOutputAlongsideUnstableOutput(t *testing.T) {
+	result := func(stable, unstable uint64) *runtimeResult {
+		return &runtimeResult{
+			Status: queue.Success,
+			Calls: []runtimeCallResult{{
+				Name:        "read",
+				Flags:       flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished,
+				ReturnValue: int64Ptr(0),
+				Outputs: []*runtimeOutputCapture{{
+					ID: 0,
+					Values: []*runtimeDecodedOutput{
+						{Path: "arg[1].stable", Kind: "int", Value: uint64Ptr(stable)},
+						{Path: "arg[1].unstable", Kind: "int", Value: uint64Ptr(unstable)},
+					},
+				}},
+			}},
+		}
+	}
+	analysis := compareRuntimeSamples(map[string][]*runtimeResult{
+		"a": {result(7, 1), result(7, 2), result(7, 3)},
+		"b": {result(8, 4), result(8, 5), result(8, 6)},
+	})
+
+	require.NotNil(t, analysis)
+	assert.Equal(t, comparisonOutcomeMismatch, analysis.Outcome)
+	require.Len(t, analysis.StableDifferences, 1)
+	assert.Equal(t, "calls[0].outputs.arg[1].stable", analysis.StableDifferences[0].Path)
+	assert.Contains(t, analysis.UnstableFields["a"], "calls[0].outputs.arg[1].unstable")
+	assert.Contains(t, analysis.UnstableFields["b"], "calls[0].outputs.arg[1].unstable")
+}
+
+func BenchmarkCompareRuntimeSamplesOutputs(b *testing.B) {
+	for _, leaves := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("leaves_%d", leaves), func(b *testing.B) {
+			result := runtimeResultWithOutputLeaves(leaves)
+			samples := map[string][]*runtimeResult{
+				"a": {result, result, result},
+				"b": {result, result, result},
+			}
+			b.ResetTimer()
+			for range b.N {
+				compareRuntimeSamples(samples)
+			}
+		})
+	}
+}
+
+func runtimeResultWithOutputLeaves(leaves int) *runtimeResult {
+	values := make([]*runtimeDecodedOutput, leaves)
+	for i := range values {
+		values[i] = &runtimeDecodedOutput{
+			Path:  fmt.Sprintf("arg[0].value[%d]", i),
+			Kind:  "int",
+			Value: uint64Ptr(uint64(i)),
+		}
+	}
+	return &runtimeResult{
+		Status: queue.Success,
+		Calls: []runtimeCallResult{{
+			Name:        "test",
+			Flags:       flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished,
+			ReturnValue: int64Ptr(0),
+			Outputs:     []*runtimeOutputCapture{{ID: 0, Values: values}},
+		}},
+	}
+}
+
+func TestCompareRuntimeResultsNormalizesResourceReturns(t *testing.T) {
+	result := func(value int64, resource bool) *runtimeResult {
+		return &runtimeResult{
+			Status: queue.Success,
+			Calls: []runtimeCallResult{{
+				Name:             "open",
+				Flags:            flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished,
+				ReturnValue:      int64Ptr(value),
+				ReturnType:       "fd",
+				ReturnIsResource: resource,
+			}},
+		}
+	}
+	assert.Nil(t, compareRuntimeResults(map[string]*runtimeResult{
+		"a": result(3, true),
+		"b": result(11, true),
+	}))
+	assert.NotNil(t, compareRuntimeResults(map[string]*runtimeResult{
+		"a": result(3, false),
+		"b": result(11, false),
 	}))
 }
 

@@ -18,6 +18,7 @@ import (
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
 	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/prog"
 )
 
@@ -30,14 +31,16 @@ type runtimeResult struct {
 }
 
 type runtimeCallResult struct {
-	Index       int                     `json:"index"`
-	Name        string                  `json:"name,omitempty"`
-	Args        []*runtimeCallArg       `json:"args,omitempty"`
-	Flags       flatrpc.CallFlag        `json:"flags"`
-	Error       int32                   `json:"error"`
-	ReturnValue *int64                  `json:"return_value,omitempty"`
-	Outputs     []*runtimeOutputCapture `json:"outputs,omitempty"`
-	Sctrace     string                  `json:"sctrace,omitempty"`
+	Index            int                     `json:"index"`
+	Name             string                  `json:"name,omitempty"`
+	Args             []*runtimeCallArg       `json:"args,omitempty"`
+	Flags            flatrpc.CallFlag        `json:"flags"`
+	Error            int32                   `json:"error"`
+	ReturnValue      *int64                  `json:"return_value,omitempty"`
+	ReturnType       string                  `json:"return_type,omitempty"`
+	ReturnIsResource bool                    `json:"return_is_resource,omitempty"`
+	Outputs          []*runtimeOutputCapture `json:"outputs,omitempty"`
+	Sctrace          string                  `json:"sctrace,omitempty"`
 }
 
 type runtimeCallArg struct {
@@ -91,13 +94,23 @@ type runtimeDecodedOutput struct {
 	DataSummary *runtimeDataSummary `json:"data_summary,omitempty"`
 }
 
+type runtimeCallExecutionState string
+
+const (
+	callNotExecuted   runtimeCallExecutionState = "not_executed"
+	callStarted       runtimeCallExecutionState = "started_but_unfinished"
+	callFinishedError runtimeCallExecutionState = "finished_error"
+	callFinishedOK    runtimeCallExecutionState = "finished_ok"
+)
+
 type comparisonRuntimeCallResult struct {
-	Index       int                     `json:"index"`
-	Name        string                  `json:"name,omitempty"`
-	Flags       flatrpc.CallFlag        `json:"flags"`
-	Error       int32                   `json:"error"`
-	ReturnValue *int64                  `json:"return_value,omitempty"`
-	Outputs     []*runtimeOutputCapture `json:"outputs,omitempty"`
+	Index          int                       `json:"index"`
+	Name           string                    `json:"name,omitempty"`
+	State          runtimeCallExecutionState `json:"state"`
+	Error          *int32                    `json:"error,omitempty"`
+	ReturnValue    *int64                    `json:"return_value,omitempty"`
+	ReturnResource string                    `json:"return_resource,omitempty"`
+	Outputs        []*runtimeOutputCapture   `json:"outputs,omitempty"`
 }
 
 type comparisonRuntimeResult struct {
@@ -106,10 +119,29 @@ type comparisonRuntimeResult struct {
 	Calls  []comparisonRuntimeCallResult `json:"calls,omitempty"`
 }
 
+type comparisonOutcome string
+
+const (
+	comparisonOutcomeMismatch     comparisonOutcome = "mismatch"
+	comparisonOutcomeInconclusive comparisonOutcome = "inconclusive"
+)
+
+type runtimeFieldDifference struct {
+	Kind      string         `json:"kind"`
+	Path      string         `json:"path"`
+	Values    map[string]any `json:"values"`
+	CallIndex *int           `json:"call_index,omitempty"`
+	CallName  string         `json:"call_name,omitempty"`
+}
+
 type runtimeMismatch struct {
-	Reason   string                              `json:"reason"`
-	Runtimes []string                            `json:"runtimes"`
-	Compared map[string]*comparisonRuntimeResult `json:"compared"`
+	Outcome           comparisonOutcome                   `json:"outcome"`
+	Reason            string                              `json:"reason"`
+	Runtimes          []string                            `json:"runtimes"`
+	Compared          map[string]*comparisonRuntimeResult `json:"compared"`
+	StableDifferences []runtimeFieldDifference            `json:"stable_differences"`
+	UnstableFields    map[string][]string                 `json:"unstable_fields,omitempty"`
+	InvalidSamples    map[string][]string                 `json:"invalid_samples,omitempty"`
 }
 
 func summarizeRuntimeResult(runtimeName string, req *queue.Request, res *queue.Result) *runtimeResult {
@@ -129,6 +161,10 @@ func summarizeRuntimeResult(runtimeName string, req *queue.Request, res *queue.R
 		if req.Prog != nil && i < len(req.Prog.Calls) {
 			callResult.Name = req.Prog.CallName(i)
 			callResult.Args = summarizeCallArgs(req.Prog, i)
+			if retType := req.Prog.Calls[i].Meta.Ret; retType != nil {
+				callResult.ReturnType = retType.String()
+				_, callResult.ReturnIsResource = retType.(*prog.ResourceType)
+			}
 		}
 		if call != nil {
 			callResult.Flags = call.Flags
@@ -149,29 +185,20 @@ func summarizeRuntimeResult(runtimeName string, req *queue.Request, res *queue.R
 func (coord *multiRuntimeCoordinator) handleCompletedRun(run *programRun) {
 	switch run.Stage {
 	case runStageFuzz:
-		mismatch := compareRuntimeResultsWithRules(run.Results, coord.noise.snapshot())
+		mismatch := compareRuntimeResults(run.Results)
 		if mismatch == nil {
 			return
 		}
 		log.Logf(1, "program %d has cross-runtime result mismatch; scheduling repro", run.ID)
 		coord.enqueueMismatchRepro(run)
 	case runStageRepro:
-		changed, err := coord.noise.learn(run.Samples)
-		if err != nil {
-			log.Logf(0, "failed to update runtime noise rules for program %d: %v",
-				run.ParentID, err)
-		} else if changed {
-			log.Logf(1, "updated runtime noise rules after repro of program %d", run.ParentID)
-		}
-		rules := coord.noise.snapshot()
-		results, unstableRuntime := stableRuntimeResults(run.Samples, rules)
-		if unstableRuntime != "" {
-			log.Logf(1, "program %d remains unstable within runtime %q after denoise",
-				run.ParentID, unstableRuntime)
+		mismatch := compareRuntimeSamples(run.Samples)
+		if mismatch == nil {
 			return
 		}
-		mismatch := compareRuntimeResultsWithRules(results, rules)
-		if mismatch == nil {
+		if mismatch.Outcome != comparisonOutcomeMismatch {
+			log.Logf(1, "runtime comparison for program %d is inconclusive; report not saved",
+				run.ParentID)
 			return
 		}
 		if coord.store == nil {
@@ -179,7 +206,7 @@ func (coord *multiRuntimeCoordinator) handleCompletedRun(run *programRun) {
 				run.ParentID)
 			return
 		}
-		path, err := coord.store.Save(run, mismatch, rules)
+		path, err := coord.store.Save(run, mismatch)
 		if err != nil {
 			log.Logf(0, "failed to save runtime mismatch for program %d: %v", run.ParentID, err)
 			return
@@ -192,27 +219,41 @@ func (coord *multiRuntimeCoordinator) handleCompletedRun(run *programRun) {
 }
 
 func compareRuntimeResults(results map[string]*runtimeResult) *runtimeMismatch {
-	return compareRuntimeResultsWithRules(results, noiseRuleFile{})
-}
-
-func compareRuntimeResultsWithRules(results map[string]*runtimeResult,
-	rules noiseRuleFile) *runtimeMismatch {
 	if len(results) < 2 {
 		return nil
 	}
 	names := sortedRuntimeNames(results)
 	compared := make(map[string]*comparisonRuntimeResult, len(results))
+	invalid := ""
 	for _, name := range names {
 		result := results[name]
+		if result == nil {
+			if invalid == "" {
+				invalid = fmt.Sprintf("runtime %q: missing runtime result", name)
+			}
+			continue
+		}
 		if result.Status == queue.Unsupported {
 			return nil
 		}
-		compared[name] = comparisonRuntimeResultForRules(result, rules)
+		compared[name] = comparisonRuntimeResultFor(result)
+		if issue := runtimeResultComparisonIssue(result); issue != "" && invalid == "" {
+			invalid = fmt.Sprintf("runtime %q: %s", name, issue)
+		}
+	}
+	if invalid != "" {
+		return &runtimeMismatch{
+			Outcome:  comparisonOutcomeInconclusive,
+			Reason:   "invalid runtime result: " + invalid,
+			Runtimes: names,
+			Compared: compared,
+		}
 	}
 	reference := compared[names[0]]
 	for _, name := range names[1:] {
 		if !reflect.DeepEqual(reference, compared[name]) {
 			return &runtimeMismatch{
+				Outcome:  comparisonOutcomeMismatch,
 				Reason:   "runtime results differ",
 				Runtimes: names,
 				Compared: compared,
@@ -223,82 +264,397 @@ func compareRuntimeResultsWithRules(results map[string]*runtimeResult,
 }
 
 func comparisonRuntimeResultFor(result *runtimeResult) *comparisonRuntimeResult {
-	return comparisonRuntimeResultForRules(result, noiseRuleFile{})
-}
-
-func comparisonRuntimeResultForRules(result *runtimeResult,
-	rules noiseRuleFile) *comparisonRuntimeResult {
 	ret := &comparisonRuntimeResult{
 		Status: result.Status,
 		Err:    result.Err,
 	}
 	for _, call := range result.Calls {
-		rule := rules.Syscalls[call.Name]
-		errno := call.Error
-		if rule.Ignore.Errno {
-			errno = 0
+		state := runtimeCallExecutionStateFor(call)
+		comparedCall := comparisonRuntimeCallResult{
+			Index: call.Index,
+			Name:  call.Name,
+			State: state,
 		}
-		var returnValue *int64
-		if !rule.Ignore.ReturnValue {
-			returnValue = cloneInt64(call.ReturnValue)
+		switch state {
+		case callFinishedError:
+			comparedCall.Error = int32Ptr(call.Error)
+		case callFinishedOK:
+			if call.ReturnIsResource {
+				comparedCall.ReturnResource = call.ReturnType
+			} else {
+				comparedCall.ReturnValue = cloneInt64(call.ReturnValue)
+			}
+			comparedCall.Outputs = comparisonRuntimeOutputCaptures(call.Outputs)
 		}
-		ret.Calls = append(ret.Calls, comparisonRuntimeCallResult{
-			Index:       call.Index,
-			Name:        call.Name,
-			Flags:       call.Flags,
-			Error:       errno,
-			ReturnValue: returnValue,
-			Outputs:     filterRuntimeOutputCaptures(call.Outputs, rule.Ignore.Outputs),
-		})
+		ret.Calls = append(ret.Calls, comparedCall)
 	}
 	return ret
 }
 
-func filterRuntimeOutputCaptures(captures []*runtimeOutputCapture,
-	ignoredPaths []string) []*runtimeOutputCapture {
+func runtimeCallExecutionStateFor(call runtimeCallResult) runtimeCallExecutionState {
+	if call.Flags&flatrpc.CallFlagExecuted == 0 {
+		return callNotExecuted
+	}
+	if call.Flags&flatrpc.CallFlagFinished == 0 {
+		return callStarted
+	}
+	if call.Error != 0 {
+		return callFinishedError
+	}
+	return callFinishedOK
+}
+
+func runtimeResultComparisonIssue(result *runtimeResult) string {
+	if result == nil {
+		return "missing runtime result"
+	}
+	const knownFlags = flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished |
+		flatrpc.CallFlagBlocked | flatrpc.CallFlagFaultInjected |
+		flatrpc.CallFlagCoverageOverflow
+	for _, call := range result.Calls {
+		if unknown := call.Flags &^ knownFlags; unknown != 0 {
+			return fmt.Sprintf("call %d (%s) has unknown flags %#x", call.Index, call.Name, unknown)
+		}
+		if call.Flags&flatrpc.CallFlagFinished != 0 &&
+			call.Flags&flatrpc.CallFlagExecuted == 0 {
+			return fmt.Sprintf("call %d (%s) finished without being executed", call.Index, call.Name)
+		}
+		if call.Flags&flatrpc.CallFlagFaultInjected != 0 {
+			return fmt.Sprintf("call %d (%s) used fault injection", call.Index, call.Name)
+		}
+		if result.Status != queue.Success {
+			continue
+		}
+		if runtimeCallExecutionStateFor(call) != callFinishedOK {
+			continue
+		}
+		if call.ReturnValue == nil {
+			return fmt.Sprintf("call %d (%s) has no return value", call.Index, call.Name)
+		}
+		for _, capture := range call.Outputs {
+			if capture != nil && (capture.Missing || capture.Faulted) {
+				return fmt.Sprintf("call %d (%s) has an invalid output capture", call.Index, call.Name)
+			}
+		}
+	}
+	return ""
+}
+
+func comparisonRuntimeOutputCaptures(captures []*runtimeOutputCapture) []*runtimeOutputCapture {
 	ret := cloneRuntimeOutputCaptures(captures)
-	if len(ret) == 0 || len(ignoredPaths) == 0 {
-		return ret
-	}
-	ignored := make(map[string]bool, len(ignoredPaths))
-	for _, path := range ignoredPaths {
-		ignored[path] = true
-	}
 	for _, capture := range ret {
 		if capture == nil {
 			continue
 		}
-		values := capture.Values[:0]
-		for _, value := range capture.Values {
-			if value == nil || !ignored[value.Path] {
-				values = append(values, value)
+		for _, output := range capture.Values {
+			if output == nil || output.Kind != "result" {
+				continue
 			}
-		}
-		if len(values) == 0 {
-			capture.Values = nil
-		} else {
-			capture.Values = values
+			output.Value = nil
+			output.ValueNames = nil
+			output.RawHex = ""
+			output.DataSummary = nil
 		}
 	}
 	return ret
 }
 
-func stableRuntimeResults(samples map[string][]*runtimeResult,
-	rules noiseRuleFile) (map[string]*runtimeResult, string) {
-	ret := make(map[string]*runtimeResult, len(samples))
-	for runtimeName, runtimeSamples := range samples {
+type observedComparisonValue struct {
+	Present bool
+	Value   any
+}
+
+type runtimeSampleComparison struct {
+	names  []string
+	views  map[string][]*comparisonRuntimeResult
+	result *runtimeMismatch
+}
+
+func compareRuntimeSamples(samples map[string][]*runtimeResult) *runtimeMismatch {
+	if len(samples) < 2 {
+		return nil
+	}
+	names := sortedRuntimeSampleNames(samples)
+	comparison := &runtimeSampleComparison{
+		names: names,
+		views: make(map[string][]*comparisonRuntimeResult, len(samples)),
+		result: &runtimeMismatch{
+			Runtimes:          names,
+			Compared:          make(map[string]*comparisonRuntimeResult, len(samples)),
+			StableDifferences: []runtimeFieldDifference{},
+			UnstableFields:    make(map[string][]string),
+			InvalidSamples:    make(map[string][]string),
+		},
+	}
+	for _, name := range names {
+		runtimeSamples := samples[name]
 		if len(runtimeSamples) == 0 {
-			return nil, runtimeName
+			comparison.result.InvalidSamples[name] = []string{"no repro samples"}
+			continue
 		}
-		baseline := comparisonRuntimeResultForRules(runtimeSamples[0], rules)
-		for _, sample := range runtimeSamples[1:] {
-			if !reflect.DeepEqual(baseline, comparisonRuntimeResultForRules(sample, rules)) {
-				return nil, runtimeName
+		for index, sample := range runtimeSamples {
+			if issue := runtimeResultComparisonIssue(sample); issue != "" {
+				comparison.result.InvalidSamples[name] = append(
+					comparison.result.InvalidSamples[name],
+					fmt.Sprintf("sample %d: %s", index+1, issue))
+				continue
+			}
+			view := comparisonRuntimeResultFor(sample)
+			comparison.views[name] = append(comparison.views[name], view)
+			if comparison.result.Compared[name] == nil {
+				comparison.result.Compared[name] = view
 			}
 		}
-		ret[runtimeName] = runtimeSamples[0]
 	}
-	return ret, ""
+	if len(comparison.result.InvalidSamples) != 0 {
+		return comparison.finish()
+	}
+
+	statusValues, stable, different := comparison.field("status", "status", -1, "",
+		func(result *comparisonRuntimeResult) observedComparisonValue {
+			return observedComparisonValue{Present: true, Value: result.Status}
+		})
+	if !stable || different {
+		return comparison.finish()
+	}
+	status := statusValues[names[0]].Value.(queue.Status)
+	if status == queue.Unsupported {
+		return nil
+	}
+	comparison.field("request_error", "err", -1, "",
+		func(result *comparisonRuntimeResult) observedComparisonValue {
+			return observedComparisonValue{Present: true, Value: result.Err}
+		})
+	if status != queue.Success {
+		return comparison.finish()
+	}
+
+	_, callCountStable, callCountDifferent := comparison.field("call_count", "calls", -1, "",
+		func(result *comparisonRuntimeResult) observedComparisonValue {
+			return observedComparisonValue{Present: true, Value: len(result.Calls)}
+		})
+	if callCountStable && callCountDifferent {
+		return comparison.finish()
+	}
+	maxCalls := comparison.maxCallCount()
+	for callIndex := 0; callIndex < maxCalls; callIndex++ {
+		index := callIndex
+		presenceValues, presenceStable, presenceDifferent := comparison.field(
+			"call_presence", fmt.Sprintf("calls[%d]", index), index, "",
+			func(result *comparisonRuntimeResult) observedComparisonValue {
+				return observedComparisonValue{Present: true, Value: index < len(result.Calls)}
+			})
+		if !presenceStable || presenceDifferent || !presenceValues[names[0]].Value.(bool) {
+			continue
+		}
+		callName := comparison.views[names[0]][0].Calls[index].Name
+		_, nameStable, nameDifferent := comparison.field(
+			"call_name", fmt.Sprintf("calls[%d].name", index), index, callName,
+			func(result *comparisonRuntimeResult) observedComparisonValue {
+				return observedComparisonValue{Present: true, Value: result.Calls[index].Name}
+			})
+		if !nameStable || nameDifferent {
+			continue
+		}
+		stateValues, stateStable, stateDifferent := comparison.field(
+			"call_state", fmt.Sprintf("calls[%d].state", index), index, callName,
+			func(result *comparisonRuntimeResult) observedComparisonValue {
+				return observedComparisonValue{Present: true, Value: result.Calls[index].State}
+			})
+		if !stateStable || stateDifferent {
+			continue
+		}
+		state := stateValues[names[0]].Value.(runtimeCallExecutionState)
+		switch state {
+		case callFinishedError:
+			comparison.field("errno", fmt.Sprintf("calls[%d].error", index), index, callName,
+				func(result *comparisonRuntimeResult) observedComparisonValue {
+					value := result.Calls[index].Error
+					if value == nil {
+						return observedComparisonValue{}
+					}
+					return observedComparisonValue{Present: true, Value: *value}
+				})
+		case callFinishedOK:
+			comparison.field("return_value", fmt.Sprintf("calls[%d].return_value", index),
+				index, callName, func(result *comparisonRuntimeResult) observedComparisonValue {
+					call := &result.Calls[index]
+					if call.ReturnResource != "" {
+						return observedComparisonValue{Present: true, Value: map[string]string{
+							"resource": call.ReturnResource,
+						}}
+					}
+					if call.ReturnValue == nil {
+						return observedComparisonValue{}
+					}
+					return observedComparisonValue{Present: true, Value: *call.ReturnValue}
+				})
+			comparison.compareOutputs(index, callName)
+		}
+	}
+	return comparison.finish()
+}
+
+func (comparison *runtimeSampleComparison) field(kind, path string, callIndex int, callName string,
+	value func(*comparisonRuntimeResult) observedComparisonValue) (
+	map[string]observedComparisonValue, bool, bool) {
+	values := make(map[string]observedComparisonValue, len(comparison.names))
+	allStable := true
+	for _, name := range comparison.names {
+		samples := comparison.views[name]
+		baseline := value(samples[0])
+		stable := true
+		for _, sample := range samples[1:] {
+			if !observedComparisonValuesEqual(baseline, value(sample)) {
+				stable = false
+				break
+			}
+		}
+		if !stable {
+			comparison.result.UnstableFields[name] = append(
+				comparison.result.UnstableFields[name], path)
+			allStable = false
+			continue
+		}
+		values[name] = baseline
+	}
+	if !allStable {
+		return values, false, false
+	}
+	reference := values[comparison.names[0]]
+	different := false
+	for _, name := range comparison.names[1:] {
+		if !observedComparisonValuesEqual(reference, values[name]) {
+			different = true
+			break
+		}
+	}
+	if different {
+		diffValues := make(map[string]any, len(values))
+		for _, name := range comparison.names {
+			if values[name].Present {
+				diffValues[name] = values[name].Value
+			} else {
+				diffValues[name] = nil
+			}
+		}
+		diff := runtimeFieldDifference{
+			Kind: kind, Path: path, Values: diffValues, CallName: callName,
+		}
+		if callIndex >= 0 {
+			diff.CallIndex = intPtr(callIndex)
+		}
+		comparison.result.StableDifferences = append(comparison.result.StableDifferences, diff)
+	}
+	return values, true, different
+}
+
+func (comparison *runtimeSampleComparison) compareOutputs(callIndex int, callName string) {
+	paths := map[string]bool{}
+	fieldsBySample := make(map[*comparisonRuntimeResult]map[string]observedComparisonValue)
+	for _, runtimeSamples := range comparison.views {
+		for _, sample := range runtimeSamples {
+			fields := comparisonOutputFields(sample.Calls[callIndex], callIndex)
+			fieldsBySample[sample] = fields
+			for path := range fields {
+				paths[path] = true
+			}
+		}
+	}
+	sortedPaths := make([]string, 0, len(paths))
+	for path := range paths {
+		sortedPaths = append(sortedPaths, path)
+	}
+	sort.Strings(sortedPaths)
+	for _, path := range sortedPaths {
+		fieldPath := path
+		comparison.field("output", fieldPath, callIndex, callName,
+			func(result *comparisonRuntimeResult) observedComparisonValue {
+				return fieldsBySample[result][fieldPath]
+			})
+	}
+}
+
+func comparisonOutputFields(call comparisonRuntimeCallResult,
+	callIndex int) map[string]observedComparisonValue {
+	ret := map[string]observedComparisonValue{
+		fmt.Sprintf("calls[%d].outputs.length", callIndex): {
+			Present: true,
+			Value:   len(call.Outputs),
+		},
+	}
+	for captureIndex, capture := range call.Outputs {
+		capturePath := fmt.Sprintf("calls[%d].outputs.capture[%d]", callIndex, captureIndex)
+		if capture == nil {
+			ret[capturePath] = observedComparisonValue{Present: true}
+			continue
+		}
+		ret[capturePath] = observedComparisonValue{Present: true, Value: struct {
+			ID           uint32 `json:"id"`
+			Path         string `json:"path,omitempty"`
+			Type         string `json:"type,omitempty"`
+			Size         uint64 `json:"size,omitempty"`
+			CapturedSize uint64 `json:"captured_size,omitempty"`
+			Truncated    bool   `json:"truncated,omitempty"`
+		}{
+			ID: capture.ID, Path: capture.Path, Type: capture.Type,
+			Size: capture.Size, CapturedSize: capture.CapturedSize,
+			Truncated: capture.Truncated,
+		}}
+		for valueIndex, output := range capture.Values {
+			path := fmt.Sprintf("%s.value[%d]", capturePath, valueIndex)
+			if output != nil && output.Path != "" {
+				path = fmt.Sprintf("calls[%d].outputs.%s", callIndex, output.Path)
+			}
+			if output == nil {
+				ret[path] = observedComparisonValue{Present: true}
+			} else {
+				ret[path] = observedComparisonValue{Present: true, Value: *output}
+			}
+		}
+	}
+	return ret
+}
+
+func observedComparisonValuesEqual(left, right observedComparisonValue) bool {
+	return left.Present == right.Present && reflect.DeepEqual(left.Value, right.Value)
+}
+
+func (comparison *runtimeSampleComparison) maxCallCount() int {
+	maxCalls := 0
+	for _, runtimeSamples := range comparison.views {
+		for _, sample := range runtimeSamples {
+			maxCalls = max(maxCalls, len(sample.Calls))
+		}
+	}
+	return maxCalls
+}
+
+func (comparison *runtimeSampleComparison) finish() *runtimeMismatch {
+	for name, fields := range comparison.result.UnstableFields {
+		sort.Strings(fields)
+		comparison.result.UnstableFields[name] = fields
+	}
+	if len(comparison.result.StableDifferences) != 0 {
+		comparison.result.Outcome = comparisonOutcomeMismatch
+		comparison.result.Reason = "runtime results differ in stable fields"
+		return comparison.result
+	}
+	if len(comparison.result.UnstableFields) != 0 || len(comparison.result.InvalidSamples) != 0 {
+		comparison.result.Outcome = comparisonOutcomeInconclusive
+		comparison.result.Reason = "runtime comparison is inconclusive"
+		return comparison.result
+	}
+	return nil
+}
+
+func sortedRuntimeSampleNames(samples map[string][]*runtimeResult) []string {
+	ret := make([]string, 0, len(samples))
+	for name := range samples {
+		ret = append(ret, name)
+	}
+	sort.Strings(ret)
+	return ret
 }
 
 func summarizeCallArgs(p *prog.Prog, callIndex int) []*runtimeCallArg {
@@ -531,6 +887,14 @@ func int64Ptr(v int64) *int64 {
 	return &v
 }
 
+func int32Ptr(v int32) *int32 {
+	return &v
+}
+
+func intPtr(v int) *int {
+	return &v
+}
+
 func cloneInt64(v *int64) *int64 {
 	if v == nil {
 		return nil
@@ -580,6 +944,13 @@ func (coord *multiRuntimeCoordinator) submitReproSample(run *programRun, runtime
 		coord.recordResult(runtimeName, r, res)
 		return true
 	})
+	coord.mu.Lock()
+	consumer := coord.consumers[runtimeName]
+	coord.mu.Unlock()
+	if consumer != nil {
+		consumer.enqueuePriority(req)
+		return
+	}
 	runtimeQueue.Submit(req)
 }
 
@@ -662,19 +1033,88 @@ func newMismatchStore(workdir string) *mismatchStore {
 	}
 }
 
-type storedMismatchReport struct {
-	ParentProgID   int64                               `json:"parent_prog_id"`
-	ReproProgID    int64                               `json:"repro_prog_id"`
-	Reason         string                              `json:"reason"`
-	Runtimes       []string                            `json:"runtimes"`
-	InitialResults map[string]*runtimeResult           `json:"initial_results"`
-	ReproSamples   map[string][]*runtimeResult         `json:"repro_samples"`
-	NoiseRules     noiseRuleFile                       `json:"noise_rules"`
-	Compared       map[string]*comparisonRuntimeResult `json:"compared"`
+const storedMismatchReportFormatVersion = 2
+
+type storedProgramCall struct {
+	Index int               `json:"index"`
+	Name  string            `json:"name,omitempty"`
+	Args  []*runtimeCallArg `json:"args,omitempty"`
 }
 
-func (store *mismatchStore) Save(run *programRun, mismatch *runtimeMismatch,
-	rules noiseRuleFile) (string, error) {
+type storedMismatchReport struct {
+	FormatVersion     int                                 `json:"format_version"`
+	ParentProgID      int64                               `json:"parent_prog_id"`
+	ReproProgID       int64                               `json:"repro_prog_id"`
+	Outcome           comparisonOutcome                   `json:"outcome"`
+	Reason            string                              `json:"reason"`
+	Runtimes          []string                            `json:"runtimes"`
+	ProgramCalls      []storedProgramCall                 `json:"program_calls,omitempty"`
+	TraceFiles        []string                            `json:"trace_files,omitempty"`
+	InitialResults    map[string]*runtimeResult           `json:"initial_results"`
+	ReproSamples      map[string][]*runtimeResult         `json:"repro_samples"`
+	Compared          map[string]*comparisonRuntimeResult `json:"compared"`
+	StableDifferences []runtimeFieldDifference            `json:"stable_differences"`
+	UnstableFields    map[string][]string                 `json:"unstable_fields,omitempty"`
+	InvalidSamples    map[string][]string                 `json:"invalid_samples,omitempty"`
+}
+
+func storedProgramCallsFor(p *prog.Prog) []storedProgramCall {
+	if p == nil {
+		return nil
+	}
+	calls := make([]storedProgramCall, 0, len(p.Calls))
+	for index := range p.Calls {
+		calls = append(calls, storedProgramCall{
+			Index: index,
+			Name:  p.CallName(index),
+			Args:  summarizeCallArgs(p, index),
+		})
+	}
+	return calls
+}
+
+func compactRuntimeResultForReport(result *runtimeResult) *runtimeResult {
+	if result == nil {
+		return nil
+	}
+	compact := *result
+	compact.Calls = make([]runtimeCallResult, len(result.Calls))
+	for index, call := range result.Calls {
+		compact.Calls[index] = call
+		compact.Calls[index].Args = nil
+		compact.Calls[index].Sctrace = ""
+	}
+	return &compact
+}
+
+func compactRuntimeResultsForReport(results map[string]*runtimeResult) map[string]*runtimeResult {
+	if results == nil {
+		return nil
+	}
+	compact := make(map[string]*runtimeResult, len(results))
+	for runtimeName, result := range results {
+		compact[runtimeName] = compactRuntimeResultForReport(result)
+	}
+	return compact
+}
+
+func compactRuntimeSamplesForReport(
+	samples map[string][]*runtimeResult) map[string][]*runtimeResult {
+	if samples == nil {
+		return nil
+	}
+	compact := make(map[string][]*runtimeResult, len(samples))
+	for runtimeName, runtimeSamples := range samples {
+		compactSamples := make([]*runtimeResult, len(runtimeSamples))
+		for index, result := range runtimeSamples {
+			compactSamples[index] = compactRuntimeResultForReport(result)
+		}
+		compact[runtimeName] = compactSamples
+	}
+	return compact
+}
+
+func (store *mismatchStore) Save(run *programRun, mismatch *runtimeMismatch) (string, error) {
 	if store == nil {
 		return "", nil
 	}
@@ -685,47 +1125,78 @@ func (store *mismatchStore) Save(run *programRun, mismatch *runtimeMismatch,
 	if err := os.WriteFile(filepath.Join(dir, "repro.prog"), run.ProgData, 0o644); err != nil {
 		return "", err
 	}
-	report := &storedMismatchReport{
-		ParentProgID:   run.ParentID,
-		ReproProgID:    run.ID,
-		Reason:         mismatch.Reason,
-		Runtimes:       mismatch.Runtimes,
-		InitialResults: run.InitialResults,
-		ReproSamples:   run.Samples,
-		NoiseRules:     rules,
-		Compared:       mismatch.Compared,
-	}
-	data, err := json.MarshalIndent(report, "", "  ")
-	if err != nil {
-		return "", err
-	}
-	if err := os.WriteFile(filepath.Join(dir, "report.json"), data, 0o644); err != nil {
-		return "", err
+	traceFiles := []string{}
+	for runtimeName, result := range run.InitialResults {
+		name := fmt.Sprintf("%s.initial.strace.log", sanitizeFileName(runtimeName))
+		written, err := writeRuntimeTraceLog(dir, name, result)
+		if err != nil {
+			return "", err
+		}
+		if written {
+			traceFiles = append(traceFiles, filepath.ToSlash(filepath.Join("logs", name)))
+		}
 	}
 	for runtimeName, samples := range run.Samples {
 		for sampleIndex, result := range samples {
-			var text strings.Builder
-			for _, call := range result.Calls {
-				if call.Sctrace == "" {
-					continue
-				}
-				text.WriteString(call.Sctrace)
-				if !strings.HasSuffix(call.Sctrace, "\n") {
-					text.WriteByte('\n')
-				}
-			}
-			if text.Len() == 0 {
-				continue
-			}
 			name := fmt.Sprintf("%s.sample%d.strace.log",
 				sanitizeFileName(runtimeName), sampleIndex+1)
-			if err := os.WriteFile(filepath.Join(dir, "logs", name),
-				[]byte(text.String()), 0o644); err != nil {
+			written, err := writeRuntimeTraceLog(dir, name, result)
+			if err != nil {
 				return "", err
+			}
+			if written {
+				traceFiles = append(traceFiles, filepath.ToSlash(filepath.Join("logs", name)))
 			}
 		}
 	}
+	sort.Strings(traceFiles)
+	report := &storedMismatchReport{
+		FormatVersion:     storedMismatchReportFormatVersion,
+		ParentProgID:      run.ParentID,
+		ReproProgID:       run.ID,
+		Outcome:           mismatch.Outcome,
+		Reason:            mismatch.Reason,
+		Runtimes:          mismatch.Runtimes,
+		ProgramCalls:      storedProgramCallsFor(run.Prog),
+		TraceFiles:        traceFiles,
+		InitialResults:    compactRuntimeResultsForReport(run.InitialResults),
+		ReproSamples:      compactRuntimeSamplesForReport(run.Samples),
+		Compared:          mismatch.Compared,
+		StableDifferences: mismatch.StableDifferences,
+		UnstableFields:    mismatch.UnstableFields,
+		InvalidSamples:    mismatch.InvalidSamples,
+	}
+	data, err := json.Marshal(report)
+	if err != nil {
+		return "", err
+	}
+	if err := osutil.WriteFileAtomically(filepath.Join(dir, "report.json"), data); err != nil {
+		return "", err
+	}
 	return dir, nil
+}
+
+func writeRuntimeTraceLog(dir, name string, result *runtimeResult) (bool, error) {
+	if result == nil {
+		return false, nil
+	}
+	var text strings.Builder
+	for _, call := range result.Calls {
+		if call.Sctrace == "" {
+			continue
+		}
+		text.WriteString(call.Sctrace)
+		if !strings.HasSuffix(call.Sctrace, "\n") {
+			text.WriteByte('\n')
+		}
+	}
+	if text.Len() == 0 {
+		return false, nil
+	}
+	if err := os.WriteFile(filepath.Join(dir, "logs", name), []byte(text.String()), 0o644); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func sanitizeFileName(name string) string {

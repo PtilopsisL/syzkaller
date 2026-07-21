@@ -125,17 +125,18 @@ type multiRuntimeCoordinator struct {
 	statuses    map[string]map[int64]queue.Status
 	runs        map[int64]*programRun
 	store       *mismatchStore
-	noise       *noiseFilter
 }
 
 type shadowConsumer struct {
 	target       *prog.Target
 	enabledCalls map[int]bool
 
-	mu     sync.Mutex
-	cond   *sync.Cond
-	queue  []storedProgram
-	closed bool
+	mu            sync.Mutex
+	cond          *sync.Cond
+	priorityQueue []*queue.Request
+	queue         []storedProgram
+	priorityBurst int
+	closed        bool
 }
 
 func newMultiRuntimeCoordinator(workdir string) *multiRuntimeCoordinator {
@@ -148,7 +149,6 @@ func newMultiRuntimeCoordinator(workdir string) *multiRuntimeCoordinator {
 		statuses:       map[string]map[int64]queue.Status{},
 		runs:           map[int64]*programRun{},
 		store:          newMismatchStore(workdir),
-		noise:          newNoiseFilter(workdir),
 	}
 	coord.nextID.Store(maxID)
 	return coord
@@ -207,7 +207,7 @@ func (coord *multiRuntimeCoordinator) EnsureRuntime(name string, target *prog.Ta
 		consumer: consumer,
 		target:   target,
 	}
-	return queue.Order(coord.runtimeQueueLocked(name), source)
+	return source
 }
 
 func (coord *multiRuntimeCoordinator) Close() {
@@ -357,13 +357,19 @@ func (coord *multiRuntimeCoordinator) status(runtimeName string, progID int64) (
 
 func (coord *multiRuntimeCoordinator) reproQueueLen(runtimeName string) int {
 	coord.mu.Lock()
-	queue := coord.reproQueues[runtimeName]
+	consumer := coord.consumers[runtimeName]
+	runtimeQueue := coord.reproQueues[runtimeName]
 	coord.mu.Unlock()
-	if queue == nil {
+	if consumer != nil {
+		return consumer.priorityLen()
+	}
+	if runtimeQueue == nil {
 		return 0
 	}
-	return queue.Len()
+	return runtimeQueue.Len()
 }
+
+const shadowPriorityBurst = 4
 
 type shadowProgramSource struct {
 	coord    *multiRuntimeCoordinator
@@ -374,9 +380,12 @@ type shadowProgramSource struct {
 
 func (source *shadowProgramSource) Next() *queue.Request {
 	for {
-		item, ok := source.consumer.next()
+		priorityReq, item, ok := source.consumer.next()
 		if !ok {
 			return nil
+		}
+		if priorityReq != nil {
+			return priorityReq
 		}
 		program, err := source.target.Deserialize(item.ProgData, prog.NonStrict)
 		if err != nil {
@@ -414,18 +423,46 @@ func (consumer *shadowConsumer) enqueue(program storedProgram) {
 	consumer.cond.Signal()
 }
 
-func (consumer *shadowConsumer) next() (storedProgram, bool) {
+func (consumer *shadowConsumer) enqueuePriority(req *queue.Request) {
 	consumer.mu.Lock()
 	defer consumer.mu.Unlock()
-	for len(consumer.queue) == 0 && !consumer.closed {
+	if consumer.closed {
+		return
+	}
+	consumer.priorityQueue = append(consumer.priorityQueue, req)
+	consumer.cond.Signal()
+}
+
+func (consumer *shadowConsumer) priorityLen() int {
+	consumer.mu.Lock()
+	defer consumer.mu.Unlock()
+	return len(consumer.priorityQueue)
+}
+
+func (consumer *shadowConsumer) next() (*queue.Request, storedProgram, bool) {
+	consumer.mu.Lock()
+	defer consumer.mu.Unlock()
+	for len(consumer.priorityQueue) == 0 && len(consumer.queue) == 0 && !consumer.closed {
 		consumer.cond.Wait()
 	}
+	if len(consumer.priorityQueue) != 0 &&
+		(consumer.priorityBurst < shadowPriorityBurst || len(consumer.queue) == 0) {
+		req := consumer.priorityQueue[0]
+		consumer.priorityQueue[0] = nil
+		consumer.priorityQueue = consumer.priorityQueue[1:]
+		if consumer.priorityBurst < shadowPriorityBurst {
+			consumer.priorityBurst++
+		}
+		return req, storedProgram{}, true
+	}
 	if len(consumer.queue) == 0 {
-		return storedProgram{}, false
+		return nil, storedProgram{}, false
 	}
 	item := consumer.queue[0]
+	consumer.queue[0] = storedProgram{}
 	consumer.queue = consumer.queue[1:]
-	return item, true
+	consumer.priorityBurst = 0
+	return nil, item, true
 }
 
 func (consumer *shadowConsumer) close() {
