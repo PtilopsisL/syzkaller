@@ -42,7 +42,7 @@ type runtimeController struct {
 }
 
 func (ctrl *runtimeController) MaxSignal() signal.Signal {
-	if ctrl.slot.shadow {
+	if ctrl.slot == nil || (!ctrl.slot.cfg.CoverageLayout && !ctrl.slot.cfg.Cover) {
 		return nil
 	}
 	return ctrl.mgr.MaxSignal()

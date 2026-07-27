@@ -44,6 +44,15 @@ public:
 		byte |= bit;
 	}
 
+	bool Empty() const
+	{
+		for (size_t region : tab_->regions) {
+			if (region != 0)
+				return false;
+		}
+		return true;
+	}
+
 	bool Contains(uint64 pc)
 	{
 		auto [byte, bit] = FindByte(pc, false);

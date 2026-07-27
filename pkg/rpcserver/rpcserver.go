@@ -40,6 +40,9 @@ type Config struct {
 	VMType string
 	RPC    string
 	VMLess bool
+	// CoverageLayout controls executor auxiliary mappings independently of
+	// vminfo.Config.Cover, which controls feedback collection.
+	CoverageLayout bool
 	// Hash adjacent PCs to form fuzzing feedback signal (otherwise just use coverage PCs as signal).
 	UseCoverEdges bool
 	// Filter signal/comparisons against target kernel text/data ranges.
@@ -195,10 +198,11 @@ func New(cfg *RemoteConfig) (Server, error) {
 			Sandbox:    sandbox,
 			SandboxArg: cfg.SandboxArg,
 		},
-		Stats:  cfg.Stats,
-		VMArch: cfg.TargetVMArch,
-		RPC:    cfg.RPC,
-		VMLess: cfg.VMLess,
+		Stats:          cfg.Stats,
+		VMArch:         cfg.TargetVMArch,
+		RPC:            cfg.RPC,
+		VMLess:         cfg.VMLess,
+		CoverageLayout: cfg.CoverageLayout,
 		// gVisor coverage is not a trace, so producing edges won't work.
 		UseCoverEdges: cfg.Experimental.CoverEdges && cfg.Type != targets.GVisor,
 		// gVisor/Starnix are not Linux, so filtering against Linux ranges won't work.
@@ -210,6 +214,13 @@ func New(cfg *RemoteConfig) (Server, error) {
 		pcBase:            pcBase,
 		localModules:      cfg.LocalModules,
 	}, cfg.Manager), nil
+}
+
+// coverageLayout reports whether executor auxiliary shared mappings should be
+// installed. The fallback to Cover keeps hand-constructed Config values (used
+// by local callers and tests) compatible with the pre-multi-runtime behavior.
+func (serv *server) coverageLayout() bool {
+	return serv.cfg.CoverageLayout || serv.cfg.Cover
 }
 
 func newImpl(cfg *Config, mgr Manager) *server {
@@ -442,7 +453,7 @@ func (serv *server) connectionLoop(baseCtx context.Context, runner *Runner) erro
 		runner.Stop()
 	}()
 
-	if serv.cfg.Cover {
+	if serv.coverageLayout() {
 		maxSignal := serv.mgr.MaxSignal().ToRaw()
 		for len(maxSignal) != 0 {
 			// Split coverage into batches to not grow the connection serialization
@@ -562,6 +573,7 @@ func (serv *server) CreateInstance(id int, injectExec chan<- bool, updInfo dispa
 		id:            id,
 		source:        serv.execSource,
 		cover:         serv.cfg.Cover,
+		layout:        serv.coverageLayout(),
 		coverEdges:    serv.cfg.UseCoverEdges,
 		filterSignal:  serv.cfg.FilterSignal,
 		debug:         serv.cfg.Debug,

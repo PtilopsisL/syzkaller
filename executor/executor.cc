@@ -682,7 +682,7 @@ int main(int argc, char** argv)
 #endif
 
 		if (fcntl(kMaxSignalFd, F_GETFD) != -1) {
-			// Use random addresses for coverage filters to not collide with output_data.
+			// Use dedicated fixed addresses so all runtime executors share the same layout.
 			max_signal.emplace(kMaxSignalFd, reinterpret_cast<void*>(0x110c230000ull));
 			close(kMaxSignalFd);
 		}
@@ -773,15 +773,14 @@ static uint32* input_base_address()
 		// just use whatever address mmap() returns us.
 		return 0;
 	}
-	// It's the first time we map output region - generate its location.
-	// The output region is the only thing in executor process for which consistency matters.
-	// If it is corrupted ipc package will fail to parse its contents and panic.
-	// But fuzzer constantly invents new ways of how to corrupt the region,
-	// so we map the region at a (hopefully) hard to guess address with random offset,
-	// surrounded by unmapped pages.
+	// Use one deterministic address for the output region in every executor.
+	// The output region is the only thing in executor process for which
+	// consistency matters: if it is corrupted ipc package will fail to parse its
+	// contents and panic. Executor processes have separate address spaces, and
+	// MAP_FIXED_EXCLUSIVE below still protects each process from overlap.
 	// The address chosen must also work on 32-bit kernels with 1GB user address space.
 	const uint64 kOutputBase = 0x1b2bc20000ull;
-	return (uint32*)(kOutputBase + (1 << 20) * (getpid() % 128));
+	return (uint32*)kOutputBase;
 }
 
 static void mmap_input()
@@ -1374,7 +1373,7 @@ uint32 write_comparisons(flatbuffers::FlatBufferBuilder& fbb, cover_t* cov)
 
 bool coverage_filter(uint64 pc)
 {
-	if (!cover_filter)
+	if (!cover_filter || cover_filter->Empty())
 		return true;
 	return cover_filter->Contains(pc);
 }

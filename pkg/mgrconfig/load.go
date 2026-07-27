@@ -26,6 +26,12 @@ type Derived struct {
 	Target    *prog.Target
 	SysTarget *targets.Target
 
+	// CoverageLayout controls whether the executor creates the shared output,
+	// max-signal, and coverage-filter mappings. It is intentionally separate
+	// from Cover: shadow runtimes don't collect feedback, but must use the same
+	// executor address layout as the primary runtime.
+	CoverageLayout bool
+
 	// Parsed Target:
 	TargetOS     string
 	TargetArch   string
@@ -200,6 +206,9 @@ func Complete(cfg *Config) error {
 	}
 	cfg.initTimeouts()
 	cfg.VMLess = cfg.Type == "none"
+	// Keep the layout compatible with the historical single-runtime behavior.
+	// Multi-runtime completion overrides this for shadow runtimes below.
+	cfg.CoverageLayout = cfg.CoverageLayout || cfg.Cover
 
 	if cfg.VMLess && cfg.Reproduce {
 		return fmt.Errorf("if config param type is none, reproduce must be false")
@@ -282,6 +291,9 @@ func (cfg *Config) completeRuntimes() error {
 		if err := Complete(runtimeCfg); err != nil {
 			return fmt.Errorf("runtime %q: %w", runtime.Name, err)
 		}
+		// Cover is deliberately disabled for shadow runtimes, while the executor
+		// layout remains identical to the primary runtime.
+		runtimeCfg.CoverageLayout = cfg.Cover
 		if runtimeCfg.VMLess {
 			return fmt.Errorf("runtime %q: type=none is not supported in multi-runtime mode", runtime.Name)
 		}

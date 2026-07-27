@@ -778,7 +778,11 @@ private:
 		rpc::InfoReplyRawT info_reply;
 		conn_.Recv(info_reply);
 		debug("received info reply: covfilter=%zu\n", info_reply.cover_filter.size());
-		if (!info_reply.cover_filter.empty()) {
+		// Cover=true means the manager wants the auxiliary executor layout. Create
+		// the shared cover-filter map even when the actual filter is empty, so
+		// primary and shadow runtimes use the same virtual address. An empty map
+		// is treated as "allow all" by coverage_filter().
+		if (conn_reply.cover || !info_reply.cover_filter.empty()) {
 			cover_filter_.emplace();
 			for (auto pc : info_reply.cover_filter)
 				cover_filter_->Insert(pc);

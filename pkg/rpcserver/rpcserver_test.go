@@ -109,6 +109,39 @@ func TestNew(t *testing.T) {
 	}
 }
 
+func TestCoverageLayoutHandshake(t *testing.T) {
+	runner := &Runner{
+		procs:     1,
+		cover:     false,
+		layout:    true,
+		sysTarget: targets.Get(targets.TestOS, targets.TestArch64),
+	}
+	serverNet, clientNet := net.Pipe()
+	serverConn := flatrpc.NewConn(serverNet)
+	clientConn := flatrpc.NewConn(clientNet)
+	defer serverConn.Close()
+	defer clientConn.Close()
+	done := make(chan error, 1)
+	go func() {
+		_, err := runner.Handshake(serverConn, &handshakeConfig{
+			Callback: func(*flatrpc.InfoRequestRawT) (handshakeResult, error) {
+				return handshakeResult{}, nil
+			},
+		})
+		done <- err
+	}()
+
+	reply, err := flatrpc.Recv[*flatrpc.ConnectReplyRaw](clientConn)
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.True(t, reply.Cover, "layout-only runtime must install executor coverage mappings")
+	assert.NoError(t, flatrpc.Send(clientConn, &flatrpc.InfoRequest{}))
+	_, err = flatrpc.Recv[*flatrpc.InfoReplyRaw](clientConn)
+	assert.NoError(t, err)
+	assert.NoError(t, <-done)
+}
+
 func TestCheckRevisions(t *testing.T) {
 	tests := []struct {
 		name    string

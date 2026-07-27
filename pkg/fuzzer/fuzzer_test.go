@@ -21,6 +21,7 @@ import (
 	"github.com/google/syzkaller/pkg/csource"
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
+	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/rpcserver"
 	"github.com/google/syzkaller/pkg/testutil"
 	"github.com/google/syzkaller/pkg/vminfo"
@@ -28,6 +29,19 @@ import (
 	"github.com/google/syzkaller/sys/targets"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestDefaultExecOptsCoverageLayoutIndependent(t *testing.T) {
+	cfg := &mgrconfig.Config{
+		Cover:   false,
+		Sandbox: "none",
+		Derived: mgrconfig.Derived{
+			CoverageLayout: true,
+		},
+	}
+	opts := DefaultExecOpts(cfg, 0, false)
+	assert.Zero(t, opts.EnvFlags&flatrpc.ExecEnvSignal,
+		"layout-only runtime must not enable feedback collection")
+}
 
 func TestFuzz(t *testing.T) {
 	defer checkGoroutineLeaks()

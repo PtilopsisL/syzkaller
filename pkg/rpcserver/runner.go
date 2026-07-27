@@ -32,6 +32,7 @@ type Runner struct {
 	source        *queue.Distributor
 	procs         int
 	cover         bool
+	layout        bool // executor auxiliary mappings; cover controls feedback collection.
 	coverEdges    bool
 	filterSignal  bool
 	debug         bool
@@ -97,7 +98,7 @@ func (runner *Runner) Handshake(conn *flatrpc.Conn, cfg *handshakeConfig) (hands
 
 	connectReply := &flatrpc.ConnectReply{
 		Debug:            runner.debug,
-		Cover:            runner.cover,
+		Cover:            runner.layout,
 		CoverEdges:       runner.coverEdges,
 		Kernel64Bit:      runner.sysTarget.PtrSize == 8,
 		Procs:            int32(runner.procs),

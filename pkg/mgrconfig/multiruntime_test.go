@@ -59,11 +59,13 @@ func TestLoadDataMultiRuntime(t *testing.T) {
 	assert.Equal(t, cfg.Name, primary.Name)
 	assert.Equal(t, cfg.Workdir, primary.Workdir)
 	assert.True(t, primary.Cover)
+	assert.True(t, primary.CoverageLayout)
 	assert.Equal(t, "dash", primary.DashboardClient)
 
 	assert.Equal(t, "multi-manager/v6.1", shadow.Name)
 	assert.Equal(t, filepath.Join(cfg.Workdir, "runtimes", "v6.1"), shadow.Workdir)
 	assert.False(t, shadow.Cover)
+	assert.True(t, shadow.CoverageLayout)
 	assert.Equal(t, ":0", shadow.RPC)
 	assert.Empty(t, shadow.DashboardClient)
 	assert.Empty(t, shadow.HubClient)
@@ -97,4 +99,6 @@ func TestLoadDataMultiRuntimeSnapshot(t *testing.T) {
 	require.True(t, cfg.Snapshot)
 	require.True(t, cfg.RuntimeConfigs["main"].Snapshot)
 	require.True(t, cfg.RuntimeConfigs["shadow"].Snapshot)
+	require.True(t, cfg.RuntimeConfigs["main"].CoverageLayout)
+	require.True(t, cfg.RuntimeConfigs["shadow"].CoverageLayout)
 }

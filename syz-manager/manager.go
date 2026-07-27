@@ -1508,6 +1508,13 @@ func (mgr *Manager) switchToSnapshot(slot *managedRuntime, source queue.Source) 
 }
 
 func (mgr *Manager) fuzzerLoop(fuzzer *fuzzer.Fuzzer) {
+	// A shadow runtime does not collect feedback, but its executor still uses
+	// max_signal as a read-only filter. Send the complete primary signal once
+	// after the fuzzer is initialized so shadows that connected earlier don't
+	// start with an empty map.
+	if mgr.cfg.Cover && !mgr.cfg.Snapshot && mgr.displayCfg.IsMultiRuntime() {
+		mgr.distributeSignalDelta(fuzzer.Cover.CopyMaxSignal())
+	}
 	for ; ; time.Sleep(time.Second / 2) {
 		if mgr.cfg.Cover && !mgr.cfg.Snapshot {
 			// Distribute new max signal over all instances.
@@ -1516,9 +1523,7 @@ func (mgr *Manager) fuzzerLoop(fuzzer *fuzzer.Fuzzer) {
 				log.Logf(3, "distributing %d new signal", len(newSignal))
 			}
 			if len(newSignal) != 0 {
-				if serv := mgr.runtime.Server(); serv != nil {
-					serv.DistributeSignalDelta(newSignal)
-				}
+				mgr.distributeSignalDelta(newSignal)
 			}
 		}
 
@@ -1546,6 +1551,14 @@ func (mgr *Manager) fuzzerLoop(fuzzer *fuzzer.Fuzzer) {
 				mgr.setPhaseLocked(phaseTriagedHub)
 			}
 			mgr.mu.Unlock()
+		}
+	}
+}
+
+func (mgr *Manager) distributeSignalDelta(plus signal.Signal) {
+	for _, slot := range mgr.runtimeList() {
+		if serv := slot.runtime.Server(); serv != nil {
+			serv.DistributeSignalDelta(plus)
 		}
 	}
 }
