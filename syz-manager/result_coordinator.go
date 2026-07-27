@@ -142,6 +142,7 @@ type runtimeMismatch struct {
 	StableDifferences []runtimeFieldDifference            `json:"stable_differences"`
 	UnstableFields    map[string][]string                 `json:"unstable_fields,omitempty"`
 	InvalidSamples    map[string][]string                 `json:"invalid_samples,omitempty"`
+	PartialSamples    map[string][]string                 `json:"partial_samples,omitempty"`
 }
 
 func summarizeRuntimeResult(runtimeName string, req *queue.Request, res *queue.Result) *runtimeResult {
@@ -189,7 +190,11 @@ func (coord *multiRuntimeCoordinator) handleCompletedRun(run *programRun) {
 		if mismatch == nil {
 			return
 		}
-		log.Logf(1, "program %d has cross-runtime result mismatch; scheduling repro", run.ID)
+		if mismatch.Outcome == comparisonOutcomeInconclusive {
+			log.Logf(1, "program %d has an incomplete cross-runtime result; scheduling validation repro", run.ID)
+		} else {
+			log.Logf(1, "program %d has cross-runtime result mismatch; scheduling repro", run.ID)
+		}
 		coord.enqueueMismatchRepro(run)
 	case runStageRepro:
 		mismatch := compareRuntimeSamples(run.Samples)
@@ -225,6 +230,7 @@ func compareRuntimeResults(results map[string]*runtimeResult) *runtimeMismatch {
 	names := sortedRuntimeNames(results)
 	compared := make(map[string]*comparisonRuntimeResult, len(results))
 	invalid := ""
+	partial, commonPrefix := runtimeResultsPartialInfo(results, names)
 	for _, name := range names {
 		result := results[name]
 		if result == nil {
@@ -236,39 +242,91 @@ func compareRuntimeResults(results map[string]*runtimeResult) *runtimeMismatch {
 		if result.Status == queue.Unsupported {
 			return nil
 		}
-		compared[name] = comparisonRuntimeResultFor(result)
+		if len(partial) != 0 {
+			compared[name] = comparisonRuntimeResultForPrefix(result, commonPrefix)
+		} else {
+			compared[name] = comparisonRuntimeResultFor(result)
+		}
 		if issue := runtimeResultComparisonIssue(result); issue != "" && invalid == "" {
 			invalid = fmt.Sprintf("runtime %q: %s", name, issue)
 		}
 	}
 	if invalid != "" {
 		return &runtimeMismatch{
-			Outcome:  comparisonOutcomeInconclusive,
-			Reason:   "invalid runtime result: " + invalid,
-			Runtimes: names,
-			Compared: compared,
+			Outcome:        comparisonOutcomeInconclusive,
+			Reason:         "invalid runtime result: " + invalid,
+			Runtimes:       names,
+			Compared:       compared,
+			PartialSamples: partial,
 		}
 	}
 	reference := compared[names[0]]
 	for _, name := range names[1:] {
+		if len(partial) != 0 && reflect.DeepEqual(reference.Calls, compared[name].Calls) {
+			continue
+		}
 		if !reflect.DeepEqual(reference, compared[name]) {
 			return &runtimeMismatch{
-				Outcome:  comparisonOutcomeMismatch,
-				Reason:   "runtime results differ",
-				Runtimes: names,
-				Compared: compared,
+				Outcome:        comparisonOutcomeMismatch,
+				Reason:         "runtime results differ",
+				Runtimes:       names,
+				Compared:       compared,
+				PartialSamples: partial,
 			}
+		}
+	}
+	if len(partial) != 0 {
+		return &runtimeMismatch{
+			Outcome:        comparisonOutcomeInconclusive,
+			Reason:         "runtime result is incomplete before all calls finished",
+			Runtimes:       names,
+			Compared:       compared,
+			PartialSamples: partial,
 		}
 	}
 	return nil
 }
 
+func runtimeResultsPartialInfo(results map[string]*runtimeResult, names []string) (map[string][]string, int) {
+	partial := make(map[string][]string)
+	commonPrefix := -1
+	for _, name := range names {
+		result := results[name]
+		if result == nil {
+			continue
+		}
+		prefix := len(result.Calls)
+		if result.Status == queue.Success {
+			completion := runtimeResultCompletionFor(result)
+			prefix = completion.prefix
+			if completion.partial {
+				partial[name] = []string{completion.description}
+			}
+		}
+		if commonPrefix == -1 || prefix < commonPrefix {
+			commonPrefix = prefix
+		}
+	}
+	if commonPrefix == -1 {
+		commonPrefix = 0
+	}
+	return partial, commonPrefix
+}
+
 func comparisonRuntimeResultFor(result *runtimeResult) *comparisonRuntimeResult {
+	return comparisonRuntimeResultForPrefix(result, -1)
+}
+
+func comparisonRuntimeResultForPrefix(result *runtimeResult, maxCalls int) *comparisonRuntimeResult {
 	ret := &comparisonRuntimeResult{
 		Status: result.Status,
 		Err:    result.Err,
 	}
-	for _, call := range result.Calls {
+	calls := result.Calls
+	if maxCalls >= 0 && len(calls) > maxCalls {
+		calls = calls[:maxCalls]
+	}
+	for _, call := range calls {
 		state := runtimeCallExecutionStateFor(call)
 		comparedCall := comparisonRuntimeCallResult{
 			Index: call.Index,
@@ -289,6 +347,53 @@ func comparisonRuntimeResultFor(result *runtimeResult) *comparisonRuntimeResult 
 		ret.Calls = append(ret.Calls, comparedCall)
 	}
 	return ret
+}
+
+const (
+	// These values are protocol sentinels rather than kernel errno values. 998 is
+	// emitted by the executor for a call for which no result record was produced;
+	// 999 is emitted by the RPC runner when the executor returned too few records.
+	executorMissingCallError = int32(998)
+	runnerMissingCallError   = int32(999)
+)
+
+type runtimeResultCompletion struct {
+	prefix      int
+	partial     bool
+	description string
+}
+
+// runtimeResultCompletionFor returns the prefix of calls with a terminal
+// execution state. A successful result with a non-terminal call is an
+// incomplete executor result, not evidence that the call returned a different
+// ABI value. Non-success statuses are kept as explicit crash/timeout results;
+// their status remains comparable by the normal status checks.
+func runtimeResultCompletionFor(result *runtimeResult) runtimeResultCompletion {
+	if result == nil {
+		return runtimeResultCompletion{}
+	}
+	if result.Status != queue.Success {
+		return runtimeResultCompletion{prefix: len(result.Calls)}
+	}
+	for index, call := range result.Calls {
+		state := runtimeCallExecutionStateFor(call)
+		if state == callFinishedOK || state == callFinishedError {
+			continue
+		}
+		description := fmt.Sprintf("call %d (%s): %s", call.Index, call.Name, state)
+		switch call.Error {
+		case executorMissingCallError:
+			description += fmt.Sprintf(" (executor did not emit a call result; sentinel error %d)", call.Error)
+		case runnerMissingCallError:
+			description += fmt.Sprintf(" (runner did not receive a call result; sentinel error %d)", call.Error)
+		}
+		return runtimeResultCompletion{
+			prefix:      index,
+			partial:     true,
+			description: description,
+		}
+	}
+	return runtimeResultCompletion{prefix: len(result.Calls)}
 }
 
 func runtimeCallExecutionStateFor(call runtimeCallResult) runtimeCallExecutionState {
@@ -365,9 +470,11 @@ type observedComparisonValue struct {
 }
 
 type runtimeSampleComparison struct {
-	names  []string
-	views  map[string][]*comparisonRuntimeResult
-	result *runtimeMismatch
+	names        []string
+	views        map[string][]*comparisonRuntimeResult
+	result       *runtimeMismatch
+	partial      bool
+	commonPrefix int
 }
 
 func compareRuntimeSamples(samples map[string][]*runtimeResult) *runtimeMismatch {
@@ -384,8 +491,11 @@ func compareRuntimeSamples(samples map[string][]*runtimeResult) *runtimeMismatch
 			StableDifferences: []runtimeFieldDifference{},
 			UnstableFields:    make(map[string][]string),
 			InvalidSamples:    make(map[string][]string),
+			PartialSamples:    make(map[string][]string),
 		},
 	}
+	validSamples := make(map[string][]*runtimeResult, len(samples))
+	commonPrefix := -1
 	for _, name := range names {
 		runtimeSamples := samples[name]
 		if len(runtimeSamples) == 0 {
@@ -399,44 +509,97 @@ func compareRuntimeSamples(samples map[string][]*runtimeResult) *runtimeMismatch
 					fmt.Sprintf("sample %d: %s", index+1, issue))
 				continue
 			}
-			view := comparisonRuntimeResultFor(sample)
-			comparison.views[name] = append(comparison.views[name], view)
-			if comparison.result.Compared[name] == nil {
-				comparison.result.Compared[name] = view
+			validSamples[name] = append(validSamples[name], sample)
+			prefix := len(sample.Calls)
+			if sample.Status == queue.Success {
+				completion := runtimeResultCompletionFor(sample)
+				prefix = completion.prefix
+				if completion.partial {
+					comparison.partial = true
+					comparison.result.PartialSamples[name] = append(
+						comparison.result.PartialSamples[name],
+						fmt.Sprintf("sample %d: %s", index+1, completion.description))
+				}
+			}
+			if commonPrefix == -1 || prefix < commonPrefix {
+				commonPrefix = prefix
 			}
 		}
 	}
 	if len(comparison.result.InvalidSamples) != 0 {
 		return comparison.finish()
 	}
+	if commonPrefix == -1 {
+		commonPrefix = 0
+	}
+	comparison.commonPrefix = commonPrefix
+	for _, name := range names {
+		for _, sample := range validSamples[name] {
+			view := comparisonRuntimeResultFor(sample)
+			if comparison.partial {
+				view = comparisonRuntimeResultForPrefix(sample, commonPrefix)
+			}
+			comparison.views[name] = append(comparison.views[name], view)
+			if comparison.result.Compared[name] == nil {
+				comparison.result.Compared[name] = view
+			}
+		}
+	}
 
 	statusValues, stable, different := comparison.field("status", "status", -1, "",
 		func(result *comparisonRuntimeResult) observedComparisonValue {
 			return observedComparisonValue{Present: true, Value: result.Status}
 		})
-	if !stable || different {
+	if !stable {
+		return comparison.finish()
+	}
+	if different && comparison.partial {
+		if count := len(comparison.result.StableDifferences); count != 0 &&
+			comparison.result.StableDifferences[count-1].Kind == "status" {
+			comparison.result.StableDifferences = comparison.result.StableDifferences[:count-1]
+		}
+		for _, name := range names {
+			comparison.result.UnstableFields[name] = append(comparison.result.UnstableFields[name], "status")
+		}
+		different = false
+	}
+	if different {
 		return comparison.finish()
 	}
 	status := statusValues[names[0]].Value.(queue.Status)
 	if status == queue.Unsupported {
 		return nil
 	}
-	comparison.field("request_error", "err", -1, "",
+	_, requestStable, requestDifferent := comparison.field("request_error", "err", -1, "",
 		func(result *comparisonRuntimeResult) observedComparisonValue {
 			return observedComparisonValue{Present: true, Value: result.Err}
 		})
+	if requestStable && requestDifferent && comparison.partial {
+		if count := len(comparison.result.StableDifferences); count != 0 &&
+			comparison.result.StableDifferences[count-1].Kind == "request_error" {
+			comparison.result.StableDifferences = comparison.result.StableDifferences[:count-1]
+		}
+		for _, name := range names {
+			comparison.result.UnstableFields[name] = append(comparison.result.UnstableFields[name], "err")
+		}
+	}
 	if status != queue.Success {
 		return comparison.finish()
 	}
 
-	_, callCountStable, callCountDifferent := comparison.field("call_count", "calls", -1, "",
-		func(result *comparisonRuntimeResult) observedComparisonValue {
-			return observedComparisonValue{Present: true, Value: len(result.Calls)}
-		})
-	if callCountStable && callCountDifferent {
-		return comparison.finish()
+	if !comparison.partial {
+		_, callCountStable, callCountDifferent := comparison.field("call_count", "calls", -1, "",
+			func(result *comparisonRuntimeResult) observedComparisonValue {
+				return observedComparisonValue{Present: true, Value: len(result.Calls)}
+			})
+		if callCountStable && callCountDifferent {
+			return comparison.finish()
+		}
 	}
 	maxCalls := comparison.maxCallCount()
+	if comparison.partial {
+		maxCalls = comparison.commonPrefix
+	}
 	for callIndex := 0; callIndex < maxCalls; callIndex++ {
 		index := callIndex
 		presenceValues, presenceStable, presenceDifferent := comparison.field(
@@ -640,7 +803,7 @@ func (comparison *runtimeSampleComparison) finish() *runtimeMismatch {
 		comparison.result.Reason = "runtime results differ in stable fields"
 		return comparison.result
 	}
-	if len(comparison.result.UnstableFields) != 0 || len(comparison.result.InvalidSamples) != 0 {
+	if len(comparison.result.UnstableFields) != 0 || len(comparison.result.InvalidSamples) != 0 || len(comparison.result.PartialSamples) != 0 {
 		comparison.result.Outcome = comparisonOutcomeInconclusive
 		comparison.result.Reason = "runtime comparison is inconclusive"
 		return comparison.result
@@ -1056,6 +1219,7 @@ type storedMismatchReport struct {
 	StableDifferences []runtimeFieldDifference            `json:"stable_differences"`
 	UnstableFields    map[string][]string                 `json:"unstable_fields,omitempty"`
 	InvalidSamples    map[string][]string                 `json:"invalid_samples,omitempty"`
+	PartialSamples    map[string][]string                 `json:"partial_samples,omitempty"`
 }
 
 func storedProgramCallsFor(p *prog.Prog) []storedProgramCall {
@@ -1165,6 +1329,7 @@ func (store *mismatchStore) Save(run *programRun, mismatch *runtimeMismatch) (st
 		StableDifferences: mismatch.StableDifferences,
 		UnstableFields:    mismatch.UnstableFields,
 		InvalidSamples:    mismatch.InvalidSamples,
+		PartialSamples:    mismatch.PartialSamples,
 	}
 	data, err := json.Marshal(report)
 	if err != nil {

@@ -255,6 +255,110 @@ func TestCompareRuntimeResultsIgnoresBlockedFlag(t *testing.T) {
 	}))
 }
 
+func TestRuntimeResultCompletionRecognizesMissingCallSentinels(t *testing.T) {
+	for _, test := range []struct {
+		errno int32
+		text  string
+	}{{998, "executor did not emit"}, {999, "runner did not receive"}} {
+		result := &runtimeResult{Status: queue.Success, Calls: []runtimeCallResult{{
+			Index: 0, Name: "read", Error: test.errno,
+		}}}
+		completion := runtimeResultCompletionFor(result)
+		assert.True(t, completion.partial)
+		assert.Equal(t, 0, completion.prefix)
+		assert.Contains(t, completion.description, test.text)
+	}
+}
+
+func TestCompareRuntimeResultsTreatsIncompleteSuffixAsInconclusive(t *testing.T) {
+	complete := &runtimeResult{
+		Status: queue.Success,
+		Calls: []runtimeCallResult{
+			{Index: 0, Name: "read", Flags: flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished, ReturnValue: int64Ptr(0)},
+			{Index: 1, Name: "write", Flags: flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished, ReturnValue: int64Ptr(0)},
+		},
+	}
+	partial := *complete
+	partial.Calls = append([]runtimeCallResult(nil), complete.Calls...)
+	partial.Calls[1] = runtimeCallResult{Index: 1, Name: "write", Error: 998}
+
+	analysis := compareRuntimeResults(map[string]*runtimeResult{
+		"v6.1": complete,
+		"v6.2": &partial,
+	})
+	require.NotNil(t, analysis)
+	assert.Equal(t, comparisonOutcomeInconclusive, analysis.Outcome)
+	require.Len(t, analysis.Compared["v6.1"].Calls, 1)
+	require.Len(t, analysis.Compared["v6.2"].Calls, 1)
+	assert.Contains(t, analysis.PartialSamples["v6.2"][0], "executor did not emit")
+}
+
+func TestCompareRuntimeResultsKeepsStablePrefixBeforeIncompleteSuffix(t *testing.T) {
+	result := func(errno int32, incomplete bool) *runtimeResult {
+		second := runtimeCallResult{
+			Index: 1, Name: "write", Flags: flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished,
+			ReturnValue: int64Ptr(0),
+		}
+		if incomplete {
+			second = runtimeCallResult{Index: 1, Name: "write", Error: 998}
+		}
+		return &runtimeResult{Status: queue.Success, Calls: []runtimeCallResult{
+			{Index: 0, Name: "read", Flags: flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished, Error: errno, ReturnValue: int64Ptr(-1)},
+			second,
+		}}
+	}
+	analysis := compareRuntimeResults(map[string]*runtimeResult{
+		"v6.1": result(12, true),
+		"v6.2": result(13, false),
+	})
+	require.NotNil(t, analysis)
+	assert.Equal(t, comparisonOutcomeMismatch, analysis.Outcome)
+	require.Len(t, analysis.Compared["v6.1"].Calls, 1)
+	assert.Equal(t, int32(12), *analysis.Compared["v6.1"].Calls[0].Error)
+	assert.Equal(t, int32(13), *analysis.Compared["v6.2"].Calls[0].Error)
+	assert.NotEmpty(t, analysis.PartialSamples["v6.1"])
+}
+
+func TestCompareRuntimeSamplesTreatsPartialOnlyAsInconclusive(t *testing.T) {
+	sample := func() *runtimeResult {
+		return &runtimeResult{Status: queue.Success, Calls: []runtimeCallResult{
+			{Index: 0, Name: "read", Flags: flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished, ReturnValue: int64Ptr(0)},
+			{Index: 1, Name: "write", Error: 998},
+		}}
+	}
+	analysis := compareRuntimeSamples(map[string][]*runtimeResult{
+		"v6.1": {sample(), sample(), sample()},
+		"v6.2": {sample(), sample(), sample()},
+	})
+	require.NotNil(t, analysis)
+	assert.Equal(t, comparisonOutcomeInconclusive, analysis.Outcome)
+	assert.Empty(t, analysis.StableDifferences)
+	assert.NotEmpty(t, analysis.PartialSamples["v6.1"])
+	require.Len(t, analysis.Compared["v6.1"].Calls, 1)
+}
+
+func TestCompareRuntimeSamplesKeepsStablePrefixBeforePartialSuffix(t *testing.T) {
+	sample := func(errno int32, incomplete bool) *runtimeResult {
+		second := runtimeCallResult{Index: 1, Name: "write", Flags: flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished, ReturnValue: int64Ptr(0)}
+		if incomplete {
+			second = runtimeCallResult{Index: 1, Name: "write", Error: 998}
+		}
+		return &runtimeResult{Status: queue.Success, Calls: []runtimeCallResult{
+			{Index: 0, Name: "read", Flags: flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished, Error: errno, ReturnValue: int64Ptr(-1)},
+			second,
+		}}
+	}
+	analysis := compareRuntimeSamples(map[string][]*runtimeResult{
+		"v6.1": {sample(12, true), sample(12, true), sample(12, true)},
+		"v6.2": {sample(13, false), sample(13, false), sample(13, false)},
+	})
+	require.NotNil(t, analysis)
+	assert.Equal(t, comparisonOutcomeMismatch, analysis.Outcome)
+	require.NotEmpty(t, analysis.StableDifferences)
+	assert.Equal(t, "errno", analysis.StableDifferences[0].Kind)
+	assert.NotEmpty(t, analysis.PartialSamples["v6.1"])
+}
+
 func TestCompareRuntimeResultsKeepsSuccessFailureDifference(t *testing.T) {
 	success := &runtimeResult{
 		Status: queue.Success,
