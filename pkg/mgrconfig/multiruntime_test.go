@@ -38,12 +38,14 @@ func TestLoadDataMultiRuntime(t *testing.T) {
 		"runtimes": [
 			{
 				"name": "v6.2",
-				"tag": "linux-v6.2"
+				"tag": "linux-v6.2",
+				"kernel_version": "6.2.0"
 			},
 			{
 				"name": "v6.1",
 				"kernel_obj": "/linux-v6.1",
-				"tag": "linux-v6.1"
+				"tag": "linux-v6.1",
+				"kernel_version": "v6.1.0"
 			}
 		]
 	}`, workdir)))
@@ -61,6 +63,7 @@ func TestLoadDataMultiRuntime(t *testing.T) {
 	assert.True(t, primary.Cover)
 	assert.True(t, primary.CoverageLayout)
 	assert.Equal(t, "dash", primary.DashboardClient)
+	assert.Equal(t, "6.2.0", primary.KernelVersion)
 
 	assert.Equal(t, "multi-manager/v6.1", shadow.Name)
 	assert.Equal(t, filepath.Join(cfg.Workdir, "runtimes", "v6.1"), shadow.Workdir)
@@ -70,6 +73,7 @@ func TestLoadDataMultiRuntime(t *testing.T) {
 	assert.Empty(t, shadow.DashboardClient)
 	assert.Empty(t, shadow.HubClient)
 	assert.Equal(t, "/linux-v6.1", shadow.KernelObj)
+	assert.Equal(t, "v6.1.0", shadow.KernelVersion)
 }
 
 func TestLoadDataMultiRuntimeSnapshot(t *testing.T) {

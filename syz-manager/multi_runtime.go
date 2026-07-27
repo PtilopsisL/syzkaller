@@ -119,12 +119,13 @@ type multiRuntimeCoordinator struct {
 	progIDState    string
 	reservedProgID int64
 
-	mu          sync.Mutex
-	consumers   map[string]*shadowConsumer
-	reproQueues map[string]*queue.PlainQueue
-	statuses    map[string]map[int64]queue.Status
-	runs        map[int64]*programRun
-	store       *mismatchStore
+	mu              sync.Mutex
+	consumers       map[string]*shadowConsumer
+	reproQueues     map[string]*queue.PlainQueue
+	runtimeVersions map[string]string
+	statuses        map[string]map[int64]queue.Status
+	runs            map[int64]*programRun
+	store           *mismatchStore
 }
 
 type shadowConsumer struct {
@@ -142,16 +143,26 @@ type shadowConsumer struct {
 func newMultiRuntimeCoordinator(workdir string) *multiRuntimeCoordinator {
 	maxID := maxPersistedProgID(workdir)
 	coord := &multiRuntimeCoordinator{
-		progIDState:    progIDStatePath(workdir),
-		reservedProgID: maxID,
-		consumers:      map[string]*shadowConsumer{},
-		reproQueues:    map[string]*queue.PlainQueue{},
-		statuses:       map[string]map[int64]queue.Status{},
-		runs:           map[int64]*programRun{},
-		store:          newMismatchStore(workdir),
+		progIDState:     progIDStatePath(workdir),
+		reservedProgID:  maxID,
+		consumers:       map[string]*shadowConsumer{},
+		reproQueues:     map[string]*queue.PlainQueue{},
+		runtimeVersions: map[string]string{},
+		statuses:        map[string]map[int64]queue.Status{},
+		runs:            map[int64]*programRun{},
+		store:           newMismatchStore(workdir),
 	}
 	coord.nextID.Store(maxID)
 	return coord
+}
+
+func (coord *multiRuntimeCoordinator) setRuntimeVersion(name, version string) {
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	if coord.runtimeVersions == nil {
+		coord.runtimeVersions = make(map[string]string)
+	}
+	coord.runtimeVersions[name] = version
 }
 
 func newShadowProgramRegistry() *multiRuntimeCoordinator {
@@ -296,6 +307,9 @@ func (coord *multiRuntimeCoordinator) recordRuntimeResult(runtimeName string, pr
 	var nextSample *programRun
 	var nextQueue *queue.PlainQueue
 	coord.mu.Lock()
+	if result != nil && result.RuntimeVersion == "" {
+		result.RuntimeVersion = coord.runtimeVersions[runtimeName]
+	}
 	if coord.statuses[runtimeName] == nil {
 		coord.statuses[runtimeName] = map[int64]queue.Status{}
 	}

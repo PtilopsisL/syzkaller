@@ -423,7 +423,11 @@ func (mgr *Manager) initRuntime(debug bool) error {
 	mgr.allRuntimes = make(map[string]*managedRuntime)
 	mgr.shadows = make(map[string]*managedRuntime)
 	if mgr.displayCfg.IsMultiRuntime() {
-		mgr.programRegistry = newMultiRuntimeCoordinator(mgr.displayCfg.Workdir)
+		coord := newMultiRuntimeCoordinator(mgr.displayCfg.Workdir)
+		for name, runtimeCfg := range mgr.displayCfg.RuntimeConfigs {
+			coord.setRuntimeVersion(name, runtimeCfg.KernelVersion)
+		}
+		mgr.programRegistry = coord
 	}
 
 	createSlot := func(name string, runtimeCfg *mgrconfig.Config, shadow bool) error {

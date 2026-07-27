@@ -63,6 +63,8 @@ type Config struct {
 	KernelSubsystem []Subsystem `json:"kernel_subsystem,omitempty"`
 	// Arbitrary optional tag that is saved along with crash reports (e.g. branch/commit).
 	Tag string `json:"tag,omitempty"`
+	// Optional kernel release identity used for version-aware multi-runtime comparison.
+	KernelVersion string `json:"kernel_version,omitempty"`
 	// Location of the disk image file.
 	Image string `json:"image,omitempty"`
 	// Location (on the host machine) of a root SSH identity to use for communicating with
@@ -247,6 +249,7 @@ type Runtime struct {
 	Image          string          `json:"image,omitempty"`
 	SSHKey         string          `json:"sshkey,omitempty"`
 	Tag            string          `json:"tag,omitempty"`
+	KernelVersion  string          `json:"kernel_version,omitempty"`
 	Type           string          `json:"type,omitempty"`
 	VM             json.RawMessage `json:"vm,omitempty"`
 }
