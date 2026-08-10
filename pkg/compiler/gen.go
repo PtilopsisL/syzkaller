@@ -531,8 +531,28 @@ func (comp *compiler) genFieldDir(attrs map[*attrDesc]uint64) (prog.Dir, bool) {
 	}
 }
 
+func (comp *compiler) genOutputPolicy(attrs map[*attrDesc]string, pos ast.Pos) prog.OutputPolicy {
+	policy := prog.OutputPolicy{
+		Domain: attrs[attrOutputDomain],
+		Mode:   attrs[attrOutputMode],
+		Scope:  attrs[attrOutputScope],
+	}
+	if value := attrs[attrOutputPolicy]; value != "" {
+		kind, err := prog.ParseOutputPolicyKind(value)
+		if err != nil {
+			comp.error(pos, "%v", err)
+		} else {
+			policy.Kind = kind
+		}
+	}
+	if err := prog.ValidateOutputPolicy(policy); err != nil {
+		comp.error(pos, "%v", err)
+	}
+	return policy
+}
+
 func (comp *compiler) genField(f *ast.Field, argSize uint64, overlayDir prog.Dir) prog.Field {
-	intAttrs, exprAttrs, _ := comp.parseAttrs(structFieldAttrs, f, f.Attrs)
+	intAttrs, exprAttrs, stringAttrs := comp.parseAttrs(structFieldAttrs, f, f.Attrs)
 	dir, hasDir := overlayDir, true
 	if overlayDir == prog.DirInOut {
 		dir, hasDir = comp.genFieldDir(intAttrs)
@@ -543,6 +563,7 @@ func (comp *compiler) genField(f *ast.Field, argSize uint64, overlayDir prog.Dir
 		HasDirection: hasDir,
 		Direction:    dir,
 		Condition:    exprAttrs[attrIf],
+		OutputPolicy: comp.genOutputPolicy(stringAttrs, f.Pos),
 	}
 }
 
@@ -578,7 +599,8 @@ func (comp *compiler) wrapConditionalField(name string, field prog.Field) prog.F
 	}
 
 	return prog.Field{
-		Name: field.Name,
+		Name:         field.Name,
+		OutputPolicy: field.OutputPolicy,
 		Type: &prog.UnionType{
 			TypeCommon: common,
 			Fields: []prog.Field{
@@ -588,6 +610,7 @@ func (comp *compiler) wrapConditionalField(name string, field prog.Field) prog.F
 					HasDirection: field.HasDirection,
 					Direction:    field.Direction,
 					Condition:    newCondition,
+					OutputPolicy: field.OutputPolicy,
 				},
 				{
 					Name: "void",

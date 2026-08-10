@@ -67,6 +67,8 @@ type Config struct {
 	KernelVersion string `json:"kernel_version,omitempty"`
 	// Optional JSON file containing manually reviewed multi-runtime diff labels.
 	RuntimeDiffLabels string `json:"runtime_diff_labels,omitempty"`
+	// Optional JSON overlay for syzlang-driven runtime output comparison policies.
+	RuntimeOutputPolicy string `json:"runtime_output_policy,omitempty"`
 	// Location of the disk image file.
 	Image string `json:"image,omitempty"`
 	// Location (on the host machine) of a root SSH identity to use for communicating with

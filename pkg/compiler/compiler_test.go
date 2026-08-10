@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/google/syzkaller/pkg/ast"
@@ -401,5 +402,98 @@ recursive {
 		if ptr, ok := typ.(*prog.PtrType); ok && ptr.SquashableElem {
 			t.Fatal("got squashable ptr")
 		}
+	}
+}
+
+func TestOutputPolicyAttrs(t *testing.T) {
+	const input = `
+foo(arg ptr[out, policy_struct])
+
+policy_struct {
+	value	int64	(output_policy["address"], output_domain["user_memory"], output_mode["strict_identity"], output_scope["value"])
+} [output_policy["timestamp"]]
+`
+	var errors []string
+	eh := func(pos ast.Pos, msg string) {
+		errors = append(errors, fmt.Sprintf("%v: %v", pos, msg))
+	}
+	desc := ast.Parse([]byte(input), "input", eh)
+	if desc == nil {
+		t.Fatalf("failed to parse: %v", errors)
+	}
+	compiled := Compile(desc, map[string]uint64{"SYS_foo": 1},
+		targets.List[targets.TestOS][targets.TestArch64], eh)
+	if compiled == nil {
+		t.Fatalf("failed to compile: %v", errors)
+	}
+	var found *prog.StructType
+	for _, typ := range compiled.Types {
+		if candidate, ok := typ.(*prog.StructType); ok && candidate.Name() == "policy_struct" {
+			found = candidate
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("compiled policy_struct type was not found")
+	}
+	if found.OutputPolicy.Kind != prog.OutputPolicyTimestamp {
+		t.Fatalf("wrong type policy: %+v", found.OutputPolicy)
+	}
+	field := found.Fields[0]
+	want := prog.OutputPolicy{
+		Kind: prog.OutputPolicyAddress, Domain: "user_memory", Mode: "strict_identity", Scope: "value",
+	}
+	if !reflect.DeepEqual(field.OutputPolicy, want) {
+		t.Fatalf("wrong field policy: got %+v, want %+v", field.OutputPolicy, want)
+	}
+}
+
+func TestOutputPolicyRejectsUnknownKind(t *testing.T) {
+	const input = `
+foo(arg ptr[out, policy_struct])
+
+policy_struct {
+	value	int64	(output_policy["not_a_policy"])
+}
+`
+	var errors []string
+	eh := func(pos ast.Pos, msg string) {
+		errors = append(errors, msg)
+	}
+	desc := ast.Parse([]byte(input), "input", eh)
+	if desc == nil {
+		t.Fatal("failed to parse")
+	}
+	if compiled := Compile(desc, map[string]uint64{"SYS_foo": 1},
+		targets.List[targets.TestOS][targets.TestArch64], eh); compiled != nil {
+		t.Fatal("compile unexpectedly accepted an unknown output policy")
+	}
+	if !strings.Contains(strings.Join(errors, "\n"), "unknown output policy") {
+		t.Fatalf("missing unknown-policy error: %v", errors)
+	}
+}
+
+func TestOutputPolicyRejectsUnsupportedMode(t *testing.T) {
+	const input = `
+foo(arg ptr[out, policy_struct])
+
+policy_struct {
+	value	int64	(output_policy["counter"], output_mode["approximately"])
+}
+`
+	var errors []string
+	eh := func(pos ast.Pos, msg string) {
+		errors = append(errors, msg)
+	}
+	desc := ast.Parse([]byte(input), "input", eh)
+	if desc == nil {
+		t.Fatal("failed to parse")
+	}
+	if compiled := Compile(desc, map[string]uint64{"SYS_foo": 1},
+		targets.List[targets.TestOS][targets.TestArch64], eh); compiled != nil {
+		t.Fatal("compile unexpectedly accepted an unsupported output mode")
+	}
+	if !strings.Contains(strings.Join(errors, "\n"), "unsupported output mode") {
+		t.Fatalf("missing unsupported-mode error: %v", errors)
 	}
 }

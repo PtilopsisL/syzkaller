@@ -23,12 +23,13 @@ import (
 )
 
 type runtimeResult struct {
-	Runtime        string              `json:"runtime"`
-	RuntimeVersion string              `json:"runtime_version,omitempty"`
-	Status         queue.Status        `json:"status"`
-	StatusName     string              `json:"status_name"`
-	Err            string              `json:"err,omitempty"`
-	Calls          []runtimeCallResult `json:"calls,omitempty"`
+	Runtime          string              `json:"runtime"`
+	RuntimeVersion   string              `json:"runtime_version,omitempty"`
+	OutputPolicyHash string              `json:"output_policy_hash,omitempty"`
+	Status           queue.Status        `json:"status"`
+	StatusName       string              `json:"status_name"`
+	Err              string              `json:"err,omitempty"`
+	Calls            []runtimeCallResult `json:"calls,omitempty"`
 }
 
 type runtimeCallResult struct {
@@ -82,17 +83,34 @@ type runtimeOutputCapture struct {
 	Values       []*runtimeDecodedOutput `json:"values,omitempty"`
 }
 
+type runtimeCanonicalOutput struct {
+	Kind      string  `json:"kind"`
+	Domain    string  `json:"domain,omitempty"`
+	Class     string  `json:"class,omitempty"`
+	State     string  `json:"state,omitempty"`
+	Region    string  `json:"region,omitempty"`
+	Offset    *uint64 `json:"offset,omitempty"`
+	Exact     *uint64 `json:"exact,omitempty"`
+	Alignment uint64  `json:"alignment,omitempty"`
+}
+
 type runtimeDecodedOutput struct {
-	Path        string              `json:"path"`
-	Type        string              `json:"type"`
-	Dir         string              `json:"dir"`
-	Kind        string              `json:"kind"`
-	Size        uint64              `json:"size,omitempty"`
-	Value       *uint64             `json:"value,omitempty"`
-	ValueNames  []string            `json:"value_names,omitempty"`
-	RawHex      string              `json:"raw_hex,omitempty"`
-	Truncated   bool                `json:"truncated,omitempty"`
-	DataSummary *runtimeDataSummary `json:"data_summary,omitempty"`
+	Path             string                  `json:"path"`
+	Type             string                  `json:"type"`
+	Dir              string                  `json:"dir"`
+	Kind             string                  `json:"kind"`
+	Size             uint64                  `json:"size,omitempty"`
+	Value            *uint64                 `json:"value,omitempty"`
+	ValueNames       []string                `json:"value_names,omitempty"`
+	RawHex           string                  `json:"raw_hex,omitempty"`
+	Truncated        bool                    `json:"truncated,omitempty"`
+	DataSummary      *runtimeDataSummary     `json:"data_summary,omitempty"`
+	OutputPolicy     prog.OutputPolicy       `json:"output_policy"`
+	PolicySource     string                  `json:"policy_source,omitempty"`
+	PolicyScope      string                  `json:"policy_scope,omitempty"`
+	IdentitySpecial  bool                    `json:"identity_special,omitempty"`
+	CanonicalValue   *runtimeCanonicalOutput `json:"canonical_value,omitempty"`
+	NormalizationErr string                  `json:"normalization_error,omitempty"`
 }
 
 type runtimeCallExecutionState string
@@ -133,6 +151,7 @@ type runtimeFieldDifference struct {
 	Values        map[string]any `json:"values"`
 	CallIndex     *int           `json:"call_index,omitempty"`
 	CallName      string         `json:"call_name,omitempty"`
+	OutputPolicy  string         `json:"output_policy,omitempty"`
 	Signature     string         `json:"signature,omitempty"`
 	Fingerprint   string         `json:"fingerprint,omitempty"`
 	TriageLabel   string         `json:"triage_label,omitempty"`
@@ -152,11 +171,17 @@ type runtimeMismatch struct {
 	PartialSamples    map[string][]string                 `json:"partial_samples,omitempty"`
 }
 
-func summarizeRuntimeResult(runtimeName string, req *queue.Request, res *queue.Result) *runtimeResult {
+func summarizeRuntimeResult(runtimeName string, req *queue.Request, res *queue.Result,
+	policies ...*runtimeOutputPolicyStore) *runtimeResult {
+	var outputPolicies *runtimeOutputPolicyStore
+	if len(policies) != 0 {
+		outputPolicies = policies[0]
+	}
 	ret := &runtimeResult{
-		Runtime:    runtimeName,
-		Status:     res.Status,
-		StatusName: res.Status.String(),
+		Runtime: runtimeName, Status: res.Status, StatusName: res.Status.String(),
+	}
+	if outputPolicies != nil {
+		ret.OutputPolicyHash = outputPolicies.hash
 	}
 	if res.Err != nil {
 		ret.Err = res.Err.Error()
@@ -182,11 +207,13 @@ func summarizeRuntimeResult(runtimeName string, req *queue.Request, res *queue.R
 			}
 			if req.Prog != nil && req.ExecOpts.ExecFlags&flatrpc.ExecFlagCollectOutputs != 0 {
 				callResult.Outputs = summarizeCallOutputs(req.Prog, i, call.Outputs)
+				applyRuntimeOutputPolicies(callResult.Name, callResult.Outputs, outputPolicies)
 			}
 			callResult.Sctrace = string(call.Sctrace)
 		}
 		ret.Calls = append(ret.Calls, callResult)
 	}
+	normalizeRuntimeOutputs(req.Prog, ret)
 	return ret
 }
 
@@ -386,17 +413,35 @@ func comparisonRuntimeOutputCaptures(captures []*runtimeOutputCapture) []*runtim
 		if capture == nil {
 			continue
 		}
+		values := capture.Values[:0]
 		for _, output := range capture.Values {
-			if output == nil || output.Kind != "result" {
+			if output == nil {
+				values = append(values, output)
 				continue
 			}
-			output.Value = nil
-			output.ValueNames = nil
-			output.RawHex = ""
-			output.DataSummary = nil
+			kind := output.OutputPolicy.EffectiveKind()
+			if kind == prog.OutputPolicyReserved {
+				continue
+			}
+			if output.CanonicalValue != nil && output.NormalizationErr == "" {
+				clearRuntimeOutputRawValue(output)
+			} else if output.OutputPolicy.Kind == "" && output.Kind == "result" {
+				// Backward compatibility for reports/tests produced before output
+				// policies were attached. New results always carry an explicit policy.
+				clearRuntimeOutputRawValue(output)
+			}
+			values = append(values, output)
 		}
+		capture.Values = values
 	}
 	return ret
+}
+
+func clearRuntimeOutputRawValue(output *runtimeDecodedOutput) {
+	output.Value = nil
+	output.ValueNames = nil
+	output.RawHex = ""
+	output.DataSummary = nil
 }
 
 type observedComparisonValue struct {
@@ -649,6 +694,21 @@ func (comparison *runtimeSampleComparison) field(kind, path string, callIndex in
 		}
 		if callIndex >= 0 {
 			diff.CallIndex = intPtr(callIndex)
+		}
+		if kind == "output" {
+			for _, observed := range values {
+				output, ok := observed.Value.(runtimeDecodedOutput)
+				if !ok {
+					continue
+				}
+				diff.OutputPolicy = string(output.OutputPolicy.EffectiveKind())
+				if output.OutputPolicy.EffectiveKind() == prog.OutputPolicyVersionIdentity {
+					diff.TriageLabel = string(runtimeDiffExpectedVersion)
+					diff.TriageLabelID = "output_policy"
+					diff.TriageNote = "classified by version_identity output policy"
+				}
+				break
+			}
 		}
 		comparison.result.StableDifferences = append(comparison.result.StableDifferences, diff)
 	}
@@ -1141,8 +1201,8 @@ func newMismatchStore(workdir string) *mismatchStore {
 	}
 }
 
-// Version 3 adds triage hashes/labels and removes the hardcoded expected-version bucket.
-const storedMismatchReportFormatVersion = 3
+// Version 4 adds raw-preserving semantic output policies and canonical comparison values.
+const storedMismatchReportFormatVersion = 4
 
 type storedProgramCall struct {
 	Index int               `json:"index"`

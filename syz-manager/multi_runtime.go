@@ -127,6 +127,7 @@ type multiRuntimeCoordinator struct {
 	runs            map[int64]*programRun
 	store           *mismatchStore
 	diffLabels      *runtimeDiffLabelStore
+	outputPolicies  *runtimeOutputPolicyStore
 }
 
 type shadowConsumer struct {
@@ -299,7 +300,11 @@ func (coord *multiRuntimeCoordinator) recordResult(runtimeName string, req *queu
 	if req == nil || res == nil {
 		return
 	}
-	coord.recordRuntimeResult(runtimeName, req.ProgID, summarizeRuntimeResult(runtimeName, req, res))
+	coord.mu.Lock()
+	policies := coord.outputPolicies
+	coord.mu.Unlock()
+	coord.recordRuntimeResult(runtimeName, req.ProgID,
+		summarizeRuntimeResult(runtimeName, req, res, policies))
 }
 
 func (coord *multiRuntimeCoordinator) recordRuntimeResult(runtimeName string, progID int64,

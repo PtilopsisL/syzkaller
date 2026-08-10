@@ -131,8 +131,8 @@ func foreachFieldAttrConst(n *ast.Struct, cb func(*ast.Type)) {
 				return
 			}
 			if attrDesc.Type != exprAttr {
-				// For now, only these field attrs may have consts.
-				return
+				// For now, only expression field attrs may have consts.
+				continue
 			}
 			ast.Recursive(func(n ast.Node) bool {
 				t, ok := n.(*ast.Type)

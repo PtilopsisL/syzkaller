@@ -223,10 +223,11 @@ func annotateRuntimeDifferences(differences []runtimeFieldDifference,
 	for index := range differences {
 		difference := &differences[index]
 		signaturePayload := runtimeDiffSignaturePayload{
-			Kind:     difference.Kind,
-			Path:     normalizeRuntimeDifferencePath(difference.Path),
-			CallName: difference.CallName,
-			Args:     runtimeDiffCallArgs(*difference, samples),
+			Kind:         difference.Kind,
+			Path:         normalizeRuntimeDifferencePath(difference.Path),
+			CallName:     difference.CallName,
+			OutputPolicy: difference.OutputPolicy,
+			Args:         runtimeDiffCallArgs(*difference, samples),
 		}
 		difference.Signature = hashRuntimeDiffPayload("signature", signaturePayload)
 		values := runtimeDiffObservedValues(difference.Values)
@@ -243,10 +244,11 @@ func annotateRuntimeDifferences(differences []runtimeFieldDifference,
 }
 
 type runtimeDiffSignaturePayload struct {
-	Kind     string                   `json:"kind"`
-	Path     string                   `json:"path"`
-	CallName string                   `json:"call_name,omitempty"`
-	Args     []runtimeDiffArgIdentity `json:"args,omitempty"`
+	Kind         string                   `json:"kind"`
+	Path         string                   `json:"path"`
+	CallName     string                   `json:"call_name,omitempty"`
+	OutputPolicy string                   `json:"output_policy,omitempty"`
+	Args         []runtimeDiffArgIdentity `json:"args,omitempty"`
 }
 
 type runtimeDiffArgIdentity struct {

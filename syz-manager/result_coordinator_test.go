@@ -717,3 +717,174 @@ func hasArgKind(arg *runtimeCallArg, kind string) bool {
 	}
 	return false
 }
+func TestOutputPoliciesCanonicalizeWithoutDiscardingRawValues(t *testing.T) {
+	target := &prog.Target{
+		PtrSize: 8, DataOffset: 0x100000, NumPages: 4, PageSize: 4096,
+	}
+	identity := prog.OutputPolicy{Kind: prog.OutputPolicyResourceIdentity, Domain: "fd"}
+	left := runtimeResultWithPolicy(target, identity, 11)
+	right := runtimeResultWithPolicy(target, identity, 27)
+	assert.Nil(t, compareRuntimeResults(map[string]*runtimeResult{"left": left, "right": right}))
+	require.NotNil(t, left.Calls[0].Outputs[0].Values[0].Value)
+	assert.Equal(t, uint64(11), *left.Calls[0].Outputs[0].Values[0].Value)
+	require.NotNil(t, left.Calls[0].Outputs[0].Values[0].CanonicalValue)
+
+	sameIdentity := runtimeResultWithPolicy(target, identity, 11, 11)
+	differentIdentities := runtimeResultWithPolicy(target, identity, 27, 28)
+	analysis := compareRuntimeResults(map[string]*runtimeResult{
+		"same": sameIdentity, "different": differentIdentities,
+	})
+	require.NotNil(t, analysis)
+	assert.Equal(t, comparisonOutcomeMismatch, analysis.Outcome)
+
+	semantic := prog.OutputPolicy{Kind: prog.OutputPolicySemantic}
+	assert.NotNil(t, compareRuntimeResults(map[string]*runtimeResult{
+		"left":  runtimeResultWithPolicy(target, semantic, 1),
+		"right": runtimeResultWithPolicy(target, semantic, 2),
+	}))
+}
+
+func TestLinuxStatOutputPoliciesReachRuntimeDecoder(t *testing.T) {
+	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
+	require.NoError(t, err)
+	p := mustDeserializeProg(t, target,
+		`fstat(0xffffffffffffffff, &(0x7f0000000000))`)
+	plan := p.OutputCapturePlan(0)
+	require.Len(t, plan, 1)
+	data := make([]byte, plan[0].Size)
+	binary.LittleEndian.PutUint64(data[0:], 17)
+	binary.LittleEndian.PutUint64(data[8:], 1234)
+
+	res := testResult(0, "")
+	res.Info.Calls[0].ReturnValue = 0
+	res.Info.Calls[0].ReturnValueValid = true
+	res.Info.Calls[0].Outputs = []*flatrpc.OutputCapture{{Id: plan[0].ID, Data: data}}
+	result := summarizeRuntimeResult("v6.2", &queue.Request{
+		Prog:     p,
+		ExecOpts: flatrpc.ExecOpts{ExecFlags: flatrpc.ExecFlagCollectOutputs},
+	}, res)
+
+	require.Len(t, result.Calls[0].Outputs, 1)
+	outputs := result.Calls[0].Outputs[0].Values
+	var device, inode *runtimeDecodedOutput
+	for _, output := range outputs {
+		switch output.Path {
+		case "arg[1].st_dev":
+			device = output
+		case "arg[1].st_ino":
+			inode = output
+		}
+	}
+	require.NotNil(t, device)
+	require.NotNil(t, inode)
+	assert.Equal(t, prog.OutputPolicyFilesystemIdentity, device.OutputPolicy.Kind)
+	assert.Equal(t, "mount", device.OutputPolicy.Domain)
+	assert.Equal(t, prog.OutputPolicyObjectIdentity, inode.OutputPolicy.Kind)
+	require.NotNil(t, device.CanonicalValue)
+	require.NotNil(t, inode.CanonicalValue)
+	assert.Equal(t, uint64(17), *device.Value, "raw value must remain available")
+}
+
+func TestOutputPoliciesReservedCounterAndTimestamp(t *testing.T) {
+	target := &prog.Target{PtrSize: 8}
+	reserved := prog.OutputPolicy{Kind: prog.OutputPolicyReserved}
+	assert.Nil(t, compareRuntimeResults(map[string]*runtimeResult{
+		"left":  runtimeResultWithPolicy(target, reserved, 1),
+		"right": runtimeResultWithPolicy(target, reserved, 2),
+	}))
+
+	counter := prog.OutputPolicy{Kind: prog.OutputPolicyCounter}
+	assert.Nil(t, compareRuntimeResults(map[string]*runtimeResult{
+		"left":  runtimeResultWithPolicy(target, counter, 11),
+		"right": runtimeResultWithPolicy(target, counter, 99),
+	}))
+	assert.NotNil(t, compareRuntimeResults(map[string]*runtimeResult{
+		"zero": runtimeResultWithPolicy(target, counter, 0),
+		"set":  runtimeResultWithPolicy(target, counter, 99),
+	}))
+
+	timestamp := prog.OutputPolicy{
+		Kind: prog.OutputPolicyTimestamp, Domain: "filesystem", Scope: "mtime",
+	}
+	assert.Nil(t, compareRuntimeResults(map[string]*runtimeResult{
+		"old": runtimeResultWithPolicy(target, timestamp, 100, 200),
+		"new": runtimeResultWithPolicy(target, timestamp, 200, 300),
+	}))
+	valid := runtimeResultWithNamedPolicy(target, timestamp,
+		[]string{"arg[0].sec", "arg[0].nsec"}, []uint64{100, 200})
+	invalid := runtimeResultWithNamedPolicy(target, timestamp,
+		[]string{"arg[0].sec", "arg[0].nsec"}, []uint64{100, 1_000_000_000})
+	assert.NotNil(t, compareRuntimeResults(map[string]*runtimeResult{
+		"valid": valid, "invalid": invalid,
+	}))
+}
+
+func TestOutputPolicyNormalizesRelativeAddresses(t *testing.T) {
+	policy := prog.OutputPolicy{Kind: prog.OutputPolicyAddress, Domain: "user_memory"}
+	leftTarget := &prog.Target{
+		PtrSize: 8, DataOffset: 0x100000, NumPages: 1, PageSize: 4096,
+	}
+	rightTarget := &prog.Target{
+		PtrSize: 8, DataOffset: 0x200000, NumPages: 1, PageSize: 4096,
+	}
+	assert.Nil(t, compareRuntimeResults(map[string]*runtimeResult{
+		"left":  runtimeResultWithPolicy(leftTarget, policy, 0x100020),
+		"right": runtimeResultWithPolicy(rightTarget, policy, 0x200020),
+	}))
+	assert.NotNil(t, compareRuntimeResults(map[string]*runtimeResult{
+		"left":  runtimeResultWithPolicy(leftTarget, policy, 0x100020),
+		"right": runtimeResultWithPolicy(rightTarget, policy, 0x200028),
+	}))
+	unknownLeft := runtimeResultWithPolicy(leftTarget, policy, 0x5000)
+	unknownRight := runtimeResultWithPolicy(rightTarget, policy, 0x6000)
+	assert.NotNil(t, compareRuntimeResults(map[string]*runtimeResult{
+		"left": unknownLeft, "right": unknownRight,
+	}))
+	assert.Equal(t, "address is outside known program regions",
+		unknownLeft.Calls[0].Outputs[0].Values[0].NormalizationErr)
+}
+
+func TestVersionIdentityPolicyClassifiesStableDifference(t *testing.T) {
+	target := &prog.Target{PtrSize: 8}
+	policy := prog.OutputPolicy{Kind: prog.OutputPolicyVersionIdentity}
+	analysis := compareRuntimeResults(map[string]*runtimeResult{
+		"old": runtimeResultWithPolicy(target, policy, 1),
+		"new": runtimeResultWithPolicy(target, policy, 2),
+	})
+	require.NotNil(t, analysis)
+	require.Len(t, analysis.StableDifferences, 1)
+	difference := analysis.StableDifferences[0]
+	assert.Equal(t, string(prog.OutputPolicyVersionIdentity), difference.OutputPolicy)
+	assert.Equal(t, string(runtimeDiffExpectedVersion), difference.TriageLabel)
+	assert.Equal(t, "output_policy", difference.TriageLabelID)
+}
+
+func runtimeResultWithPolicy(target *prog.Target, policy prog.OutputPolicy,
+	values ...uint64) *runtimeResult {
+	paths := make([]string, len(values))
+	for index := range paths {
+		paths[index] = fmt.Sprintf("arg[0].value[%d]", index)
+	}
+	return runtimeResultWithNamedPolicy(target, policy, paths, values)
+}
+
+func runtimeResultWithNamedPolicy(target *prog.Target, policy prog.OutputPolicy,
+	paths []string, values []uint64) *runtimeResult {
+	outputs := make([]*runtimeDecodedOutput, len(values))
+	for index, value := range values {
+		outputs[index] = &runtimeDecodedOutput{
+			Path: paths[index], Type: "int64", Kind: "int", Value: uint64Ptr(value),
+			OutputPolicy: policy, PolicySource: "test", PolicyScope: policy.Scope,
+		}
+	}
+	result := &runtimeResult{
+		Status: queue.Success,
+		Calls: []runtimeCallResult{{
+			Name: "test", Flags: flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished,
+			ReturnValue: int64Ptr(0),
+			Outputs:     []*runtimeOutputCapture{{ID: 0, Values: outputs}},
+		}},
+	}
+	normalizeRuntimeOutputs(&prog.Prog{Target: target}, result)
+	return result
+}

@@ -86,6 +86,7 @@ type Field struct {
 	HasDirection bool
 	Direction    Dir
 	Condition    Expression
+	OutputPolicy OutputPolicy
 
 	// See Target.initRelatedFields.
 	relatedFields map[Type]struct{}
@@ -786,6 +787,7 @@ type StructType struct {
 	Fields       []Field
 	AlignAttr    uint64
 	OverlayField int // index of the field marked with out_overlay attribute (0 if no attribute)
+	OutputPolicy OutputPolicy
 }
 
 func (t *StructType) String() string {
@@ -812,7 +814,8 @@ func (t *StructType) isDefaultArg(arg Arg) bool {
 
 type UnionType struct {
 	TypeCommon
-	Fields []Field
+	Fields       []Field
+	OutputPolicy OutputPolicy
 }
 
 func (t *UnionType) String() string {

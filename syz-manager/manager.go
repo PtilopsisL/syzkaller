@@ -430,6 +430,9 @@ func (mgr *Manager) initRuntime(debug bool) error {
 		if err := coord.configureRuntimeDiffLabels(mgr.displayCfg.RuntimeDiffLabels); err != nil {
 			return fmt.Errorf("runtime diff labels: %w", err)
 		}
+		if err := coord.configureRuntimeOutputPolicies(mgr.displayCfg.RuntimeOutputPolicy); err != nil {
+			return fmt.Errorf("runtime output policy: %w", err)
+		}
 		mgr.programRegistry = coord
 	}
 

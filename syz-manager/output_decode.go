@@ -45,7 +45,8 @@ func summarizeCallOutputs(p *prog.Prog, callIndex int,
 			decoded.Faulted = raw.Faulted
 			decoded.Truncated = decoded.Truncated || raw.Truncated
 			if !raw.Faulted {
-				decoded.Values = decodeOutputArg(p.Target, capture.Arg, capture.Path, raw.Data)
+				decoded.Values = decodeOutputArgWithPolicy(p.Target, capture.Arg, capture.Path,
+					capture.OutputPolicy, capture.PolicyScope, raw.Data)
 			}
 		}
 		ret = append(ret, decoded)
@@ -66,9 +67,26 @@ func summarizeCallOutputs(p *prog.Prog, callIndex int,
 
 func decodeOutputArg(target *prog.Target, root prog.Arg, rootPath string,
 	data []byte) []*runtimeDecodedOutput {
+	return decodeOutputArgWithPolicy(target, root, rootPath, prog.OutputPolicy{}, "", data)
+}
+
+func decodeOutputArgWithPolicy(target *prog.Target, root prog.Arg, rootPath string,
+	rootPolicy prog.OutputPolicy, rootScope string, data []byte) []*runtimeDecodedOutput {
 	var ret []*runtimeDecodedOutput
-	var walk func(prog.Arg, string, uint64)
-	walk = func(arg prog.Arg, path string, offset uint64) {
+	var walk func(prog.Arg, string, uint64, prog.OutputPolicy, string, string, prog.OutputPolicy)
+	walk = func(arg prog.Arg, path string, offset uint64, inherited prog.OutputPolicy,
+		inheritedScope, inheritedSource string, fieldPolicy prog.OutputPolicy) {
+		policy, scope, source := inherited, inheritedScope, inheritedSource
+		if typePolicy := prog.TypeOutputPolicy(arg.Type()); !typePolicy.Empty() {
+			policy = prog.MergeOutputPolicy(policy, typePolicy)
+			scope = runtimeOutputPolicyScope(path, typePolicy.Scope)
+			source = "syzlang_type"
+		}
+		if !fieldPolicy.Empty() {
+			policy = prog.MergeOutputPolicy(policy, fieldPolicy)
+			scope = runtimeOutputPolicyScope(path, fieldPolicy.Scope)
+			source = "syzlang_field"
+		}
 		switch a := arg.(type) {
 		case *prog.GroupArg:
 			base := offset
@@ -83,19 +101,25 @@ func decodeOutputArg(target *prog.Target, root prog.Arg, rootPath string,
 					offset = base
 				}
 				childPath := path + "[" + strconv.Itoa(i) + "]"
-				if i < len(fields) && fields[i].Name != "" {
-					childPath = path + "." + fields[i].Name
+				var childPolicy prog.OutputPolicy
+				if i < len(fields) {
+					childPolicy = fields[i].OutputPolicy
+					if fields[i].Name != "" {
+						childPath = path + "." + fields[i].Name
+					}
 				}
-				walk(inner, childPath, offset)
+				walk(inner, childPath, offset, policy, scope, source, childPolicy)
 				offset += inner.Size()
 			}
 		case *prog.UnionArg:
 			childPath := path + ".option"
+			var childPolicy prog.OutputPolicy
 			if typ, ok := a.Type().(*prog.UnionType); ok &&
 				a.Index >= 0 && a.Index < len(typ.Fields) {
 				childPath = path + "." + typ.Fields[a.Index].Name
+				childPolicy = typ.Fields[a.Index].OutputPolicy
 			}
-			walk(a.Option, childPath, offset)
+			walk(a.Option, childPath, offset, policy, scope, source, childPolicy)
 		case *prog.PointerArg:
 			// The pointee has its own capture and address space.
 			return
@@ -103,11 +127,47 @@ func decodeOutputArg(target *prog.Target, root prog.Arg, rootPath string,
 			if arg.Dir() == prog.DirIn || prog.IsPad(arg.Type()) {
 				return
 			}
-			ret = append(ret, decodeOutputValue(target, arg, path, offset, data))
+			if policy.Kind == "" {
+				if _, ok := arg.Type().(*prog.ResourceType); ok {
+					policy.Kind = prog.OutputPolicyResourceIdentity
+					source = "syzlang_resource"
+				} else {
+					policy.Kind = prog.OutputPolicySemantic
+					source = "default"
+				}
+				scope = path
+			}
+			output := decodeOutputValue(target, arg, path, offset, data)
+			output.OutputPolicy = policy
+			output.PolicyScope = scope
+			output.PolicySource = source
+			if resource, ok := arg.Type().(*prog.ResourceType); ok && output.Value != nil {
+				for _, special := range resource.SpecialValues() {
+					if special == *output.Value {
+						output.IdentitySpecial = true
+						break
+					}
+				}
+			}
+			ret = append(ret, output)
 		}
 	}
-	walk(root, rootPath, 0)
+	source := ""
+	if !rootPolicy.Empty() {
+		source = "syzlang_capture"
+	}
+	walk(root, rootPath, 0, rootPolicy, rootScope, source, prog.OutputPolicy{})
 	return ret
+}
+
+func runtimeOutputPolicyScope(path, declared string) string {
+	if declared == "" {
+		return path
+	}
+	if index := strings.LastIndexByte(path, '.'); index != -1 {
+		return path[:index] + "#" + declared
+	}
+	return path + "#" + declared
 }
 
 func decodeOutputValue(target *prog.Target, arg prog.Arg, path string,
@@ -262,6 +322,16 @@ func cloneRuntimeOutputCaptures(captures []*runtimeOutputCapture) []*runtimeOutp
 			if value.DataSummary != nil {
 				summary := *value.DataSummary
 				clonedValue.DataSummary = &summary
+			}
+			if value.CanonicalValue != nil {
+				canonical := *value.CanonicalValue
+				if value.CanonicalValue.Offset != nil {
+					canonical.Offset = uint64Ptr(*value.CanonicalValue.Offset)
+				}
+				if value.CanonicalValue.Exact != nil {
+					canonical.Exact = uint64Ptr(*value.CanonicalValue.Exact)
+				}
+				clonedValue.CanonicalValue = &canonical
 			}
 			cloned.Values[j] = &clonedValue
 		}

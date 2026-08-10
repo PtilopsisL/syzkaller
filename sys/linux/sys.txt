@@ -741,26 +741,26 @@ type iovec_in iovec[in, array[int8]]
 type iovec_out iovec[out, array[int8]]
 
 stat {
-	st_dev		intptr
-	st_ino		intptr
+	st_dev		intptr	(output_policy["filesystem_identity"], output_domain["mount"])
+	st_ino		intptr	(output_policy["object_identity"], output_domain["inode"])
 	st_mode		int32
 	st_nlink	int32
 	st_uid		uid
 	st_gid		gid
-	st_rdev		intptr
-	__pad1		const[0, intptr]
+	st_rdev		intptr	(output_policy["filesystem_identity"], output_domain["device"])
+	__pad1		const[0, intptr]	(output_policy["reserved"])
 	st_size		intptr
 	st_blksize	int32
-	__pad2		const[0, int32]
+	__pad2		const[0, int32]	(output_policy["reserved"])
 	st_blocks	intptr
-	st_atime	intptr
-	st_atime_nsec	intptr
-	st_mtime	intptr
-	st_mtime_nsec	intptr
-	st_ctime	intptr
-	st_ctime_nsec	intptr
-	__unused4	const[0, int32]
-	__unused5	const[0, int32]
+	st_atime	intptr	(output_policy["timestamp"], output_domain["filesystem"], output_scope["atime"])
+	st_atime_nsec	intptr	(output_policy["timestamp"], output_domain["filesystem"], output_scope["atime"])
+	st_mtime	intptr	(output_policy["timestamp"], output_domain["filesystem"], output_scope["mtime"])
+	st_mtime_nsec	intptr	(output_policy["timestamp"], output_domain["filesystem"], output_scope["mtime"])
+	st_ctime	intptr	(output_policy["timestamp"], output_domain["filesystem"], output_scope["ctime"])
+	st_ctime_nsec	intptr	(output_policy["timestamp"], output_domain["filesystem"], output_scope["ctime"])
+	__unused4	const[0, int32]	(output_policy["reserved"])
+	__unused5	const[0, int32]	(output_policy["reserved"])
 }
 
 statx {
@@ -771,11 +771,11 @@ statx {
 	uid		uid
 	gid		gid
 	mode		int16
-	__spare0	int16
-	ino		int64
+	__spare0	int16	(output_policy["reserved"])
+	ino		int64	(output_policy["object_identity"], output_domain["inode"])
 	size		int64
 	blocks		int64
-	__spare1	int64
+	__spare1	int64	(output_policy["reserved"])
 	atime		statx_timestamp
 	btime		statx_timestamp
 	ctime		statx_timestamp
@@ -784,7 +784,7 @@ statx {
 	rdev_minor	int32
 	dev_major	int32
 	dev_minor	int32
-	__spare2	array[int64, 14]
+	__spare2	array[int64, 14]	(output_policy["reserved"])
 }
 
 define STAT64_SIZE	sizeof(struct stat64)
@@ -814,19 +814,19 @@ resource time_usec[intptr]
 timespec {
 	sec	time_sec
 	nsec	time_nsec
-}
+} [output_policy["timestamp"]]
 
 # prog knowns about this struct type
 timeval {
 	sec	time_sec
 	usec	time_usec
-}
+} [output_policy["timestamp"]]
 
 statx_timestamp {
 	sec		int64
 	nsec		int32
-	__reserved	int32
-}
+	__reserved	int32	(output_policy["reserved"])
+} [output_policy["timestamp"], output_domain["filesystem"]]
 
 itimerspec {
 	interv	timespec

@@ -29,6 +29,7 @@ func TestLoadDataMultiRuntime(t *testing.T) {
 		"dashboard_addr": "https://dashboard.example",
 		"dashboard_key": "secret",
 		"runtime_diff_labels": "labels.json",
+		"runtime_output_policy": "output-policy.json",
 		"vm": {
 			"count": 2,
 			"cpu": 1,
@@ -67,6 +68,8 @@ func TestLoadDataMultiRuntime(t *testing.T) {
 	assert.Equal(t, "6.2.0", primary.KernelVersion)
 	assert.Equal(t, "labels.json", cfg.RuntimeDiffLabels)
 	assert.Equal(t, "labels.json", primary.RuntimeDiffLabels)
+	assert.Equal(t, "output-policy.json", cfg.RuntimeOutputPolicy)
+	assert.Equal(t, "output-policy.json", primary.RuntimeOutputPolicy)
 
 	assert.Equal(t, "multi-manager/v6.1", shadow.Name)
 	assert.Equal(t, filepath.Join(cfg.Workdir, "runtimes", "v6.1"), shadow.Workdir)

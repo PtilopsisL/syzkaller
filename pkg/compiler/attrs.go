@@ -32,21 +32,29 @@ type attrDesc struct {
 }
 
 var (
-	attrPacked     = &attrDesc{Name: "packed"}
-	attrVarlen     = &attrDesc{Name: "varlen"}
-	attrSize       = &attrDesc{Name: "size", Type: intAttr}
-	attrAlign      = &attrDesc{Name: "align", Type: intAttr}
-	attrIn         = &attrDesc{Name: "in"}
-	attrOut        = &attrDesc{Name: "out"}
-	attrInOut      = &attrDesc{Name: "inout"}
-	attrOutOverlay = &attrDesc{Name: "out_overlay"}
-	attrIf         = &attrDesc{Name: "if", Type: exprAttr}
+	attrPacked       = &attrDesc{Name: "packed"}
+	attrVarlen       = &attrDesc{Name: "varlen"}
+	attrSize         = &attrDesc{Name: "size", Type: intAttr}
+	attrAlign        = &attrDesc{Name: "align", Type: intAttr}
+	attrIn           = &attrDesc{Name: "in"}
+	attrOut          = &attrDesc{Name: "out"}
+	attrInOut        = &attrDesc{Name: "inout"}
+	attrOutOverlay   = &attrDesc{Name: "out_overlay"}
+	attrIf           = &attrDesc{Name: "if", Type: exprAttr}
+	attrOutputPolicy = &attrDesc{Name: "output_policy", Type: stringAttr}
+	attrOutputDomain = &attrDesc{Name: "output_domain", Type: stringAttr}
+	attrOutputMode   = &attrDesc{Name: "output_mode", Type: stringAttr}
+	attrOutputScope  = &attrDesc{Name: "output_scope", Type: stringAttr}
 
-	structAttrs      = makeAttrs(attrPacked, attrSize, attrAlign)
-	unionAttrs       = makeAttrs(attrVarlen, attrSize)
-	structFieldAttrs = makeAttrs(attrIn, attrOut, attrInOut, attrOutOverlay, attrIf)
-	unionFieldAttrs  = makeAttrs(attrIn, attrIf) // attrIn is safe.
-	callAttrs        = make(map[string]*attrDesc)
+	structAttrs = makeAttrs(attrPacked, attrSize, attrAlign,
+		attrOutputPolicy, attrOutputDomain, attrOutputMode, attrOutputScope)
+	unionAttrs = makeAttrs(attrVarlen, attrSize,
+		attrOutputPolicy, attrOutputDomain, attrOutputMode, attrOutputScope)
+	structFieldAttrs = makeAttrs(attrIn, attrOut, attrInOut, attrOutOverlay, attrIf,
+		attrOutputPolicy, attrOutputDomain, attrOutputMode, attrOutputScope)
+	unionFieldAttrs = makeAttrs(attrIn, attrIf,
+		attrOutputPolicy, attrOutputDomain, attrOutputMode, attrOutputScope) // attrIn is safe.
+	callAttrs = make(map[string]*attrDesc)
 )
 
 func init() {
