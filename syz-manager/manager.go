@@ -427,6 +427,9 @@ func (mgr *Manager) initRuntime(debug bool) error {
 		for name, runtimeCfg := range mgr.displayCfg.RuntimeConfigs {
 			coord.setRuntimeVersion(name, runtimeCfg.KernelVersion)
 		}
+		if err := coord.configureRuntimeDiffLabels(mgr.displayCfg.RuntimeDiffLabels); err != nil {
+			return fmt.Errorf("runtime diff labels: %w", err)
+		}
 		mgr.programRegistry = coord
 	}
 

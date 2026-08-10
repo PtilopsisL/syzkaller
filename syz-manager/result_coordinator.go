@@ -128,28 +128,28 @@ const (
 )
 
 type runtimeFieldDifference struct {
-	Kind      string         `json:"kind"`
-	Path      string         `json:"path"`
-	Values    map[string]any `json:"values"`
-	CallIndex *int           `json:"call_index,omitempty"`
-	CallName  string         `json:"call_name,omitempty"`
-}
-
-type runtimeExpectedDifference struct {
-	Rule       string                 `json:"rule"`
-	Difference runtimeFieldDifference `json:"difference"`
+	Kind          string         `json:"kind"`
+	Path          string         `json:"path"`
+	Values        map[string]any `json:"values"`
+	CallIndex     *int           `json:"call_index,omitempty"`
+	CallName      string         `json:"call_name,omitempty"`
+	Signature     string         `json:"signature,omitempty"`
+	Fingerprint   string         `json:"fingerprint,omitempty"`
+	TriageLabel   string         `json:"triage_label,omitempty"`
+	TriageLabelID string         `json:"triage_label_id,omitempty"`
+	TriageNote    string         `json:"triage_note,omitempty"`
 }
 
 type runtimeMismatch struct {
-	Outcome                    comparisonOutcome                   `json:"outcome"`
-	Reason                     string                              `json:"reason"`
-	Runtimes                   []string                            `json:"runtimes"`
-	Compared                   map[string]*comparisonRuntimeResult `json:"compared"`
-	StableDifferences          []runtimeFieldDifference            `json:"stable_differences"`
-	ExpectedVersionDifferences []runtimeExpectedDifference         `json:"expected_version_differences,omitempty"`
-	UnstableFields             map[string][]string                 `json:"unstable_fields,omitempty"`
-	InvalidSamples             map[string][]string                 `json:"invalid_samples,omitempty"`
-	PartialSamples             map[string][]string                 `json:"partial_samples,omitempty"`
+	Outcome           comparisonOutcome                   `json:"outcome"`
+	Reason            string                              `json:"reason"`
+	Runtimes          []string                            `json:"runtimes"`
+	Compared          map[string]*comparisonRuntimeResult `json:"compared"`
+	StableDifferences []runtimeFieldDifference            `json:"stable_differences"`
+	Triage            runtimeDiffTriage                   `json:"triage,omitempty"`
+	UnstableFields    map[string][]string                 `json:"unstable_fields,omitempty"`
+	InvalidSamples    map[string][]string                 `json:"invalid_samples,omitempty"`
+	PartialSamples    map[string][]string                 `json:"partial_samples,omitempty"`
 }
 
 func summarizeRuntimeResult(runtimeName string, req *queue.Request, res *queue.Result) *runtimeResult {
@@ -193,7 +193,7 @@ func summarizeRuntimeResult(runtimeName string, req *queue.Request, res *queue.R
 func (coord *multiRuntimeCoordinator) handleCompletedRun(run *programRun) {
 	switch run.Stage {
 	case runStageFuzz:
-		mismatch := compareRuntimeResults(run.Results)
+		mismatch := compareRuntimeResults(run.Results, coord.diffLabels)
 		if mismatch == nil {
 			return
 		}
@@ -204,7 +204,7 @@ func (coord *multiRuntimeCoordinator) handleCompletedRun(run *programRun) {
 		}
 		coord.enqueueMismatchRepro(run)
 	case runStageRepro:
-		mismatch := compareRuntimeSamples(run.Samples)
+		mismatch := compareRuntimeSamples(run.Samples, coord.diffLabels)
 		if mismatch == nil {
 			return
 		}
@@ -230,7 +230,7 @@ func (coord *multiRuntimeCoordinator) handleCompletedRun(run *programRun) {
 	}
 }
 
-func compareRuntimeResults(results map[string]*runtimeResult) *runtimeMismatch {
+func compareRuntimeResults(results map[string]*runtimeResult, labels ...*runtimeDiffLabelStore) *runtimeMismatch {
 	if len(results) < 2 {
 		return nil
 	}
@@ -245,7 +245,7 @@ func compareRuntimeResults(results map[string]*runtimeResult) *runtimeMismatch {
 	for name, result := range results {
 		samples[name] = []*runtimeResult{result}
 	}
-	return compareRuntimeSamples(samples)
+	return compareRuntimeSamples(samples, labels...)
 }
 
 func comparisonRuntimeResultFor(result *runtimeResult) *comparisonRuntimeResult {
@@ -405,32 +405,36 @@ type observedComparisonValue struct {
 }
 
 type runtimeSampleComparison struct {
-	names           []string
-	views           map[string][]*comparisonRuntimeResult
-	rawSamples      map[string][]*runtimeResult
-	result          *runtimeMismatch
-	partial         bool
-	commonPrefix    int
-	versionFiltered bool
+	names        []string
+	views        map[string][]*comparisonRuntimeResult
+	rawSamples   map[string][]*runtimeResult
+	labels       *runtimeDiffLabelStore
+	result       *runtimeMismatch
+	partial      bool
+	commonPrefix int
 }
 
-func compareRuntimeSamples(samples map[string][]*runtimeResult) *runtimeMismatch {
+func compareRuntimeSamples(samples map[string][]*runtimeResult, labels ...*runtimeDiffLabelStore) *runtimeMismatch {
 	if len(samples) < 2 {
 		return nil
 	}
 	names := sortedRuntimeSampleNames(samples)
+	var diffLabels *runtimeDiffLabelStore
+	if len(labels) != 0 {
+		diffLabels = labels[0]
+	}
 	comparison := &runtimeSampleComparison{
 		names:      names,
 		rawSamples: samples,
+		labels:     diffLabels,
 		views:      make(map[string][]*comparisonRuntimeResult, len(samples)),
 		result: &runtimeMismatch{
-			Runtimes:                   names,
-			Compared:                   make(map[string]*comparisonRuntimeResult, len(samples)),
-			StableDifferences:          []runtimeFieldDifference{},
-			ExpectedVersionDifferences: []runtimeExpectedDifference{},
-			UnstableFields:             make(map[string][]string),
-			InvalidSamples:             make(map[string][]string),
-			PartialSamples:             make(map[string][]string),
+			Runtimes:          names,
+			Compared:          make(map[string]*comparisonRuntimeResult, len(samples)),
+			StableDifferences: []runtimeFieldDifference{},
+			UnstableFields:    make(map[string][]string),
+			InvalidSamples:    make(map[string][]string),
+			PartialSamples:    make(map[string][]string),
 		},
 	}
 	validSamples := make(map[string][]*runtimeResult, len(samples))
@@ -733,13 +737,8 @@ func (comparison *runtimeSampleComparison) maxCallCount() int {
 }
 
 func (comparison *runtimeSampleComparison) finish() *runtimeMismatch {
-	if !comparison.versionFiltered {
-		unexpected, expected := filterExpectedVersionDifferences(
-			comparison.result.StableDifferences, comparison.rawSamples, defaultVersionCompatibilityRules)
-		comparison.result.StableDifferences = unexpected
-		comparison.result.ExpectedVersionDifferences = expected
-		comparison.versionFiltered = true
-	}
+	annotateRuntimeDifferences(comparison.result.StableDifferences, comparison.rawSamples, comparison.labels)
+	comparison.result.Triage = summarizeRuntimeDiffTriage(comparison.result.StableDifferences)
 	for name, fields := range comparison.result.UnstableFields {
 		sort.Strings(fields)
 		comparison.result.UnstableFields[name] = fields
@@ -1142,7 +1141,8 @@ func newMismatchStore(workdir string) *mismatchStore {
 	}
 }
 
-const storedMismatchReportFormatVersion = 2
+// Version 3 adds triage hashes/labels and removes the hardcoded expected-version bucket.
+const storedMismatchReportFormatVersion = 3
 
 type storedProgramCall struct {
 	Index int               `json:"index"`
@@ -1151,22 +1151,22 @@ type storedProgramCall struct {
 }
 
 type storedMismatchReport struct {
-	FormatVersion              int                                 `json:"format_version"`
-	ParentProgID               int64                               `json:"parent_prog_id"`
-	ReproProgID                int64                               `json:"repro_prog_id"`
-	Outcome                    comparisonOutcome                   `json:"outcome"`
-	Reason                     string                              `json:"reason"`
-	Runtimes                   []string                            `json:"runtimes"`
-	ProgramCalls               []storedProgramCall                 `json:"program_calls,omitempty"`
-	TraceFiles                 []string                            `json:"trace_files,omitempty"`
-	InitialResults             map[string]*runtimeResult           `json:"initial_results"`
-	ReproSamples               map[string][]*runtimeResult         `json:"repro_samples"`
-	Compared                   map[string]*comparisonRuntimeResult `json:"compared"`
-	StableDifferences          []runtimeFieldDifference            `json:"stable_differences"`
-	ExpectedVersionDifferences []runtimeExpectedDifference         `json:"expected_version_differences,omitempty"`
-	UnstableFields             map[string][]string                 `json:"unstable_fields,omitempty"`
-	InvalidSamples             map[string][]string                 `json:"invalid_samples,omitempty"`
-	PartialSamples             map[string][]string                 `json:"partial_samples,omitempty"`
+	FormatVersion     int                                 `json:"format_version"`
+	ParentProgID      int64                               `json:"parent_prog_id"`
+	ReproProgID       int64                               `json:"repro_prog_id"`
+	Outcome           comparisonOutcome                   `json:"outcome"`
+	Reason            string                              `json:"reason"`
+	Runtimes          []string                            `json:"runtimes"`
+	ProgramCalls      []storedProgramCall                 `json:"program_calls,omitempty"`
+	TraceFiles        []string                            `json:"trace_files,omitempty"`
+	InitialResults    map[string]*runtimeResult           `json:"initial_results"`
+	ReproSamples      map[string][]*runtimeResult         `json:"repro_samples"`
+	Compared          map[string]*comparisonRuntimeResult `json:"compared"`
+	StableDifferences []runtimeFieldDifference            `json:"stable_differences"`
+	Triage            runtimeDiffTriage                   `json:"triage,omitempty"`
+	UnstableFields    map[string][]string                 `json:"unstable_fields,omitempty"`
+	InvalidSamples    map[string][]string                 `json:"invalid_samples,omitempty"`
+	PartialSamples    map[string][]string                 `json:"partial_samples,omitempty"`
 }
 
 func storedProgramCallsFor(p *prog.Prog) []storedProgramCall {
@@ -1262,22 +1262,22 @@ func (store *mismatchStore) Save(run *programRun, mismatch *runtimeMismatch) (st
 	}
 	sort.Strings(traceFiles)
 	report := &storedMismatchReport{
-		FormatVersion:              storedMismatchReportFormatVersion,
-		ParentProgID:               run.ParentID,
-		ReproProgID:                run.ID,
-		Outcome:                    mismatch.Outcome,
-		Reason:                     mismatch.Reason,
-		Runtimes:                   mismatch.Runtimes,
-		ProgramCalls:               storedProgramCallsFor(run.Prog),
-		TraceFiles:                 traceFiles,
-		InitialResults:             compactRuntimeResultsForReport(run.InitialResults),
-		ReproSamples:               compactRuntimeSamplesForReport(run.Samples),
-		Compared:                   mismatch.Compared,
-		StableDifferences:          mismatch.StableDifferences,
-		ExpectedVersionDifferences: mismatch.ExpectedVersionDifferences,
-		UnstableFields:             mismatch.UnstableFields,
-		InvalidSamples:             mismatch.InvalidSamples,
-		PartialSamples:             mismatch.PartialSamples,
+		FormatVersion:     storedMismatchReportFormatVersion,
+		ParentProgID:      run.ParentID,
+		ReproProgID:       run.ID,
+		Outcome:           mismatch.Outcome,
+		Reason:            mismatch.Reason,
+		Runtimes:          mismatch.Runtimes,
+		ProgramCalls:      storedProgramCallsFor(run.Prog),
+		TraceFiles:        traceFiles,
+		InitialResults:    compactRuntimeResultsForReport(run.InitialResults),
+		ReproSamples:      compactRuntimeSamplesForReport(run.Samples),
+		Compared:          mismatch.Compared,
+		StableDifferences: mismatch.StableDifferences,
+		Triage:            mismatch.Triage,
+		UnstableFields:    mismatch.UnstableFields,
+		InvalidSamples:    mismatch.InvalidSamples,
+		PartialSamples:    mismatch.PartialSamples,
 	}
 	data, err := json.Marshal(report)
 	if err != nil {

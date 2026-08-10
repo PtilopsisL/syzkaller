@@ -28,6 +28,7 @@ func TestLoadDataMultiRuntime(t *testing.T) {
 		"dashboard_client": "dash",
 		"dashboard_addr": "https://dashboard.example",
 		"dashboard_key": "secret",
+		"runtime_diff_labels": "labels.json",
 		"vm": {
 			"count": 2,
 			"cpu": 1,
@@ -64,6 +65,8 @@ func TestLoadDataMultiRuntime(t *testing.T) {
 	assert.True(t, primary.CoverageLayout)
 	assert.Equal(t, "dash", primary.DashboardClient)
 	assert.Equal(t, "6.2.0", primary.KernelVersion)
+	assert.Equal(t, "labels.json", cfg.RuntimeDiffLabels)
+	assert.Equal(t, "labels.json", primary.RuntimeDiffLabels)
 
 	assert.Equal(t, "multi-manager/v6.1", shadow.Name)
 	assert.Equal(t, filepath.Join(cfg.Workdir, "runtimes", "v6.1"), shadow.Workdir)

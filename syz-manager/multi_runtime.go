@@ -126,6 +126,7 @@ type multiRuntimeCoordinator struct {
 	statuses        map[string]map[int64]queue.Status
 	runs            map[int64]*programRun
 	store           *mismatchStore
+	diffLabels      *runtimeDiffLabelStore
 }
 
 type shadowConsumer struct {
