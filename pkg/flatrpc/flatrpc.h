@@ -81,6 +81,10 @@ struct CallInfoRaw;
 struct CallInfoRawBuilder;
 struct CallInfoRawT;
 
+struct OutputCaptureRaw;
+struct OutputCaptureRawBuilder;
+struct OutputCaptureRawT;
+
 struct ComparisonRaw;
 
 struct ProgInfoRaw;
@@ -580,12 +584,13 @@ enum class ExecEnv : uint64_t {
   EnableWifi = 65536ULL,
   DelayKcovMmap = 131072ULL,
   EnableNicVF = 262144ULL,
+  SyscallTrace = 524288ULL,
   NONE = 0,
-  ANY = 524287ULL
+  ANY = 1048575ULL
 };
 FLATBUFFERS_DEFINE_BITMASK_OPERATORS(ExecEnv, uint64_t)
 
-inline const ExecEnv (&EnumValuesExecEnv())[19] {
+inline const ExecEnv (&EnumValuesExecEnv())[20] {
   static const ExecEnv values[] = {
     ExecEnv::Debug,
     ExecEnv::Signal,
@@ -605,7 +610,8 @@ inline const ExecEnv (&EnumValuesExecEnv())[19] {
     ExecEnv::EnableVhciInjection,
     ExecEnv::EnableWifi,
     ExecEnv::DelayKcovMmap,
-    ExecEnv::EnableNicVF
+    ExecEnv::EnableNicVF,
+    ExecEnv::SyscallTrace
   };
   return values;
 }
@@ -631,6 +637,7 @@ inline const char *EnumNameExecEnv(ExecEnv e) {
     case ExecEnv::EnableWifi: return "EnableWifi";
     case ExecEnv::DelayKcovMmap: return "DelayKcovMmap";
     case ExecEnv::EnableNicVF: return "EnableNicVF";
+    case ExecEnv::SyscallTrace: return "SyscallTrace";
     default: return "";
   }
 }
@@ -641,49 +648,34 @@ enum class ExecFlag : uint64_t {
   DedupCover = 4ULL,
   CollectComps = 8ULL,
   Threaded = 16ULL,
+  CollectOutputs = 32ULL,
   NONE = 0,
-  ANY = 31ULL
+  ANY = 63ULL
 };
 FLATBUFFERS_DEFINE_BITMASK_OPERATORS(ExecFlag, uint64_t)
 
-inline const ExecFlag (&EnumValuesExecFlag())[5] {
+inline const ExecFlag (&EnumValuesExecFlag())[6] {
   static const ExecFlag values[] = {
     ExecFlag::CollectSignal,
     ExecFlag::CollectCover,
     ExecFlag::DedupCover,
     ExecFlag::CollectComps,
-    ExecFlag::Threaded
+    ExecFlag::Threaded,
+    ExecFlag::CollectOutputs
   };
   return values;
 }
 
-inline const char * const *EnumNamesExecFlag() {
-  static const char * const names[17] = {
-    "CollectSignal",
-    "CollectCover",
-    "",
-    "DedupCover",
-    "",
-    "",
-    "",
-    "CollectComps",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "Threaded",
-    nullptr
-  };
-  return names;
-}
-
 inline const char *EnumNameExecFlag(ExecFlag e) {
-  if (::flatbuffers::IsOutRange(e, ExecFlag::CollectSignal, ExecFlag::Threaded)) return "";
-  const size_t index = static_cast<size_t>(e) - static_cast<size_t>(ExecFlag::CollectSignal);
-  return EnumNamesExecFlag()[index];
+  switch (e) {
+    case ExecFlag::CollectSignal: return "CollectSignal";
+    case ExecFlag::CollectCover: return "CollectCover";
+    case ExecFlag::DedupCover: return "DedupCover";
+    case ExecFlag::CollectComps: return "CollectComps";
+    case ExecFlag::Threaded: return "Threaded";
+    case ExecFlag::CollectOutputs: return "CollectOutputs";
+    default: return "";
+  }
 }
 
 enum class CallFlag : uint8_t {
@@ -2227,6 +2219,14 @@ struct CallInfoRawT : public ::flatbuffers::NativeTable {
   std::vector<uint64_t> signal{};
   std::vector<uint64_t> cover{};
   std::vector<rpc::ComparisonRaw> comps{};
+  std::vector<uint8_t> sctrace{};
+  int64_t return_value = 0;
+  bool return_value_valid = false;
+  std::vector<std::unique_ptr<rpc::OutputCaptureRawT>> outputs{};
+  CallInfoRawT() = default;
+  CallInfoRawT(const CallInfoRawT &o);
+  CallInfoRawT(CallInfoRawT&&) FLATBUFFERS_NOEXCEPT = default;
+  CallInfoRawT &operator=(CallInfoRawT o) FLATBUFFERS_NOEXCEPT;
 };
 
 struct CallInfoRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
@@ -2237,7 +2237,11 @@ struct CallInfoRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
     VT_ERROR = 6,
     VT_SIGNAL = 8,
     VT_COVER = 10,
-    VT_COMPS = 12
+    VT_COMPS = 12,
+    VT_SCTRACE = 14,
+    VT_RETURN_VALUE = 16,
+    VT_RETURN_VALUE_VALID = 18,
+    VT_OUTPUTS = 20
   };
   rpc::CallFlag flags() const {
     return static_cast<rpc::CallFlag>(GetField<uint8_t>(VT_FLAGS, 0));
@@ -2254,6 +2258,18 @@ struct CallInfoRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   const ::flatbuffers::Vector<const rpc::ComparisonRaw *> *comps() const {
     return GetPointer<const ::flatbuffers::Vector<const rpc::ComparisonRaw *> *>(VT_COMPS);
   }
+  const ::flatbuffers::Vector<uint8_t> *sctrace() const {
+    return GetPointer<const ::flatbuffers::Vector<uint8_t> *>(VT_SCTRACE);
+  }
+  int64_t return_value() const {
+    return GetField<int64_t>(VT_RETURN_VALUE, 0);
+  }
+  bool return_value_valid() const {
+    return GetField<uint8_t>(VT_RETURN_VALUE_VALID, 0) != 0;
+  }
+  const ::flatbuffers::Vector<::flatbuffers::Offset<rpc::OutputCaptureRaw>> *outputs() const {
+    return GetPointer<const ::flatbuffers::Vector<::flatbuffers::Offset<rpc::OutputCaptureRaw>> *>(VT_OUTPUTS);
+  }
   bool Verify(::flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyField<uint8_t>(verifier, VT_FLAGS, 1) &&
@@ -2264,6 +2280,13 @@ struct CallInfoRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
            verifier.VerifyVector(cover()) &&
            VerifyOffset(verifier, VT_COMPS) &&
            verifier.VerifyVector(comps()) &&
+           VerifyOffset(verifier, VT_SCTRACE) &&
+           verifier.VerifyVector(sctrace()) &&
+           VerifyField<int64_t>(verifier, VT_RETURN_VALUE, 8) &&
+           VerifyField<uint8_t>(verifier, VT_RETURN_VALUE_VALID, 1) &&
+           VerifyOffset(verifier, VT_OUTPUTS) &&
+           verifier.VerifyVector(outputs()) &&
+           verifier.VerifyVectorOfTables(outputs()) &&
            verifier.EndTable();
   }
   CallInfoRawT *UnPack(const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
@@ -2290,6 +2313,18 @@ struct CallInfoRawBuilder {
   void add_comps(::flatbuffers::Offset<::flatbuffers::Vector<const rpc::ComparisonRaw *>> comps) {
     fbb_.AddOffset(CallInfoRaw::VT_COMPS, comps);
   }
+  void add_sctrace(::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> sctrace) {
+    fbb_.AddOffset(CallInfoRaw::VT_SCTRACE, sctrace);
+  }
+  void add_return_value(int64_t return_value) {
+    fbb_.AddElement<int64_t>(CallInfoRaw::VT_RETURN_VALUE, return_value, 0);
+  }
+  void add_return_value_valid(bool return_value_valid) {
+    fbb_.AddElement<uint8_t>(CallInfoRaw::VT_RETURN_VALUE_VALID, static_cast<uint8_t>(return_value_valid), 0);
+  }
+  void add_outputs(::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<rpc::OutputCaptureRaw>>> outputs) {
+    fbb_.AddOffset(CallInfoRaw::VT_OUTPUTS, outputs);
+  }
   explicit CallInfoRawBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -2307,12 +2342,20 @@ inline ::flatbuffers::Offset<CallInfoRaw> CreateCallInfoRaw(
     int32_t error = 0,
     ::flatbuffers::Offset<::flatbuffers::Vector<uint64_t>> signal = 0,
     ::flatbuffers::Offset<::flatbuffers::Vector<uint64_t>> cover = 0,
-    ::flatbuffers::Offset<::flatbuffers::Vector<const rpc::ComparisonRaw *>> comps = 0) {
+    ::flatbuffers::Offset<::flatbuffers::Vector<const rpc::ComparisonRaw *>> comps = 0,
+    ::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> sctrace = 0,
+    int64_t return_value = 0,
+    bool return_value_valid = false,
+    ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<rpc::OutputCaptureRaw>>> outputs = 0) {
   CallInfoRawBuilder builder_(_fbb);
+  builder_.add_return_value(return_value);
+  builder_.add_outputs(outputs);
+  builder_.add_sctrace(sctrace);
   builder_.add_comps(comps);
   builder_.add_cover(cover);
   builder_.add_signal(signal);
   builder_.add_error(error);
+  builder_.add_return_value_valid(return_value_valid);
   builder_.add_flags(flags);
   return builder_.Finish();
 }
@@ -2323,20 +2366,131 @@ inline ::flatbuffers::Offset<CallInfoRaw> CreateCallInfoRawDirect(
     int32_t error = 0,
     const std::vector<uint64_t> *signal = nullptr,
     const std::vector<uint64_t> *cover = nullptr,
-    const std::vector<rpc::ComparisonRaw> *comps = nullptr) {
+    const std::vector<rpc::ComparisonRaw> *comps = nullptr,
+    const std::vector<uint8_t> *sctrace = nullptr,
+    int64_t return_value = 0,
+    bool return_value_valid = false,
+    const std::vector<::flatbuffers::Offset<rpc::OutputCaptureRaw>> *outputs = nullptr) {
   auto signal__ = signal ? _fbb.CreateVector<uint64_t>(*signal) : 0;
   auto cover__ = cover ? _fbb.CreateVector<uint64_t>(*cover) : 0;
   auto comps__ = comps ? _fbb.CreateVectorOfStructs<rpc::ComparisonRaw>(*comps) : 0;
+  auto sctrace__ = sctrace ? _fbb.CreateVector<uint8_t>(*sctrace) : 0;
+  auto outputs__ = outputs ? _fbb.CreateVector<::flatbuffers::Offset<rpc::OutputCaptureRaw>>(*outputs) : 0;
   return rpc::CreateCallInfoRaw(
       _fbb,
       flags,
       error,
       signal__,
       cover__,
-      comps__);
+      comps__,
+      sctrace__,
+      return_value,
+      return_value_valid,
+      outputs__);
 }
 
 ::flatbuffers::Offset<CallInfoRaw> CreateCallInfoRaw(::flatbuffers::FlatBufferBuilder &_fbb, const CallInfoRawT *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
+
+struct OutputCaptureRawT : public ::flatbuffers::NativeTable {
+  typedef OutputCaptureRaw TableType;
+  uint32_t id = 0;
+  std::vector<uint8_t> data{};
+  bool faulted = false;
+  bool truncated = false;
+};
+
+struct OutputCaptureRaw FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
+  typedef OutputCaptureRawT NativeTableType;
+  typedef OutputCaptureRawBuilder Builder;
+  enum FlatBuffersVTableOffset FLATBUFFERS_VTABLE_UNDERLYING_TYPE {
+    VT_ID = 4,
+    VT_DATA = 6,
+    VT_FAULTED = 8,
+    VT_TRUNCATED = 10
+  };
+  uint32_t id() const {
+    return GetField<uint32_t>(VT_ID, 0);
+  }
+  const ::flatbuffers::Vector<uint8_t> *data() const {
+    return GetPointer<const ::flatbuffers::Vector<uint8_t> *>(VT_DATA);
+  }
+  bool faulted() const {
+    return GetField<uint8_t>(VT_FAULTED, 0) != 0;
+  }
+  bool truncated() const {
+    return GetField<uint8_t>(VT_TRUNCATED, 0) != 0;
+  }
+  bool Verify(::flatbuffers::Verifier &verifier) const {
+    return VerifyTableStart(verifier) &&
+           VerifyField<uint32_t>(verifier, VT_ID, 4) &&
+           VerifyOffset(verifier, VT_DATA) &&
+           verifier.VerifyVector(data()) &&
+           VerifyField<uint8_t>(verifier, VT_FAULTED, 1) &&
+           VerifyField<uint8_t>(verifier, VT_TRUNCATED, 1) &&
+           verifier.EndTable();
+  }
+  OutputCaptureRawT *UnPack(const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
+  void UnPackTo(OutputCaptureRawT *_o, const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
+  static ::flatbuffers::Offset<OutputCaptureRaw> Pack(::flatbuffers::FlatBufferBuilder &_fbb, const OutputCaptureRawT* _o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
+};
+
+struct OutputCaptureRawBuilder {
+  typedef OutputCaptureRaw Table;
+  ::flatbuffers::FlatBufferBuilder &fbb_;
+  ::flatbuffers::uoffset_t start_;
+  void add_id(uint32_t id) {
+    fbb_.AddElement<uint32_t>(OutputCaptureRaw::VT_ID, id, 0);
+  }
+  void add_data(::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> data) {
+    fbb_.AddOffset(OutputCaptureRaw::VT_DATA, data);
+  }
+  void add_faulted(bool faulted) {
+    fbb_.AddElement<uint8_t>(OutputCaptureRaw::VT_FAULTED, static_cast<uint8_t>(faulted), 0);
+  }
+  void add_truncated(bool truncated) {
+    fbb_.AddElement<uint8_t>(OutputCaptureRaw::VT_TRUNCATED, static_cast<uint8_t>(truncated), 0);
+  }
+  explicit OutputCaptureRawBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
+        : fbb_(_fbb) {
+    start_ = fbb_.StartTable();
+  }
+  ::flatbuffers::Offset<OutputCaptureRaw> Finish() {
+    const auto end = fbb_.EndTable(start_);
+    auto o = ::flatbuffers::Offset<OutputCaptureRaw>(end);
+    return o;
+  }
+};
+
+inline ::flatbuffers::Offset<OutputCaptureRaw> CreateOutputCaptureRaw(
+    ::flatbuffers::FlatBufferBuilder &_fbb,
+    uint32_t id = 0,
+    ::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> data = 0,
+    bool faulted = false,
+    bool truncated = false) {
+  OutputCaptureRawBuilder builder_(_fbb);
+  builder_.add_data(data);
+  builder_.add_id(id);
+  builder_.add_truncated(truncated);
+  builder_.add_faulted(faulted);
+  return builder_.Finish();
+}
+
+inline ::flatbuffers::Offset<OutputCaptureRaw> CreateOutputCaptureRawDirect(
+    ::flatbuffers::FlatBufferBuilder &_fbb,
+    uint32_t id = 0,
+    const std::vector<uint8_t> *data = nullptr,
+    bool faulted = false,
+    bool truncated = false) {
+  auto data__ = data ? _fbb.CreateVector<uint8_t>(*data) : 0;
+  return rpc::CreateOutputCaptureRaw(
+      _fbb,
+      id,
+      data__,
+      faulted,
+      truncated);
+}
+
+::flatbuffers::Offset<OutputCaptureRaw> CreateOutputCaptureRaw(::flatbuffers::FlatBufferBuilder &_fbb, const OutputCaptureRawT *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
 
 struct ProgInfoRawT : public ::flatbuffers::NativeTable {
   typedef ProgInfoRaw TableType;
@@ -3496,6 +3650,32 @@ inline ::flatbuffers::Offset<ExecutingMessageRaw> CreateExecutingMessageRaw(::fl
       _wait_duration);
 }
 
+inline CallInfoRawT::CallInfoRawT(const CallInfoRawT &o)
+      : flags(o.flags),
+        error(o.error),
+        signal(o.signal),
+        cover(o.cover),
+        comps(o.comps),
+        sctrace(o.sctrace),
+        return_value(o.return_value),
+        return_value_valid(o.return_value_valid) {
+  outputs.reserve(o.outputs.size());
+  for (const auto &outputs_ : o.outputs) { outputs.emplace_back((outputs_) ? new rpc::OutputCaptureRawT(*outputs_) : nullptr); }
+}
+
+inline CallInfoRawT &CallInfoRawT::operator=(CallInfoRawT o) FLATBUFFERS_NOEXCEPT {
+  std::swap(flags, o.flags);
+  std::swap(error, o.error);
+  std::swap(signal, o.signal);
+  std::swap(cover, o.cover);
+  std::swap(comps, o.comps);
+  std::swap(sctrace, o.sctrace);
+  std::swap(return_value, o.return_value);
+  std::swap(return_value_valid, o.return_value_valid);
+  std::swap(outputs, o.outputs);
+  return *this;
+}
+
 inline CallInfoRawT *CallInfoRaw::UnPack(const ::flatbuffers::resolver_function_t *_resolver) const {
   auto _o = std::unique_ptr<CallInfoRawT>(new CallInfoRawT());
   UnPackTo(_o.get(), _resolver);
@@ -3510,6 +3690,10 @@ inline void CallInfoRaw::UnPackTo(CallInfoRawT *_o, const ::flatbuffers::resolve
   { auto _e = signal(); if (_e) { _o->signal.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { _o->signal[_i] = _e->Get(_i); } } else { _o->signal.resize(0); } }
   { auto _e = cover(); if (_e) { _o->cover.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { _o->cover[_i] = _e->Get(_i); } } else { _o->cover.resize(0); } }
   { auto _e = comps(); if (_e) { _o->comps.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { _o->comps[_i] = *_e->Get(_i); } } else { _o->comps.resize(0); } }
+  { auto _e = sctrace(); if (_e) { _o->sctrace.resize(_e->size()); std::copy(_e->begin(), _e->end(), _o->sctrace.begin()); } }
+  { auto _e = return_value(); _o->return_value = _e; }
+  { auto _e = return_value_valid(); _o->return_value_valid = _e; }
+  { auto _e = outputs(); if (_e) { _o->outputs.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { if(_o->outputs[_i]) { _e->Get(_i)->UnPackTo(_o->outputs[_i].get(), _resolver); } else { _o->outputs[_i] = std::unique_ptr<rpc::OutputCaptureRawT>(_e->Get(_i)->UnPack(_resolver)); }; } } else { _o->outputs.resize(0); } }
 }
 
 inline ::flatbuffers::Offset<CallInfoRaw> CallInfoRaw::Pack(::flatbuffers::FlatBufferBuilder &_fbb, const CallInfoRawT* _o, const ::flatbuffers::rehasher_function_t *_rehasher) {
@@ -3525,13 +3709,56 @@ inline ::flatbuffers::Offset<CallInfoRaw> CreateCallInfoRaw(::flatbuffers::FlatB
   auto _signal = _o->signal.size() ? _fbb.CreateVector(_o->signal) : 0;
   auto _cover = _o->cover.size() ? _fbb.CreateVector(_o->cover) : 0;
   auto _comps = _o->comps.size() ? _fbb.CreateVectorOfStructs(_o->comps) : 0;
+  auto _sctrace = _o->sctrace.size() ? _fbb.CreateVector(_o->sctrace) : 0;
+  auto _return_value = _o->return_value;
+  auto _return_value_valid = _o->return_value_valid;
+  auto _outputs = _o->outputs.size() ? _fbb.CreateVector<::flatbuffers::Offset<rpc::OutputCaptureRaw>> (_o->outputs.size(), [](size_t i, _VectorArgs *__va) { return CreateOutputCaptureRaw(*__va->__fbb, __va->__o->outputs[i].get(), __va->__rehasher); }, &_va ) : 0;
   return rpc::CreateCallInfoRaw(
       _fbb,
       _flags,
       _error,
       _signal,
       _cover,
-      _comps);
+      _comps,
+      _sctrace,
+      _return_value,
+      _return_value_valid,
+      _outputs);
+}
+
+inline OutputCaptureRawT *OutputCaptureRaw::UnPack(const ::flatbuffers::resolver_function_t *_resolver) const {
+  auto _o = std::unique_ptr<OutputCaptureRawT>(new OutputCaptureRawT());
+  UnPackTo(_o.get(), _resolver);
+  return _o.release();
+}
+
+inline void OutputCaptureRaw::UnPackTo(OutputCaptureRawT *_o, const ::flatbuffers::resolver_function_t *_resolver) const {
+  (void)_o;
+  (void)_resolver;
+  { auto _e = id(); _o->id = _e; }
+  { auto _e = data(); if (_e) { _o->data.resize(_e->size()); std::copy(_e->begin(), _e->end(), _o->data.begin()); } }
+  { auto _e = faulted(); _o->faulted = _e; }
+  { auto _e = truncated(); _o->truncated = _e; }
+}
+
+inline ::flatbuffers::Offset<OutputCaptureRaw> OutputCaptureRaw::Pack(::flatbuffers::FlatBufferBuilder &_fbb, const OutputCaptureRawT* _o, const ::flatbuffers::rehasher_function_t *_rehasher) {
+  return CreateOutputCaptureRaw(_fbb, _o, _rehasher);
+}
+
+inline ::flatbuffers::Offset<OutputCaptureRaw> CreateOutputCaptureRaw(::flatbuffers::FlatBufferBuilder &_fbb, const OutputCaptureRawT *_o, const ::flatbuffers::rehasher_function_t *_rehasher) {
+  (void)_rehasher;
+  (void)_o;
+  struct _VectorArgs { ::flatbuffers::FlatBufferBuilder *__fbb; const OutputCaptureRawT* __o; const ::flatbuffers::rehasher_function_t *__rehasher; } _va = { &_fbb, _o, _rehasher}; (void)_va;
+  auto _id = _o->id;
+  auto _data = _o->data.size() ? _fbb.CreateVector(_o->data) : 0;
+  auto _faulted = _o->faulted;
+  auto _truncated = _o->truncated;
+  return rpc::CreateOutputCaptureRaw(
+      _fbb,
+      _id,
+      _data,
+      _faulted,
+      _truncated);
 }
 
 inline ProgInfoRawT::ProgInfoRawT(const ProgInfoRawT &o)

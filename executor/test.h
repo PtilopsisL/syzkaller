@@ -212,6 +212,8 @@ static int test_cover_filter()
 {
 	CoverFilter filter;
 	CoverFilter child(filter.FD());
+	if (!filter.Empty() || !child.Empty())
+		return 1;
 
 	std::vector<uint64> pcs = {
 	    100,
@@ -265,6 +267,8 @@ static int test_cover_filter()
 	int ret = 0;
 	for (auto pc : pcs)
 		filter.Insert(pc);
+	if (filter.Empty() || child.Empty())
+		ret = 1;
 	pcs.insert(pcs.end(), also_contain.begin(), also_contain.end());
 	for (auto pc : pcs) {
 		if (!filter.Contains(pc) || !child.Contains(pc)) {

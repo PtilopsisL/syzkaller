@@ -342,6 +342,7 @@ const (
 	ExecEnvEnableWifi          ExecEnv = 65536
 	ExecEnvDelayKcovMmap       ExecEnv = 131072
 	ExecEnvEnableNicVF         ExecEnv = 262144
+	ExecEnvSyscallTrace        ExecEnv = 524288
 )
 
 var EnumNamesExecEnv = map[ExecEnv]string{
@@ -364,6 +365,7 @@ var EnumNamesExecEnv = map[ExecEnv]string{
 	ExecEnvEnableWifi:          "EnableWifi",
 	ExecEnvDelayKcovMmap:       "DelayKcovMmap",
 	ExecEnvEnableNicVF:         "EnableNicVF",
+	ExecEnvSyscallTrace:        "SyscallTrace",
 }
 
 var EnumValuesExecEnv = map[string]ExecEnv{
@@ -386,6 +388,7 @@ var EnumValuesExecEnv = map[string]ExecEnv{
 	"EnableWifi":          ExecEnvEnableWifi,
 	"DelayKcovMmap":       ExecEnvDelayKcovMmap,
 	"EnableNicVF":         ExecEnvEnableNicVF,
+	"SyscallTrace":        ExecEnvSyscallTrace,
 }
 
 func (v ExecEnv) String() string {
@@ -398,27 +401,30 @@ func (v ExecEnv) String() string {
 type ExecFlag uint64
 
 const (
-	ExecFlagCollectSignal ExecFlag = 1
-	ExecFlagCollectCover  ExecFlag = 2
-	ExecFlagDedupCover    ExecFlag = 4
-	ExecFlagCollectComps  ExecFlag = 8
-	ExecFlagThreaded      ExecFlag = 16
+	ExecFlagCollectSignal  ExecFlag = 1
+	ExecFlagCollectCover   ExecFlag = 2
+	ExecFlagDedupCover     ExecFlag = 4
+	ExecFlagCollectComps   ExecFlag = 8
+	ExecFlagThreaded       ExecFlag = 16
+	ExecFlagCollectOutputs ExecFlag = 32
 )
 
 var EnumNamesExecFlag = map[ExecFlag]string{
-	ExecFlagCollectSignal: "CollectSignal",
-	ExecFlagCollectCover:  "CollectCover",
-	ExecFlagDedupCover:    "DedupCover",
-	ExecFlagCollectComps:  "CollectComps",
-	ExecFlagThreaded:      "Threaded",
+	ExecFlagCollectSignal:  "CollectSignal",
+	ExecFlagCollectCover:   "CollectCover",
+	ExecFlagDedupCover:     "DedupCover",
+	ExecFlagCollectComps:   "CollectComps",
+	ExecFlagThreaded:       "Threaded",
+	ExecFlagCollectOutputs: "CollectOutputs",
 }
 
 var EnumValuesExecFlag = map[string]ExecFlag{
-	"CollectSignal": ExecFlagCollectSignal,
-	"CollectCover":  ExecFlagCollectCover,
-	"DedupCover":    ExecFlagDedupCover,
-	"CollectComps":  ExecFlagCollectComps,
-	"Threaded":      ExecFlagThreaded,
+	"CollectSignal":  ExecFlagCollectSignal,
+	"CollectCover":   ExecFlagCollectCover,
+	"DedupCover":     ExecFlagDedupCover,
+	"CollectComps":   ExecFlagCollectComps,
+	"Threaded":       ExecFlagThreaded,
+	"CollectOutputs": ExecFlagCollectOutputs,
 }
 
 func (v ExecFlag) String() string {
@@ -2705,11 +2711,15 @@ func ExecutingMessageRawEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 }
 
 type CallInfoRawT struct {
-	Flags  CallFlag          `json:"flags"`
-	Error  int32             `json:"error"`
-	Signal []uint64          `json:"signal"`
-	Cover  []uint64          `json:"cover"`
-	Comps  []*ComparisonRawT `json:"comps"`
+	Flags            CallFlag             `json:"flags"`
+	Error            int32                `json:"error"`
+	Signal           []uint64             `json:"signal"`
+	Cover            []uint64             `json:"cover"`
+	Comps            []*ComparisonRawT    `json:"comps"`
+	Sctrace          []byte               `json:"sctrace"`
+	ReturnValue      int64                `json:"return_value"`
+	ReturnValueValid bool                 `json:"return_value_valid"`
+	Outputs          []*OutputCaptureRawT `json:"outputs"`
 }
 
 func (t *CallInfoRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
@@ -2743,12 +2753,33 @@ func (t *CallInfoRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 		}
 		compsOffset = builder.EndVector(compsLength)
 	}
+	sctraceOffset := flatbuffers.UOffsetT(0)
+	if t.Sctrace != nil {
+		sctraceOffset = builder.CreateByteString(t.Sctrace)
+	}
+	outputsOffset := flatbuffers.UOffsetT(0)
+	if t.Outputs != nil {
+		outputsLength := len(t.Outputs)
+		outputsOffsets := make([]flatbuffers.UOffsetT, outputsLength)
+		for j := 0; j < outputsLength; j++ {
+			outputsOffsets[j] = t.Outputs[j].Pack(builder)
+		}
+		CallInfoRawStartOutputsVector(builder, outputsLength)
+		for j := outputsLength - 1; j >= 0; j-- {
+			builder.PrependUOffsetT(outputsOffsets[j])
+		}
+		outputsOffset = builder.EndVector(outputsLength)
+	}
 	CallInfoRawStart(builder)
 	CallInfoRawAddFlags(builder, t.Flags)
 	CallInfoRawAddError(builder, t.Error)
 	CallInfoRawAddSignal(builder, signalOffset)
 	CallInfoRawAddCover(builder, coverOffset)
 	CallInfoRawAddComps(builder, compsOffset)
+	CallInfoRawAddSctrace(builder, sctraceOffset)
+	CallInfoRawAddReturnValue(builder, t.ReturnValue)
+	CallInfoRawAddReturnValueValid(builder, t.ReturnValueValid)
+	CallInfoRawAddOutputs(builder, outputsOffset)
 	return CallInfoRawEnd(builder)
 }
 
@@ -2771,6 +2802,16 @@ func (rcv *CallInfoRaw) UnPackTo(t *CallInfoRawT) {
 		x := ComparisonRaw{}
 		rcv.Comps(&x, j)
 		t.Comps[j] = x.UnPack()
+	}
+	t.Sctrace = rcv.SctraceBytes()
+	t.ReturnValue = rcv.ReturnValue()
+	t.ReturnValueValid = rcv.ReturnValueValid()
+	outputsLength := rcv.OutputsLength()
+	t.Outputs = make([]*OutputCaptureRawT, outputsLength)
+	for j := 0; j < outputsLength; j++ {
+		x := OutputCaptureRaw{}
+		rcv.Outputs(&x, j)
+		t.Outputs[j] = x.UnPack()
 	}
 }
 
@@ -2913,8 +2954,86 @@ func (rcv *CallInfoRaw) CompsLength() int {
 	return 0
 }
 
+func (rcv *CallInfoRaw) Sctrace(j int) byte {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(14))
+	if o != 0 {
+		a := rcv._tab.Vector(o)
+		return rcv._tab.GetByte(a + flatbuffers.UOffsetT(j*1))
+	}
+	return 0
+}
+
+func (rcv *CallInfoRaw) SctraceLength() int {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(14))
+	if o != 0 {
+		return rcv._tab.VectorLen(o)
+	}
+	return 0
+}
+
+func (rcv *CallInfoRaw) SctraceBytes() []byte {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(14))
+	if o != 0 {
+		return rcv._tab.ByteVector(o + rcv._tab.Pos)
+	}
+	return nil
+}
+
+func (rcv *CallInfoRaw) MutateSctrace(j int, n byte) bool {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(14))
+	if o != 0 {
+		a := rcv._tab.Vector(o)
+		return rcv._tab.MutateByte(a+flatbuffers.UOffsetT(j*1), n)
+	}
+	return false
+}
+
+func (rcv *CallInfoRaw) ReturnValue() int64 {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(16))
+	if o != 0 {
+		return rcv._tab.GetInt64(o + rcv._tab.Pos)
+	}
+	return 0
+}
+
+func (rcv *CallInfoRaw) MutateReturnValue(n int64) bool {
+	return rcv._tab.MutateInt64Slot(16, n)
+}
+
+func (rcv *CallInfoRaw) ReturnValueValid() bool {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(18))
+	if o != 0 {
+		return rcv._tab.GetBool(o + rcv._tab.Pos)
+	}
+	return false
+}
+
+func (rcv *CallInfoRaw) MutateReturnValueValid(n bool) bool {
+	return rcv._tab.MutateBoolSlot(18, n)
+}
+
+func (rcv *CallInfoRaw) Outputs(obj *OutputCaptureRaw, j int) bool {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(20))
+	if o != 0 {
+		x := rcv._tab.Vector(o)
+		x += flatbuffers.UOffsetT(j) * 4
+		x = rcv._tab.Indirect(x)
+		obj.Init(rcv._tab.Bytes, x)
+		return true
+	}
+	return false
+}
+
+func (rcv *CallInfoRaw) OutputsLength() int {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(20))
+	if o != 0 {
+		return rcv._tab.VectorLen(o)
+	}
+	return 0
+}
+
 func CallInfoRawStart(builder *flatbuffers.Builder) {
-	builder.StartObject(5)
+	builder.StartObject(9)
 }
 func CallInfoRawAddFlags(builder *flatbuffers.Builder, flags CallFlag) {
 	builder.PrependByteSlot(0, byte(flags), 0)
@@ -2940,7 +3059,191 @@ func CallInfoRawAddComps(builder *flatbuffers.Builder, comps flatbuffers.UOffset
 func CallInfoRawStartCompsVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
 	return builder.StartVector(32, numElems, 8)
 }
+func CallInfoRawAddSctrace(builder *flatbuffers.Builder, sctrace flatbuffers.UOffsetT) {
+	builder.PrependUOffsetTSlot(5, flatbuffers.UOffsetT(sctrace), 0)
+}
+func CallInfoRawStartSctraceVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
+	return builder.StartVector(1, numElems, 1)
+}
+func CallInfoRawAddReturnValue(builder *flatbuffers.Builder, returnValue int64) {
+	builder.PrependInt64Slot(6, returnValue, 0)
+}
+func CallInfoRawAddReturnValueValid(builder *flatbuffers.Builder, returnValueValid bool) {
+	builder.PrependBoolSlot(7, returnValueValid, false)
+}
+func CallInfoRawAddOutputs(builder *flatbuffers.Builder, outputs flatbuffers.UOffsetT) {
+	builder.PrependUOffsetTSlot(8, flatbuffers.UOffsetT(outputs), 0)
+}
+func CallInfoRawStartOutputsVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
+	return builder.StartVector(4, numElems, 4)
+}
 func CallInfoRawEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
+	return builder.EndObject()
+}
+
+type OutputCaptureRawT struct {
+	Id        uint32 `json:"id"`
+	Data      []byte `json:"data"`
+	Faulted   bool   `json:"faulted"`
+	Truncated bool   `json:"truncated"`
+}
+
+func (t *OutputCaptureRawT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
+	if t == nil {
+		return 0
+	}
+	dataOffset := flatbuffers.UOffsetT(0)
+	if t.Data != nil {
+		dataOffset = builder.CreateByteString(t.Data)
+	}
+	OutputCaptureRawStart(builder)
+	OutputCaptureRawAddId(builder, t.Id)
+	OutputCaptureRawAddData(builder, dataOffset)
+	OutputCaptureRawAddFaulted(builder, t.Faulted)
+	OutputCaptureRawAddTruncated(builder, t.Truncated)
+	return OutputCaptureRawEnd(builder)
+}
+
+func (rcv *OutputCaptureRaw) UnPackTo(t *OutputCaptureRawT) {
+	t.Id = rcv.Id()
+	t.Data = rcv.DataBytes()
+	t.Faulted = rcv.Faulted()
+	t.Truncated = rcv.Truncated()
+}
+
+func (rcv *OutputCaptureRaw) UnPack() *OutputCaptureRawT {
+	if rcv == nil {
+		return nil
+	}
+	t := &OutputCaptureRawT{}
+	rcv.UnPackTo(t)
+	return t
+}
+
+type OutputCaptureRaw struct {
+	_tab flatbuffers.Table
+}
+
+func GetRootAsOutputCaptureRaw(buf []byte, offset flatbuffers.UOffsetT) *OutputCaptureRaw {
+	n := flatbuffers.GetUOffsetT(buf[offset:])
+	x := &OutputCaptureRaw{}
+	x.Init(buf, n+offset)
+	return x
+}
+
+func FinishOutputCaptureRawBuffer(builder *flatbuffers.Builder, offset flatbuffers.UOffsetT) {
+	builder.Finish(offset)
+}
+
+func GetSizePrefixedRootAsOutputCaptureRaw(buf []byte, offset flatbuffers.UOffsetT) *OutputCaptureRaw {
+	n := flatbuffers.GetUOffsetT(buf[offset+flatbuffers.SizeUint32:])
+	x := &OutputCaptureRaw{}
+	x.Init(buf, n+offset+flatbuffers.SizeUint32)
+	return x
+}
+
+func FinishSizePrefixedOutputCaptureRawBuffer(builder *flatbuffers.Builder, offset flatbuffers.UOffsetT) {
+	builder.FinishSizePrefixed(offset)
+}
+
+func (rcv *OutputCaptureRaw) Init(buf []byte, i flatbuffers.UOffsetT) {
+	rcv._tab.Bytes = buf
+	rcv._tab.Pos = i
+}
+
+func (rcv *OutputCaptureRaw) Table() flatbuffers.Table {
+	return rcv._tab
+}
+
+func (rcv *OutputCaptureRaw) Id() uint32 {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(4))
+	if o != 0 {
+		return rcv._tab.GetUint32(o + rcv._tab.Pos)
+	}
+	return 0
+}
+
+func (rcv *OutputCaptureRaw) MutateId(n uint32) bool {
+	return rcv._tab.MutateUint32Slot(4, n)
+}
+
+func (rcv *OutputCaptureRaw) Data(j int) byte {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(6))
+	if o != 0 {
+		a := rcv._tab.Vector(o)
+		return rcv._tab.GetByte(a + flatbuffers.UOffsetT(j*1))
+	}
+	return 0
+}
+
+func (rcv *OutputCaptureRaw) DataLength() int {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(6))
+	if o != 0 {
+		return rcv._tab.VectorLen(o)
+	}
+	return 0
+}
+
+func (rcv *OutputCaptureRaw) DataBytes() []byte {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(6))
+	if o != 0 {
+		return rcv._tab.ByteVector(o + rcv._tab.Pos)
+	}
+	return nil
+}
+
+func (rcv *OutputCaptureRaw) MutateData(j int, n byte) bool {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(6))
+	if o != 0 {
+		a := rcv._tab.Vector(o)
+		return rcv._tab.MutateByte(a+flatbuffers.UOffsetT(j*1), n)
+	}
+	return false
+}
+
+func (rcv *OutputCaptureRaw) Faulted() bool {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(8))
+	if o != 0 {
+		return rcv._tab.GetBool(o + rcv._tab.Pos)
+	}
+	return false
+}
+
+func (rcv *OutputCaptureRaw) MutateFaulted(n bool) bool {
+	return rcv._tab.MutateBoolSlot(8, n)
+}
+
+func (rcv *OutputCaptureRaw) Truncated() bool {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(10))
+	if o != 0 {
+		return rcv._tab.GetBool(o + rcv._tab.Pos)
+	}
+	return false
+}
+
+func (rcv *OutputCaptureRaw) MutateTruncated(n bool) bool {
+	return rcv._tab.MutateBoolSlot(10, n)
+}
+
+func OutputCaptureRawStart(builder *flatbuffers.Builder) {
+	builder.StartObject(4)
+}
+func OutputCaptureRawAddId(builder *flatbuffers.Builder, id uint32) {
+	builder.PrependUint32Slot(0, id, 0)
+}
+func OutputCaptureRawAddData(builder *flatbuffers.Builder, data flatbuffers.UOffsetT) {
+	builder.PrependUOffsetTSlot(1, flatbuffers.UOffsetT(data), 0)
+}
+func OutputCaptureRawStartDataVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
+	return builder.StartVector(1, numElems, 1)
+}
+func OutputCaptureRawAddFaulted(builder *flatbuffers.Builder, faulted bool) {
+	builder.PrependBoolSlot(2, faulted, false)
+}
+func OutputCaptureRawAddTruncated(builder *flatbuffers.Builder, truncated bool) {
+	builder.PrependBoolSlot(3, truncated, false)
+}
+func OutputCaptureRawEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	return builder.EndObject()
 }
 

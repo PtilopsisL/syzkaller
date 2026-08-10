@@ -1,0 +1,3 @@
+[submodule "executor/libsclog"]
+	path = executor/libsclog
+	url = git@github.com:PtilopsisL/libsclog.git

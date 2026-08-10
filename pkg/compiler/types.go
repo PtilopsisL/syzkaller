@@ -989,14 +989,18 @@ func init() {
 		s := comp.structs[t.Ident]
 		common := genCommon(t.Ident, sizeUnassigned, false)
 		common.IsVarlen = typeStruct.Varlen(comp, t, args)
+		_, _, stringAttrs := comp.parseAttrs(structOrUnionAttrs(s), s, s.Attrs)
+		outputPolicy := comp.genOutputPolicy(stringAttrs, s.Pos)
 		var typ prog.Type
 		if s.IsUnion {
 			typ = &prog.UnionType{
-				TypeCommon: common,
+				TypeCommon:   common,
+				OutputPolicy: outputPolicy,
 			}
 		} else {
 			typ = &prog.StructType{
-				TypeCommon: common,
+				TypeCommon:   common,
+				OutputPolicy: outputPolicy,
 			}
 		}
 		// Need to cache type in structTypes before generating fields to break recursion.

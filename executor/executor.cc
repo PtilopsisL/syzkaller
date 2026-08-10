@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <optional>
+#include <vector>
 
 #if !GOOS_windows
 #include <unistd.h>
@@ -25,6 +26,8 @@
 #include "defs.h"
 
 #include "pkg/flatrpc/flatrpc.h"
+
+#include "libsclog/include/sclog.h"
 
 #if defined(__GNUC__)
 #define SYSCALLAPI
@@ -74,6 +77,7 @@ const int kExtraCoverFd = kCoverFd - 1;
 const int kMaxArgs = 9;
 const int kCoverSize = 512 << 10;
 const int kFailStatus = 67;
+const size_t kSctraceBufferSize = 16 << 10;
 
 // Two approaches of dealing with kcov memory.
 const int kCoverOptimizedCount = 8; // the max number of kcov instances
@@ -274,11 +278,13 @@ static bool flag_vhci_injection;
 static bool flag_wifi;
 static bool flag_delay_kcov_mmap;
 static bool flag_return_error;
+static bool flag_sctrace = false;
 
 static bool flag_collect_cover;
 static bool flag_collect_signal;
 static bool flag_dedup_cover;
 static bool flag_threaded;
+static bool flag_collect_outputs;
 
 // If true, then executor should write the comparisons data to fuzzer.
 static bool flag_comparisons;
@@ -303,11 +309,13 @@ static bool in_execute_one = false;
 
 const size_t kMaxInput = 4 << 20; // keep in sync with prog.ExecBufferSize
 const size_t kMaxCommands = 1000; // prog package knows about this constant (prog.execMaxCommands)
+const size_t kMaxOutputBytesPerCall = 16 << 10; // keep in sync with prog.MaxOutputCaptureBytesPerCall
 
 const uint64 instr_eof = -1;
 const uint64 instr_copyin = -2;
 const uint64 instr_copyout = -3;
 const uint64 instr_setprops = -4;
+const uint64 instr_observe = -5;
 
 const uint64 arg_const = 0;
 const uint64 arg_addr32 = 1;
@@ -382,6 +390,13 @@ struct cover_t {
 	bool enabled;
 };
 
+struct output_capture_t {
+	uint32 id;
+	std::vector<uint8_t> data;
+	bool faulted;
+	bool truncated;
+};
+
 struct thread_t {
 	int id;
 	bool created;
@@ -398,8 +413,14 @@ struct thread_t {
 	intptr_t res;
 	uint32 reserrno;
 	bool fault_injected;
+	std::vector<output_capture_t> outputs;
 	cover_t cov;
 	bool soft_fail_state;
+	struct {
+		char* data;
+		size_t size;
+		FILE* file;
+	} sctrace;
 };
 
 static thread_t threads[kMaxThreads];
@@ -496,6 +517,8 @@ static flatbuffers::span<uint8_t> finish_output(OutputData* output, int proc_id,
 static void parse_execute(const execute_req& req);
 static void parse_handshake(const handshake_req& req);
 
+static void setup_sctrace_logs();
+
 static void mmap_input();
 
 #include "syscalls.h"
@@ -582,6 +605,36 @@ static std::optional<CoverFilter> cover_filter;
 static uint64 sandbox_arg = 0;
 #endif
 
+// Initialize per-thread syscall trace logs using libsclog.
+// Each thread gets its own log file named "sctrace.<pid>.<tid>.log".
+void setup_sctrace_logs()
+{
+	if (!flag_sctrace)
+		return;
+
+	init_sclog();
+	for (int i = 0; i < kMaxThreads; i++) {
+#if GOOS_windows
+		pid_t pid = getpid();
+		char path[128];
+		snprintf(path, sizeof(path), "sctrace.%d.%d.log", (int)pid, i);
+		FILE* f = fopen(path, "w");
+		char* buf = nullptr;
+#else
+		char* buf = (char*)malloc(kSctraceBufferSize);
+		if (!buf)
+			fail("failed to allocate sctrace buffer");
+		FILE* f = fmemopen(buf, kSctraceBufferSize, "w");
+#endif
+		if (!f)
+			fail("failed to open sctrace log file");
+		threads[i].sctrace.data = buf;
+		threads[i].sctrace.size = 0;
+		threads[i].sctrace.file = f;
+		set_log_file(i, f);
+	}
+}
+
 int main(int argc, char** argv)
 {
 	if (argc == 1) {
@@ -632,7 +685,7 @@ int main(int argc, char** argv)
 #endif
 
 		if (fcntl(kMaxSignalFd, F_GETFD) != -1) {
-			// Use random addresses for coverage filters to not collide with output_data.
+			// Use dedicated fixed addresses so all runtime executors share the same layout.
 			max_signal.emplace(kMaxSignalFd, reinterpret_cast<void*>(0x110c230000ull));
 			close(kMaxSignalFd);
 		}
@@ -643,6 +696,7 @@ int main(int argc, char** argv)
 
 		setup_control_pipes();
 		receive_handshake();
+		setup_sctrace_logs();
 #if !SYZ_EXECUTOR_USES_FORK_SERVER
 		// We receive/reply handshake when fork server is disabled just to simplify runner logic.
 		// It's a bit suboptimal, but no fork server is much slower anyway.
@@ -722,15 +776,14 @@ static uint32* input_base_address()
 		// just use whatever address mmap() returns us.
 		return 0;
 	}
-	// It's the first time we map output region - generate its location.
-	// The output region is the only thing in executor process for which consistency matters.
-	// If it is corrupted ipc package will fail to parse its contents and panic.
-	// But fuzzer constantly invents new ways of how to corrupt the region,
-	// so we map the region at a (hopefully) hard to guess address with random offset,
-	// surrounded by unmapped pages.
+	// Use one deterministic address for the output region in every executor.
+	// The output region is the only thing in executor process for which
+	// consistency matters: if it is corrupted ipc package will fail to parse its
+	// contents and panic. Executor processes have separate address spaces, and
+	// MAP_FIXED_EXCLUSIVE below still protects each process from overlap.
 	// The address chosen must also work on 32-bit kernels with 1GB user address space.
 	const uint64 kOutputBase = 0x1b2bc20000ull;
-	return (uint32*)(kOutputBase + (1 << 20) * (getpid() % 128));
+	return (uint32*)kOutputBase;
 }
 
 static void mmap_input()
@@ -852,6 +905,7 @@ void parse_handshake(const handshake_req& req)
 	flag_delay_kcov_mmap = (bool)(req.flags & rpc::ExecEnv::DelayKcovMmap);
 	flag_nic_vf = (bool)(req.flags & rpc::ExecEnv::EnableNicVF);
 	flag_return_error = req.return_error;
+	flag_sctrace = (bool)(req.flags & rpc::ExecEnv::SyscallTrace);
 }
 
 void receive_execute()
@@ -874,6 +928,7 @@ void parse_execute(const execute_req& req)
 	flag_dedup_cover = req.exec_flags & (uint64)rpc::ExecFlag::DedupCover;
 	flag_comparisons = req.exec_flags & (uint64)rpc::ExecFlag::CollectComps;
 	flag_threaded = req.exec_flags & (uint64)rpc::ExecFlag::Threaded;
+	flag_collect_outputs = req.exec_flags & (uint64)rpc::ExecFlag::CollectOutputs;
 	all_call_signal = req.all_call_signal;
 	all_extra_signal = req.all_extra_signal;
 	flag_return_error = req.return_error;
@@ -1075,6 +1130,14 @@ void execute_one()
 			// The copyout will happen when/if the call completes.
 			continue;
 		}
+		if (call_num == instr_observe) {
+			read_input(&input_pos); // id
+			read_input(&input_pos); // addr
+			read_input(&input_pos); // size
+			read_input(&input_pos); // truncated
+			// The capture will happen when/if the call completes.
+			continue;
+		}
 		if (call_num == instr_setprops) {
 			read_call_props_t(call_props, read_input(&input_pos, false));
 			continue;
@@ -1220,6 +1283,7 @@ thread_t* schedule_call(int call_index, int call_num, uint64 copyout_index, uint
 	th->call_num = call_num;
 	th->num_args = num_args;
 	th->call_props = call_props;
+	th->outputs.clear();
 	for (int i = 0; i < kMaxArgs; i++)
 		th->args[i] = args[i];
 	event_set(&th->ready);
@@ -1314,7 +1378,7 @@ uint32 write_comparisons(flatbuffers::FlatBufferBuilder& fbb, cover_t* cov)
 
 bool coverage_filter(uint64 pc)
 {
-	if (!cover_filter)
+	if (!cover_filter || cover_filter->Empty())
 		return true;
 	return cover_filter->Contains(pc);
 }
@@ -1324,8 +1388,7 @@ void handle_completion(thread_t* th)
 	if (event_isset(&th->ready) || !event_isset(&th->done) || !th->executing)
 		exitf("bad thread state in completion: ready=%d done=%d executing=%d",
 		      event_isset(&th->ready), event_isset(&th->done), th->executing);
-	if (th->res != (intptr_t)-1)
-		copyout_call_results(th);
+	copyout_call_results(th);
 
 	write_call_output(th, true);
 	write_extra_output();
@@ -1349,7 +1412,8 @@ void handle_completion(thread_t* th)
 
 void copyout_call_results(thread_t* th)
 {
-	if (th->copyout_index != no_copyout) {
+	const bool succeeded = th->res != (intptr_t)-1;
+	if (succeeded && th->copyout_index != no_copyout) {
 		if (th->copyout_index >= kMaxCommands)
 			failmsg("result overflows kMaxCommands", "index=%lld", th->copyout_index);
 		results[th->copyout_index].executed = true;
@@ -1364,12 +1428,35 @@ void copyout_call_results(thread_t* th)
 				failmsg("result overflows kMaxCommands", "index=%lld", index);
 			char* addr = (char*)(read_input(&th->copyout_pos) + SYZ_DATA_OFFSET);
 			uint64 size = read_input(&th->copyout_pos);
-			uint64 val = 0;
-			if (copyout(addr, size, &val)) {
-				results[index].executed = true;
-				results[index].val = val;
+			if (succeeded) {
+				uint64 val = 0;
+				if (copyout(addr, size, &val)) {
+					results[index].executed = true;
+					results[index].val = val;
+				}
+				debug_verbose("copyout 0x%llx from %p\n", val, addr);
 			}
-			debug_verbose("copyout 0x%llx from %p\n", val, addr);
+			break;
+		}
+		case instr_observe: {
+			uint64 id = read_input(&th->copyout_pos);
+			char* addr = (char*)(read_input(&th->copyout_pos) + SYZ_DATA_OFFSET);
+			uint64 size = read_input(&th->copyout_pos);
+			bool truncated = read_input(&th->copyout_pos);
+			if (size > kMaxOutputBytesPerCall)
+				failmsg("output capture is too large", "size=%llu", size);
+			if (id > UINT32_MAX)
+				failmsg("output capture id is too large", "id=%llu", id);
+			if (!flag_collect_outputs || !succeeded)
+				break;
+			output_capture_t output = {};
+			output.id = static_cast<uint32>(id);
+			output.truncated = truncated;
+			output.data.resize(size);
+			output.faulted = !NONFAILING(memcpy(output.data.data(), addr, size));
+			if (output.faulted)
+				output.data.clear();
+			th->outputs.push_back(std::move(output));
 			break;
 		}
 		default:
@@ -1379,7 +1466,8 @@ void copyout_call_results(thread_t* th)
 	}
 }
 
-void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bool all_signal)
+void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bool all_signal,
+		  const thread_t* th)
 {
 	CoverAccessScope scope(cov);
 	auto& fbb = *output_builder;
@@ -1388,6 +1476,8 @@ void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bo
 	uint32 signal_off = 0;
 	uint32 cover_off = 0;
 	uint32 comps_off = 0;
+	flatbuffers::Offset<flatbuffers::Vector<uint8_t>> sctrace_off;
+	flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<rpc::OutputCaptureRaw>>> outputs_off;
 	if (flag_comparisons) {
 		comps_off = write_comparisons(fbb, cov);
 	} else {
@@ -1404,6 +1494,20 @@ void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bo
 				cover_off = write_cover<uint32>(fbb, cov);
 		}
 	}
+	if (flag_sctrace && th && th->sctrace.data && th->sctrace.size) {
+		uint8_t* dst = nullptr;
+		sctrace_off = fbb.CreateUninitializedVector(th->sctrace.size, &dst);
+		memcpy(dst, th->sctrace.data, th->sctrace.size);
+	}
+	if (th && !th->outputs.empty()) {
+		std::vector<flatbuffers::Offset<rpc::OutputCaptureRaw>> outputs;
+		outputs.reserve(th->outputs.size());
+		for (const auto& output : th->outputs) {
+			outputs.push_back(rpc::CreateOutputCaptureRawDirect(
+			    fbb, output.id, &output.data, output.faulted, output.truncated));
+		}
+		outputs_off = fbb.CreateVector(outputs);
+	}
 
 	rpc::CallInfoRawBuilder builder(*output_builder);
 	if (cov->overflow)
@@ -1416,6 +1520,14 @@ void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bo
 		builder.add_cover(cover_off);
 	if (comps_off)
 		builder.add_comps(comps_off);
+	if (!sctrace_off.IsNull())
+		builder.add_sctrace(sctrace_off);
+	if (th && (flags & rpc::CallFlag::Finished) != rpc::CallFlag::NONE) {
+		builder.add_return_value(th->res);
+		builder.add_return_value_valid(true);
+	}
+	if (!outputs_off.IsNull())
+		builder.add_outputs(outputs_off);
 	auto off = builder.Finish();
 	uint32 slot = output_data->completed.load(std::memory_order_relaxed);
 	if (slot >= kMaxCalls)
@@ -1442,7 +1554,7 @@ void write_call_output(thread_t* th, bool finished)
 			flags |= rpc::CallFlag::FaultInjected;
 	}
 	bool all_signal = th->call_index < 64 ? (all_call_signal & (1ull << th->call_index)) : false;
-	write_output(th->call_index, &th->cov, flags, reserrno, all_signal);
+	write_output(th->call_index, &th->cov, flags, reserrno, all_signal, th);
 }
 
 void write_extra_output()
@@ -1452,7 +1564,7 @@ void write_extra_output()
 	cover_collect(&extra_cov);
 	if (!extra_cov.size)
 		return;
-	write_output(-1, &extra_cov, rpc::CallFlag::NONE, 997, all_extra_signal);
+	write_output(-1, &extra_cov, rpc::CallFlag::NONE, 997, all_extra_signal, nullptr);
 	cover_reset(&extra_cov);
 }
 
@@ -1563,6 +1675,28 @@ void execute_call(thread_t* th)
 		th->soft_fail_state = true;
 	}
 
+	// Log syscall entry via libsclog.
+	// For pseudo-syscalls (call->call != nullptr) we still log them, but
+	// without a kernel syscall number.
+	if (flag_sctrace) {
+		if (th->sctrace.file) {
+			rewind(th->sctrace.file);
+			clearerr(th->sctrace.file);
+		}
+		th->sctrace.size = 0;
+		if (!call->call) {
+			log_syscall_with_index(th->id, th->call_index, call->sys_nr,
+			                       th->num_args, th->args, 0, 0, true);
+		} else {
+			log_syscall_printf(th->id, "%d: %s(", th->call_index, call->name);
+			for (int i = 0; i < th->num_args; i++) {
+				log_syscall_printf(th->id, "%s0x%llx",
+				                   (i ? ", " : ""), (unsigned long long)th->args[i]);
+			}
+			log_syscall_printf(th->id, ") ...\n");
+		}
+	}
+
 	if (flag_coverage)
 		cover_reset(&th->cov);
 	// For pseudo-syscalls and user-space functions NONFAILING can abort before assigning to th->res.
@@ -1588,6 +1722,27 @@ void execute_call(thread_t* th)
 	// But let's still return res, errno and coverage from the first execution.
 	for (int i = 0; i < th->call_props.rerun; i++)
 		NONFAILING(execute_syscall(call, th->args));
+
+	// Log syscall exit via libsclog.
+	if (flag_sctrace) {
+		const int trace_errno = th->res == -1 ? th->reserrno : 0;
+		if (!call->call) {
+			log_syscall_with_index(th->id, th->call_index, call->sys_nr,
+			                       th->num_args, th->args,
+			                       th->res, trace_errno, false);
+		} else {
+			log_syscall_printf(th->id, "%d: %s() = %lld {%d}\n",
+			                   th->call_index, call->name,
+			                   (long long)th->res, trace_errno);
+		}
+		if (th->sctrace.file && th->sctrace.data) {
+			if (fflush(th->sctrace.file) == 0) {
+				long size = ftell(th->sctrace.file);
+				if (size > 0)
+					th->sctrace.size = std::min(static_cast<size_t>(size), kSctraceBufferSize);
+			}
+		}
+	}
 
 	debug("#%d [%llums] <- %s=0x%llx",
 	      th->id, current_time_ms() - start_time_ms, call->name, (uint64)th->res);

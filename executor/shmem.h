@@ -27,7 +27,7 @@ public:
 	}
 
 	// Maps shared memory region from the file 'fd' in read/write or write-only mode,
-	// preferably at the address 'preferred'.
+	// at the address 'preferred' when it is non-null.
 	ShmemFile(int fd, void* preferred, size_t size, bool write)
 	{
 		Mmap(fd, preferred, size, write);
@@ -69,9 +69,14 @@ private:
 	void Mmap(int fd, void* preferred, size_t size, bool write)
 	{
 		size_ = size;
-		mem_ = mmap(preferred, size, PROT_READ | (write ? PROT_WRITE : 0), MAP_SHARED, fd, 0);
+		int flags = MAP_SHARED;
+		if (preferred != nullptr)
+			flags |= MAP_FIXED_EXCLUSIVE;
+		mem_ = mmap(preferred, size, PROT_READ | (write ? PROT_WRITE : 0), flags, fd, 0);
 		if (mem_ == MAP_FAILED)
 			failmsg("shmem mmap failed", "size=%zu", size);
+		if (preferred != nullptr && mem_ != preferred)
+			failmsg("shmem mmap returned an unexpected address", "want=%p, got=%p", preferred, mem_);
 	}
 
 	ShmemFile(const ShmemFile&) = delete;

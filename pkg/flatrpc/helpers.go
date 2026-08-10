@@ -37,6 +37,7 @@ type SignalUpdate = SignalUpdateRawT
 type CorpusTriaged = CorpusTriagedRawT
 type ExecutingMessage = ExecutingMessageRawT
 type CallInfo = CallInfoRawT
+type OutputCapture = OutputCaptureRawT
 type Comparison = ComparisonRawT
 type ExecOpts = ExecOptsRawT
 type ProgInfo = ProgInfoRawT
@@ -71,6 +72,16 @@ func (ci *CallInfo) clone() *CallInfo {
 	ret.Signal = slices.Clone(ret.Signal)
 	ret.Cover = slices.Clone(ret.Cover)
 	ret.Comps = slices.Clone(ret.Comps)
+	ret.Sctrace = slices.Clone(ret.Sctrace)
+	ret.Outputs = make([]*OutputCapture, len(ci.Outputs))
+	for i, output := range ci.Outputs {
+		if output == nil {
+			continue
+		}
+		cloned := *output
+		cloned.Data = slices.Clone(output.Data)
+		ret.Outputs[i] = &cloned
+	}
 	return &ret
 }
 

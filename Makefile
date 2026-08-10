@@ -83,6 +83,13 @@ TARGETGOARCH := $(TARGETVMARCH)
 export GO111MODULE=on
 export GOBIN=$(shell pwd -P)/bin
 
+# Use libsclog only in linux
+ifeq ($(TARGETOS),linux)
+LIBSCLOG_DIR    := executor/libsclog
+LIBSCLOG_A      := $(LIBSCLOG_DIR)/build/libsclog.a
+LIBSCLOG_LIBS   := -pthread -lm -ltinfo
+endif
+
 ifeq ("$(TARGETOS)", "test")
 	TARGETGOOS := $(HOSTOS)
 	TARGETGOARCH := $(HOSTARCH)
@@ -133,9 +140,16 @@ ifneq ("$(NO_CROSS_COMPILER)", "")
 	$(info ************************************************************************************)
 else
 	mkdir -p ./bin/$(TARGETOS)_$(TARGETARCH)
+ifeq ($(TARGETOS),linux)
+	$(CXX) -o ./bin/$(TARGETOS)_$(TARGETARCH)/syz-executor$(EXE) executor/executor.cc $(LIBSCLOG_A) \
+		$(ADDCXXFLAGS) $(CXXFLAGS) $(LDFLAGS) $(LIBSCLOG_LIBS) \
+		-DGOOS_$(TARGETOS)=1 -DGOARCH_$(TARGETARCH)=1 \
+		-DHOSTGOOS_$(HOSTOS)=1 -DGIT_REVISION=\"$(REV)\"
+else
 	$(CXX) -o ./bin/$(TARGETOS)_$(TARGETARCH)/syz-executor$(EXE) executor/executor.cc \
 		$(ADDCXXFLAGS) $(CXXFLAGS) $(LDFLAGS) -DGOOS_$(TARGETOS)=1 -DGOARCH_$(TARGETARCH)=1 \
 		-DHOSTGOOS_$(HOSTOS)=1 -DGIT_REVISION=\"$(REV)\"
+endif
 endif
 endif
 endif

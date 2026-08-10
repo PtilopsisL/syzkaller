@@ -253,6 +253,7 @@ func verifyExecResult(res *ExecResultRaw, rawSize int) error {
 		return nil
 	}
 	var tmp ComparisonRaw
+	var output OutputCaptureRaw
 	// It's hard to impose good limit on each individual signal/cover/comps array,
 	// so instead we count total memory size for all calls and check that it's not
 	// larger than the total message size.
@@ -268,6 +269,17 @@ func verifyExecResult(res *ExecResultRaw, rawSize int) error {
 		}
 		if call.CompsLength() != 0 {
 			size += min(maxSize, call.CompsLength()) * int(unsafe.Sizeof(call.Comps(&tmp, 0)))
+		}
+		if call.SctraceLength() != 0 {
+			size += min(maxSize, call.SctraceLength()) * int(unsafe.Sizeof(call.Sctrace(0)))
+		}
+		if call.OutputsLength() != 0 {
+			size += min(maxSize, call.OutputsLength()) * int(unsafe.Sizeof(OutputCaptureRawT{}))
+			for i := 0; i < call.OutputsLength(); i++ {
+				if call.Outputs(&output, i) {
+					size += min(maxSize, output.DataLength()) * int(unsafe.Sizeof(output.Data(0)))
+				}
+			}
 		}
 		return size
 	}
