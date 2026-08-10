@@ -5,6 +5,7 @@ package mgrconfig
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"os"
@@ -26,6 +27,12 @@ import (
 type Derived struct {
 	Target    *prog.Target
 	SysTarget *targets.Target
+
+	// CoverageLayout controls whether the executor creates the shared output,
+	// max-signal, and coverage-filter mappings. It is intentionally separate
+	// from Cover: shadow runtimes don't collect feedback, but must use the same
+	// executor address layout as the primary runtime.
+	CoverageLayout bool
 
 	// Parsed Target:
 	TargetOS     string
@@ -213,11 +220,102 @@ func Complete(cfg *Config) error {
 	}
 	cfg.initTimeouts()
 	cfg.VMLess = cfg.Type == "none"
+	// Keep the layout compatible with the historical single-runtime behavior.
+	// Multi-runtime completion overrides this for shadow runtimes below.
+	cfg.CoverageLayout = cfg.CoverageLayout || cfg.Cover
 
 	if cfg.VMLess && cfg.Reproduce {
 		return fmt.Errorf("if config param type is none, reproduce must be false")
 	}
+	if len(cfg.Runtimes) != 0 {
+		return cfg.completeRuntimes()
+	}
 
+	return nil
+}
+
+var runtimeNameRe = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,64}$`)
+
+func (cfg *Config) completeRuntimes() error {
+	if cfg.PrimaryRuntime == "" {
+		return fmt.Errorf("multi-runtime mode requires primary to be set")
+	}
+
+	base := *cfg
+	base.PrimaryRuntime = ""
+	base.Runtimes = nil
+	base.RuntimeConfigs = nil
+	base.Derived = Derived{}
+	baseJSON, err := json.Marshal(&base)
+	if err != nil {
+		return fmt.Errorf("failed to serialize base runtime config: %w", err)
+	}
+
+	cfg.RuntimeConfigs = make(map[string]*Config, len(cfg.Runtimes))
+	seen := make(map[string]struct{}, len(cfg.Runtimes))
+	foundPrimary := false
+	for _, runtime := range cfg.Runtimes {
+		if !runtimeNameRe.MatchString(runtime.Name) {
+			return fmt.Errorf("bad runtime name %q", runtime.Name)
+		}
+		if _, ok := seen[runtime.Name]; ok {
+			return fmt.Errorf("duplicate runtime %q", runtime.Name)
+		}
+		seen[runtime.Name] = struct{}{}
+		if runtime.Name == cfg.PrimaryRuntime {
+			foundPrimary = true
+		}
+
+		overrideJSON, err := json.Marshal(runtime)
+		if err != nil {
+			return fmt.Errorf("failed to serialize runtime %q overrides: %w", runtime.Name, err)
+		}
+		merged, err := config.MergeJSONs(baseJSON, overrideJSON)
+		if err != nil {
+			return fmt.Errorf("failed to merge runtime %q config: %w", runtime.Name, err)
+		}
+		runtimeCfg, err := LoadPartialData(merged)
+		if err != nil {
+			return fmt.Errorf("failed to load runtime %q config: %w", runtime.Name, err)
+		}
+		runtimeCfg.PrimaryRuntime = ""
+		runtimeCfg.Runtimes = nil
+		runtimeCfg.RuntimeConfigs = nil
+		switch runtime.Name {
+		case cfg.PrimaryRuntime:
+			runtimeCfg.Name = cfg.Name
+			runtimeCfg.Workdir = cfg.Workdir
+		default:
+			runtimeCfg.Name = fmt.Sprintf("%s/%s", cfg.Name, runtime.Name)
+			runtimeCfg.Workdir = filepath.Join(cfg.Workdir, "runtimes", runtime.Name)
+			runtimeCfg.HTTP = ""
+			runtimeCfg.RPC = ":0"
+			runtimeCfg.HubClient = ""
+			runtimeCfg.HubAddr = ""
+			runtimeCfg.HubKey = ""
+			runtimeCfg.HubDomain = ""
+			runtimeCfg.DashboardClient = ""
+			runtimeCfg.DashboardAddr = ""
+			runtimeCfg.DashboardKey = ""
+			runtimeCfg.DashboardUserAgent = ""
+			runtimeCfg.DashboardOnlyRepro = false
+			runtimeCfg.AssetStorage = nil
+			runtimeCfg.Cover = false
+		}
+		if err := Complete(runtimeCfg); err != nil {
+			return fmt.Errorf("runtime %q: %w", runtime.Name, err)
+		}
+		// Cover is deliberately disabled for shadow runtimes, while the executor
+		// layout remains identical to the primary runtime.
+		runtimeCfg.CoverageLayout = cfg.Cover
+		if runtimeCfg.VMLess {
+			return fmt.Errorf("runtime %q: type=none is not supported in multi-runtime mode", runtime.Name)
+		}
+		cfg.RuntimeConfigs[runtime.Name] = runtimeCfg
+	}
+	if !foundPrimary {
+		return fmt.Errorf("primary runtime %q is not defined", cfg.PrimaryRuntime)
+	}
 	return nil
 }
 

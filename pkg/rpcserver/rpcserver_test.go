@@ -35,6 +35,12 @@ func getTestDefaultCfg() mgrconfig.Config {
 	}
 }
 
+func TestPrometheusMetricName(t *testing.T) {
+	assert.Equal(t, "syz_exec_total", prometheusMetricName("syz_exec_total", ""))
+	assert.Equal(t, "syz_exec_total_v6_2", prometheusMetricName("syz_exec_total", "v6.2"))
+	assert.Equal(t, "syz_exec_total_linux_next", prometheusMetricName("syz_exec_total", "linux-next"))
+}
+
 func TestNew(t *testing.T) {
 	defaultCfg := getTestDefaultCfg()
 
@@ -115,6 +121,39 @@ func TestNew(t *testing.T) {
 			tt.expectedServCheck(serv)
 		})
 	}
+}
+
+func TestCoverageLayoutHandshake(t *testing.T) {
+	runner := &Runner{
+		procs:     1,
+		cover:     false,
+		layout:    true,
+		sysTarget: targets.Get(targets.TestOS, targets.TestArch64),
+	}
+	serverNet, clientNet := net.Pipe()
+	serverConn := flatrpc.NewConn(serverNet)
+	clientConn := flatrpc.NewConn(clientNet)
+	defer serverConn.Close()
+	defer clientConn.Close()
+	done := make(chan error, 1)
+	go func() {
+		_, err := runner.Handshake(serverConn, &handshakeConfig{
+			Callback: func(*flatrpc.InfoRequestRawT) (handshakeResult, error) {
+				return handshakeResult{}, nil
+			},
+		})
+		done <- err
+	}()
+
+	reply, err := flatrpc.Recv[*flatrpc.ConnectReplyRaw](clientConn)
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.True(t, reply.Cover, "layout-only runtime must install executor coverage mappings")
+	assert.NoError(t, flatrpc.Send(clientConn, &flatrpc.InfoRequest{}))
+	_, err = flatrpc.Recv[*flatrpc.InfoReplyRaw](clientConn)
+	assert.NoError(t, err)
+	assert.NoError(t, <-done)
 }
 
 func TestCheckRevisions(t *testing.T) {

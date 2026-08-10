@@ -27,7 +27,6 @@ import (
 	"github.com/google/syzkaller/pkg/asset"
 	"github.com/google/syzkaller/pkg/corpus"
 	"github.com/google/syzkaller/pkg/db"
-	"github.com/google/syzkaller/pkg/execbackend"
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
@@ -64,15 +63,17 @@ var (
 )
 
 type Manager struct {
+	displayCfg      *mgrconfig.Config
 	cfg             *mgrconfig.Config
 	mode            *Mode
-	vmPool          *vm.Pool
-	pool            *vm.Dispatcher
+	primary         *managedRuntime
+	shadows         map[string]*managedRuntime
+	allRuntimes     map[string]*managedRuntime
+	programRegistry *multiRuntimeCoordinator
+	runtime         *manager.KernelRuntime
 	target          *prog.Target
 	sysTarget       *targets.Target
-	reporter        *report.Reporter
 	crashStore      *manager.CrashStore
-	serv            execbackend.Server
 	http            *manager.HTTPServer
 	servStats       rpcserver.Stats
 	corpus          *corpus.Corpus
@@ -231,6 +232,10 @@ func main() {
 		// This lets better distinguish logs of individual syz-manager instances.
 		log.SetName(cfg.Name)
 	}
+	managerCfg := cfg
+	if cfg.IsMultiRuntime() {
+		managerCfg = cfg.RuntimeConfigs[cfg.PrimaryRuntime]
+	}
 	var mode *Mode
 	for _, m := range modes {
 		if *flagMode == m.Name {
@@ -243,18 +248,22 @@ func main() {
 		log.Fatalf("unknown mode: %v", *flagMode)
 	}
 	if mode.CheckConfig != nil {
-		if err := mode.CheckConfig(cfg); err != nil {
+		if err := mode.CheckConfig(managerCfg); err != nil {
 			log.Fatalf("%v mode: %v", mode.Name, err)
 		}
 	}
 	if !mode.UseDashboard {
 		cfg.DashboardClient = ""
 		cfg.HubClient = ""
+		for _, runtimeCfg := range cfg.RuntimeConfigs {
+			runtimeCfg.DashboardClient = ""
+			runtimeCfg.HubClient = ""
+		}
 	}
-	if cfg.Experimental.EnableKFuzzTest {
-		vmLinuxPath := path.Join(cfg.KernelObj, cfg.SysTarget.KernelObject)
+	if managerCfg.Experimental.EnableKFuzzTest {
+		vmLinuxPath := path.Join(managerCfg.KernelObj, managerCfg.SysTarget.KernelObject)
 		log.Log(0, "enabling KFuzzTest targets")
-		_, err := kfuzztest.ActivateKFuzzTargets(cfg.Target, vmLinuxPath)
+		_, err := kfuzztest.ActivateKFuzzTargets(managerCfg.Target, vmLinuxPath)
 		if err != nil {
 			log.Fatalf("failed to enable KFuzzTest targets: %v", err)
 		}
@@ -263,32 +272,19 @@ func main() {
 }
 
 func RunManager(mode *Mode, cfg *mgrconfig.Config) {
-	var vmPool *vm.Pool
-	if !cfg.VMLess {
-		var err error
-		vmPool, err = vm.Create(cfg, *flagDebug)
-		if err != nil {
-			log.Fatalf("%v", err)
-		}
-		defer vmPool.Close()
-	}
-
 	osutil.MkdirAll(cfg.Workdir)
-
-	reporter, err := report.NewReporter(cfg)
-	if err != nil {
-		log.Fatalf("%v", err)
+	primaryCfg := cfg
+	if cfg.IsMultiRuntime() {
+		primaryCfg = cfg.RuntimeConfigs[cfg.PrimaryRuntime]
 	}
 
 	mgr := &Manager{
-		cfg:                cfg,
+		displayCfg:         cfg,
+		cfg:                primaryCfg,
 		mode:               mode,
-		vmPool:             vmPool,
 		corpusPreload:      make(chan []fuzzer.Candidate),
-		target:             cfg.Target,
-		sysTarget:          cfg.SysTarget,
-		reporter:           reporter,
-		crashStore:         manager.NewCrashStore(cfg),
+		target:             primaryCfg.Target,
+		sysTarget:          primaryCfg.SysTarget,
 		crashTypes:         make(map[string]bool),
 		disabledHashes:     make(map[string]struct{}),
 		memoryLeakFrames:   make(map[string]bool),
@@ -297,18 +293,22 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 		externalReproQueue: make(chan *manager.Crash, 10),
 		crashes:            make(chan *manager.Crash, 10),
 		saturatedCalls:     make(map[string]bool),
-		reportGenerator:    manager.ReportGeneratorCache(cfg),
-	}
-	mgr.crashStore.Reporter = reporter
-	if subsystem.HasList(cfg.TargetOS) {
-		mgr.crashStore.Extractor = subsystem.MakeExtractor(subsystem.GetList(cfg.TargetOS))
+		reportGenerator:    manager.ReportGeneratorCache(primaryCfg),
 	}
 	if *flagDebug {
 		mgr.cfg.Procs = 1
+		for _, runtimeCfg := range mgr.displayCfg.RuntimeConfigs {
+			runtimeCfg.Procs = 1
+		}
 	}
+	if err := mgr.initRuntime(*flagDebug); err != nil {
+		log.Fatalf("failed to create runtime: %v", err)
+	}
+	defer mgr.closeRuntimes()
+
 	mgr.http = &manager.HTTPServer{
 		// Note that if cfg.HTTP == "", we don't start the server.
-		Cfg:        cfg,
+		Cfg:        mgr.displayCfg,
 		StartTime:  time.Now(),
 		CrashStore: mgr.crashStore,
 	}
@@ -321,8 +321,21 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 	}
 
 	ctx := vm.ShutdownCtx()
-	mgr.initRPCServer(ctx)
+	// Create RPC servers for fuzzers.
+	for _, slot := range mgr.runtimeList() {
+		serv := slot.runtime.Server()
+		if err := slot.runtime.SetupServer(); err != nil {
+			log.Fatalf("failed to start %q rpc server: %v", slot.name, err)
+		}
+		go func(runtimeName string) {
+			err := serv.Serve(ctx)
+			if err != nil {
+				log.Fatalf("%s rpc server: %v", runtimeName, err)
+			}
+		}(slot.name)
+	}
 
+	var err error
 	if cfg.DashboardAddr != "" {
 		opts := []dashapi.DashboardOpts{}
 		if cfg.DashboardUserAgent != "" {
@@ -353,19 +366,33 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 	if mgr.mode != ModeSmokeTest {
 		osutil.HandleInterrupts(vm.Shutdown)
 	}
-	if mgr.vmPool == nil {
+	if mgr.runtime.Pool() == nil {
 		log.Logf(0, "no VMs started (type=none)")
-		log.Logf(0, "you are supposed to start syz-executor manually as:")
 		log.Logf(0, "you are supposed to start syz-executor manually")
 		<-vm.Shutdown
 		return
 	}
-	mgr.pool = vm.NewDispatcher(mgr.vmPool, mgr.fuzzerInstance)
-	mgr.http.Pool = mgr.pool
-	reproVMs := max(0, mgr.vmPool.Count()-mgr.cfg.FuzzingVMs)
-	mgr.reproLoop = manager.NewReproLoop(mgr, reproVMs, mgr.cfg.DashboardOnlyRepro)
-	mgr.http.ReproLoop = mgr.reproLoop
-	mgr.http.TogglePause = mgr.pool.TogglePause
+	if mgr.displayCfg.IsMultiRuntime() {
+		mgr.http.Pools = make(map[string]*vm.Dispatcher)
+		mgr.http.CrashStores = make(map[string]*manager.CrashStore)
+		mgr.http.ReproLoops = make(map[string]*manager.ReproLoop)
+		for _, slot := range mgr.runtimeList() {
+			mgr.http.Pools[slot.name] = slot.runtime.Pool()
+			mgr.http.CrashStores[slot.name] = slot.crashStore
+			if slot.reproLoop != nil {
+				mgr.http.ReproLoops[slot.name] = slot.reproLoop
+			}
+		}
+		mgr.http.TogglePause = mgr.togglePauseAll
+	} else {
+		if mgr.reproLoop == nil {
+			reproVMs := max(0, mgr.runtime.Pool().Total()-mgr.cfg.FuzzingVMs)
+			mgr.reproLoop = manager.NewReproLoop(mgr, reproVMs, mgr.cfg.DashboardOnlyRepro)
+		}
+		mgr.http.Pool = mgr.runtime.Pool()
+		mgr.http.ReproLoop = mgr.reproLoop
+		mgr.http.TogglePause = mgr.runtime.Pool().TogglePause
+	}
 
 	if mgr.cfg.HTTP != "" {
 		go func() {
@@ -377,7 +404,108 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 	}
 	go mgr.trackUsedFiles()
 	go mgr.processFuzzingResults(ctx)
-	mgr.pool.Loop(ctx)
+	for _, slot := range mgr.runtimeList() {
+		if pool := slot.runtime.Pool(); pool != nil {
+			go mgr.forwardBootErrors(ctx, slot)
+		}
+		if slot.shadow && slot.reproLoop != nil {
+			go slot.reproLoop.Loop(ctx)
+		}
+	}
+	for _, slot := range mgr.shadows {
+		go slot.runtime.Pool().Loop(ctx)
+	}
+	mgr.runtime.Pool().Loop(ctx)
+}
+
+func (mgr *Manager) initRuntime(debug bool) error {
+	if mgr.displayCfg == nil {
+		mgr.displayCfg = mgr.cfg
+	}
+	if mgr.displayCfg.IsMultiRuntime() && mgr.mode != ModeFuzzing {
+		return fmt.Errorf("multi-runtime mode is only supported in fuzzing mode")
+	}
+
+	mgr.allRuntimes = make(map[string]*managedRuntime)
+	mgr.shadows = make(map[string]*managedRuntime)
+	if mgr.displayCfg.IsMultiRuntime() {
+		coord := newMultiRuntimeCoordinator(mgr.displayCfg.Workdir)
+		for name, runtimeCfg := range mgr.displayCfg.RuntimeConfigs {
+			coord.setRuntimeVersion(name, runtimeCfg.KernelVersion)
+		}
+		if err := coord.configureRuntimeDiffLabels(mgr.displayCfg.RuntimeDiffLabels); err != nil {
+			return fmt.Errorf("runtime diff labels: %w", err)
+		}
+		if err := coord.configureRuntimeOutputPolicies(mgr.displayCfg.RuntimeOutputPolicy); err != nil {
+			return fmt.Errorf("runtime output policy: %w", err)
+		}
+		mgr.programRegistry = coord
+	}
+
+	createSlot := func(name string, runtimeCfg *mgrconfig.Config, shadow bool) error {
+		slot := &managedRuntime{
+			name:       name,
+			cfg:        runtimeCfg,
+			shadow:     shadow,
+			controller: &runtimeController{mgr: mgr, slot: nil},
+			crashStore: newManagedCrashStore(mgr.displayCfg.Workdir, runtimeCfg, name,
+				mgr.displayCfg.IsMultiRuntime()),
+		}
+		slot.controller.slot = slot
+		var stats rpcserver.Stats
+		if mgr.displayCfg.IsMultiRuntime() || shadow {
+			stats = rpcserver.NewNamedStats(name)
+		} else {
+			stats = rpcserver.NewStats()
+		}
+		if !shadow {
+			mgr.servStats = stats
+		}
+		slot.stats = stats
+		runtime, err := manager.NewKernelRuntime(name, runtimeCfg, manager.KernelRuntimeOptions{
+			Debug:           debug,
+			RPCManager:      slot.controller,
+			InstanceHandler: mgr.makeInstanceHandler(slot),
+			Stats:           stats,
+		})
+		if err != nil {
+			return err
+		}
+		slot.runtime = runtime
+		slot.crashStore.Reporter = runtime.Reporter()
+		if subsystem.HasList(runtimeCfg.TargetOS) {
+			slot.crashStore.Extractor = subsystem.MakeExtractor(subsystem.GetList(runtimeCfg.TargetOS))
+		}
+		if runtime.Pool() != nil && runtimeCfg.Reproduce {
+			reproVMs := max(0, runtime.Pool().Total()-runtimeCfg.FuzzingVMs)
+			slot.reproLoop = manager.NewReproLoop(&runtimeReproView{mgr: mgr, slot: slot},
+				reproVMs, !shadow && runtimeCfg.DashboardOnlyRepro)
+		}
+		mgr.allRuntimes[name] = slot
+		if shadow {
+			mgr.shadows[name] = slot
+			return nil
+		}
+		mgr.primary = slot
+		mgr.runtime = slot.runtime
+		mgr.crashStore = slot.crashStore
+		mgr.reproLoop = slot.reproLoop
+		return nil
+	}
+
+	if !mgr.displayCfg.IsMultiRuntime() {
+		return createSlot("main", mgr.cfg, false)
+	}
+	for _, runtime := range mgr.displayCfg.Runtimes {
+		name := runtime.Name
+		if err := createSlot(name, mgr.displayCfg.RuntimeConfigs[name], name != mgr.displayCfg.PrimaryRuntime); err != nil {
+			return fmt.Errorf("runtime %q: %w", name, err)
+		}
+	}
+	if mgr.primary == nil {
+		return fmt.Errorf("failed to initialize primary runtime %q", mgr.displayCfg.PrimaryRuntime)
+	}
+	return nil
 }
 
 // Exit successfully in special operation modes.
@@ -387,38 +515,6 @@ func (mgr *Manager) exit(reason string) {
 	close(vm.Shutdown)
 	time.Sleep(10 * time.Second)
 	os.Exit(0)
-}
-
-func (mgr *Manager) initRPCServer(ctx context.Context) {
-	var err error
-	mgr.servStats = rpcserver.NewStats()
-	rpcCfg := &rpcserver.RemoteConfig{
-		Config:  mgr.cfg,
-		Manager: mgr,
-		Stats:   mgr.servStats,
-		Debug:   *flagDebug,
-	}
-	mgr.serv, err = execbackend.New(rpcCfg)
-	if err != nil {
-		log.Fatalf("failed to create rpcserver: %v", err)
-	}
-
-	if mgr.cfg.Snapshot {
-		snapCfg := execbackend.SnapshotConfig{
-			Config: mgr.cfg,
-			Stats:  mgr.servStats,
-		}
-		mgr.serv = execbackend.NewSnapshotBackend(mgr.serv, snapCfg)
-	}
-	if err := mgr.serv.Setup(); err != nil {
-		log.Fatalf("failed to start rpc server: %v", err)
-	}
-	go func() {
-		err := mgr.serv.Serve(ctx)
-		if err != nil {
-			log.Fatalf("%s", err)
-		}
-	}()
 }
 
 func (mgr *Manager) heartbeatLoop() {
@@ -476,14 +572,10 @@ func (mgr *Manager) processFuzzingResults(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case crash := <-mgr.crashes:
+			slot := mgr.slotForRuntime(crash.Runtime)
 			needRepro := mgr.saveCrash(crash)
-			if mgr.cfg.Reproduce && needRepro {
-				mgr.reproLoop.Enqueue(crash)
-			}
-		case err := <-mgr.pool.BootErrors:
-			crash := mgr.convertBootError(err)
-			if crash != nil {
-				mgr.saveCrash(crash)
+			if slot != nil && slot.cfg.Reproduce && needRepro && slot.reproLoop != nil {
+				slot.reproLoop.Enqueue(crash)
 			}
 		case crash := <-mgr.externalReproQueue:
 			if mgr.NeedRepro(crash) {
@@ -493,13 +585,34 @@ func (mgr *Manager) processFuzzingResults(ctx context.Context) {
 	}
 }
 
-func (mgr *Manager) convertBootError(err error) *manager.Crash {
+func (mgr *Manager) forwardBootErrors(ctx context.Context, slot *managedRuntime) {
+	if slot.runtime.Pool() == nil {
+		return
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case err := <-slot.runtime.Pool().BootErrors:
+			crash := mgr.convertBootError(slot, err)
+			if crash != nil {
+				select {
+				case mgr.crashes <- crash:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}
+}
+
+func (mgr *Manager) convertBootError(slot *managedRuntime, err error) *manager.Crash {
 	if bootErr, ok := errors.AsType[vm.BootError](err); ok {
 		title, output := bootErr.Details()
-		rep := mgr.reporter.Parse(output)
+		rep := slot.runtime.Reporter().Parse(output)
 		if rep != nil && rep.Type == crash_pkg.UnexpectedReboot {
 			// Avoid detecting any boot crash as "unexpected kernel reboot".
-			rep = mgr.reporter.ParseFrom(output, rep.SkipPos)
+			rep = slot.runtime.Reporter().ParseFrom(output, rep.SkipPos)
 		}
 		if rep == nil {
 			rep = &report.Report{
@@ -508,7 +621,8 @@ func (mgr *Manager) convertBootError(err error) *manager.Crash {
 			}
 		}
 		return &manager.Crash{
-			Report: rep,
+			Runtime: slot.name,
+			Report:  rep,
 		}
 	}
 	return nil
@@ -537,11 +651,16 @@ func reportReproError(err error) {
 }
 
 func (mgr *Manager) RunRepro(ctx context.Context, crash *manager.Crash) *manager.ReproResult {
+	return mgr.runReproOn(mgr.primary, ctx, crash)
+}
+
+func (mgr *Manager) runReproOn(slot *managedRuntime, ctx context.Context,
+	crash *manager.Crash) *manager.ReproResult {
 	res, stats, err := repro.Run(ctx, crash.Output, repro.Environment{
-		Config:   mgr.cfg,
-		Features: mgr.enabledFeatures,
-		Reporter: mgr.reporter,
-		Pool:     mgr.pool,
+		Config:   slot.cfg,
+		Features: slot.features,
+		Reporter: slot.runtime.Reporter(),
+		Pool:     slot.runtime.Pool(),
 	})
 	ret := &manager.ReproResult{
 		Crash: crash,
@@ -549,10 +668,10 @@ func (mgr *Manager) RunRepro(ctx context.Context, crash *manager.Crash) *manager
 		Stats: stats,
 		Err:   err,
 	}
-	if err == nil && res != nil && mgr.cfg.StraceBin != "" {
+	if err == nil && res != nil && slot.cfg.StraceBin != "" {
 		const straceAttempts = 2
 		for i := 1; i <= straceAttempts; i++ {
-			strace := repro.RunStrace(res, mgr.cfg, mgr.reporter, mgr.pool)
+			strace := repro.RunStrace(res, slot.cfg, slot.runtime.Reporter(), slot.runtime.Pool())
 			sameBug := strace.IsSameBug(res)
 			log.Logf(0, "strace run attempt %d/%d for '%s': same bug %v, error %v",
 				i, straceAttempts, res.Report.Title, sameBug, strace.Error)
@@ -565,12 +684,12 @@ func (mgr *Manager) RunRepro(ctx context.Context, crash *manager.Crash) *manager
 		}
 	}
 
-	mgr.processRepro(ret)
+	mgr.processRepro(slot, ret)
 
 	return ret
 }
 
-func (mgr *Manager) processRepro(res *manager.ReproResult) {
+func (mgr *Manager) processRepro(slot *managedRuntime, res *manager.ReproResult) {
 	if res.Err != nil {
 		reportReproError(res.Err)
 	}
@@ -580,10 +699,10 @@ func (mgr *Manager) processRepro(res *manager.ReproResult) {
 				res.Crash.FullTitle())
 		} else {
 			log.Logf(1, "report repro failure of '%v'", res.Crash.Title)
-			mgr.saveFailedRepro(res.Crash.Report, res.Stats, res.Err)
+			mgr.saveFailedReproOn(slot, res.Crash.Report, res.Stats, res.Err)
 		}
 	} else {
-		mgr.saveRepro(res)
+		mgr.saveReproOn(slot, res)
 	}
 
 	if res.Crash.ExtReqID != 0 {
@@ -636,26 +755,28 @@ func (mgr *Manager) loadCorpus(enabledSyscalls map[*prog.Syscall]bool) []fuzzer.
 }
 
 func (mgr *Manager) fuzzerInstance(ctx context.Context, inst *vm.Instance, updInfo dispatcher.UpdateInfo) {
-	mgr.mu.Lock()
-	serv := mgr.serv
-	mgr.mu.Unlock()
+	mgr.fuzzerInstanceFor(mgr.primary, ctx, inst, updInfo)
+}
+
+func (mgr *Manager) fuzzerInstanceFor(slot *managedRuntime, ctx context.Context,
+	inst *vm.Instance, updInfo dispatcher.UpdateInfo) {
+	serv := slot.runtime.Server()
 	if serv == nil {
 		// We're in the process of switching off the RPCServer.
 		return
 	}
-
-	reps, err := serv.RunRequests(ctx, inst, mgr.reporter, updInfo)
-
+	reps, err := serv.RunRequests(ctx, inst, slot.runtime.Reporter(), updInfo)
 	var rep *report.Report
 	if len(reps) != 0 {
 		rep = reps[0]
 	}
 	var memoryDump string
-	if mgr.cfg.MemoryDump && rep != nil {
-		memoryDump = mgr.extractMemoryDump(inst, rep)
+	if slot.cfg.MemoryDump && rep != nil {
+		memoryDump = mgr.extractMemoryDump(slot, inst, rep)
 	}
 	if err == nil && rep != nil {
 		mgr.crashes <- &manager.Crash{
+			Runtime:       slot.name,
 			InstanceIndex: inst.Index(),
 			Report:        rep,
 			TailReports:   reps[1:],
@@ -682,11 +803,23 @@ func (mgr *Manager) emailCrash(crash *manager.Crash) {
 	}
 }
 
+func (mgr *Manager) slotForRuntime(runtimeName string) *managedRuntime {
+	if runtimeName == "" || !mgr.displayCfg.IsMultiRuntime() {
+		return mgr.primary
+	}
+	return mgr.allRuntimes[runtimeName]
+}
+
 func (mgr *Manager) saveCrash(crash *manager.Crash) bool {
 	if crash.MemoryDump != "" {
 		defer os.Remove(crash.MemoryDump)
 	}
-	if err := mgr.reporter.Symbolize(crash.Report); err != nil {
+	slot := mgr.slotForRuntime(crash.Runtime)
+	if slot == nil {
+		log.Errorf("failed to route crash for unknown runtime %q", crash.Runtime)
+		return false
+	}
+	if err := slot.runtime.Reporter().Symbolize(crash.Report); err != nil {
 		log.Errorf("failed to symbolize report: %v", err)
 	}
 	if crash.Type == crash_pkg.MemoryLeak {
@@ -706,9 +839,13 @@ func (mgr *Manager) saveCrash(crash *manager.Crash) bool {
 	if crash.Suppressed {
 		flags += " [suppressed]"
 	}
-	log.Logf(0, "VM %v: crash: %v%v", crash.InstanceIndex, crash.Report.Title, flags)
+	logPrefix := fmt.Sprintf("VM %v", crash.InstanceIndex)
+	if crash.Runtime != "" {
+		logPrefix = fmt.Sprintf("%s VM %v", crash.Runtime, crash.InstanceIndex)
+	}
+	log.Logf(0, "%s: crash: %v%v", logPrefix, crash.Report.Title, flags)
 	for i, report := range crash.TailReports {
-		log.Logf(0, "VM %v: crash(tail%d): %v%v", crash.InstanceIndex, i, report.Title, flags)
+		log.Logf(0, "%s: crash(tail%d): %v%v", logPrefix, i, report.Title, flags)
 	}
 
 	if mgr.mode.FailOnCrashes {
@@ -728,13 +865,17 @@ func (mgr *Manager) saveCrash(crash *manager.Crash) bool {
 
 	mgr.statCrashes.Add(1)
 	mgr.mu.Lock()
-	if !mgr.crashTypes[crash.Title] {
-		mgr.crashTypes[crash.Title] = true
+	titleKey := crash.Title
+	if crash.Runtime != "" && mgr.displayCfg.IsMultiRuntime() {
+		titleKey = crash.Runtime + "\x00" + crash.Title
+	}
+	if !mgr.crashTypes[titleKey] {
+		mgr.crashTypes[titleKey] = true
 		mgr.statCrashTypes.Add(1)
 	}
 	mgr.mu.Unlock()
 
-	if mgr.dash != nil {
+	if slot == mgr.primary && mgr.dash != nil {
 		if crash.Type == crash_pkg.MemoryLeak {
 			return true
 		}
@@ -758,7 +899,7 @@ func (mgr *Manager) saveCrash(crash *manager.Crash) bool {
 		// There is 0 chance that one will ever look in the crashes/ folder of those instances.
 		return mgr.cfg.Reproduce && resp.NeedRepro
 	}
-	first, err := mgr.crashStore.SaveCrash(crash)
+	first, err := slot.crashStore.SaveCrash(crash)
 	if err != nil {
 		log.Logf(0, "failed to save the crash: %v", err)
 		return false
@@ -766,25 +907,32 @@ func (mgr *Manager) saveCrash(crash *manager.Crash) bool {
 	if first {
 		go mgr.emailCrash(crash)
 	}
-	return mgr.NeedRepro(crash)
+	return mgr.needReproOn(slot, crash)
 }
 
-func (mgr *Manager) needLocalRepro(crash *manager.Crash) bool {
-	if !mgr.cfg.Reproduce || crash.Corrupted || crash.Suppressed {
+func (mgr *Manager) needLocalReproOn(slot *managedRuntime, crash *manager.Crash) bool {
+	if !slot.cfg.Reproduce || crash.Corrupted || crash.Suppressed {
 		return false
 	}
-	if mgr.crashStore.HasRepro(crash.Title) {
+	if slot.crashStore.HasRepro(crash.Title) {
 		return false
 	}
-	return mgr.crashStore.MoreReproAttempts(crash.Title)
+	return slot.crashStore.MoreReproAttempts(crash.Title)
 }
 
 func (mgr *Manager) NeedRepro(crash *manager.Crash) bool {
-	if !mgr.cfg.Reproduce {
+	return mgr.needReproOn(mgr.primary, crash)
+}
+
+func (mgr *Manager) needReproOn(slot *managedRuntime, crash *manager.Crash) bool {
+	if slot == nil || !slot.cfg.Reproduce {
 		return false
 	}
 	if crash.FromHub || crash.FromDashboard {
 		return true
+	}
+	if slot.shadow {
+		return mgr.needLocalReproOn(slot, crash)
 	}
 	mgr.mu.Lock()
 	phase, features := mgr.phase, mgr.enabledFeatures
@@ -795,7 +943,7 @@ func (mgr *Manager) NeedRepro(crash *manager.Crash) bool {
 		return false
 	}
 	if mgr.dashRepro == nil {
-		return mgr.needLocalRepro(crash)
+		return mgr.needLocalReproOn(slot, crash)
 	}
 	cid := &dashapi.CrashID{
 		BuildID:    mgr.cfg.Tag,
@@ -820,11 +968,19 @@ func truncateReproLog(log []byte) []byte {
 }
 
 func (mgr *Manager) saveFailedRepro(rep *report.Report, stats *repro.Stats, reproErr error) {
-	reproLog := stats.FullLog()
-	if reproLog == nil && reproErr != nil {
+	mgr.saveFailedReproOn(mgr.primary, rep, stats, reproErr)
+}
+
+func (mgr *Manager) saveFailedReproOn(slot *managedRuntime, rep *report.Report,
+	stats *repro.Stats, reproErr error) {
+	var reproLog []byte
+	if stats != nil {
+		reproLog = stats.FullLog()
+	}
+	if len(reproLog) == 0 && reproErr != nil {
 		reproLog = []byte(fmt.Sprintf("reproduction failed: %v", reproErr))
 	}
-	if mgr.dash != nil {
+	if slot == mgr.primary && mgr.dash != nil {
 		if rep.Type == crash_pkg.MemoryLeak {
 			// Don't send failed leak repro attempts to dashboard
 			// as we did not send the crash itself.
@@ -845,21 +1001,25 @@ func (mgr *Manager) saveFailedRepro(rep *report.Report, stats *repro.Stats, repr
 		}
 		return
 	}
-	err := mgr.crashStore.SaveFailedRepro(rep.Title, reproLog)
+	err := slot.crashStore.SaveFailedRepro(rep.Title, reproLog)
 	if err != nil {
 		log.Logf(0, "failed to save repro log for %q: %v", rep.Title, err)
 	}
 }
 
 func (mgr *Manager) saveRepro(res *manager.ReproResult) {
+	mgr.saveReproOn(mgr.primary, res)
+}
+
+func (mgr *Manager) saveReproOn(slot *managedRuntime, res *manager.ReproResult) {
 	repro := res.Repro
 	opts := fmt.Sprintf("# %+v\n", repro.Opts)
 	progText := repro.Prog.Serialize()
 
 	// Append this repro to repro list to send to hub if it didn't come from hub originally.
-	if !res.Crash.FromHub {
+	if slot == mgr.primary && !res.Crash.FromHub {
 		progForHub := []byte(fmt.Sprintf("# %+v\n# %v\n# %v\n%s",
-			repro.Opts, repro.Report.Title, mgr.cfg.Tag, progText))
+			repro.Opts, repro.Report.Title, slot.cfg.Tag, progText))
 		mgr.mu.Lock()
 		mgr.newRepros = append(mgr.newRepros, progForHub)
 		mgr.mu.Unlock()
@@ -874,7 +1034,7 @@ func (mgr *Manager) saveRepro(res *manager.ReproResult) {
 		}
 	}
 
-	if mgr.dash != nil {
+	if slot == mgr.primary && mgr.dash != nil {
 		// Note: we intentionally don't set Corrupted for reproducers:
 		// 1. This is reproducible so can be debugged even with corrupted report.
 		// 2. Repro re-tried 3 times and still got corrupted report at the end,
@@ -894,7 +1054,7 @@ func (mgr *Manager) saveRepro(res *manager.ReproResult) {
 		}
 
 		dc := &dashapi.Crash{
-			BuildID:       mgr.cfg.Tag,
+			BuildID:       slot.cfg.Tag,
 			Title:         reproReport.Title,
 			AltTitles:     reproReport.AltTitles,
 			Suppressed:    reproReport.Suppressed,
@@ -918,14 +1078,14 @@ func (mgr *Manager) saveRepro(res *manager.ReproResult) {
 			return
 		}
 	}
-	err := mgr.crashStore.SaveRepro(res, append([]byte(opts), progText...), cprogText)
+	err := slot.crashStore.SaveRepro(res, append([]byte(opts), progText...), cprogText)
 	if err != nil {
 		log.Logf(0, "%s", err)
 	}
 }
 
 func (mgr *Manager) ResizeReproPool(size int) {
-	mgr.pool.ReserveForRun(size)
+	mgr.runtime.Pool().ReserveForRun(size)
 }
 
 func (mgr *Manager) uploadReproAssets(repro *repro.Result) []dashapi.NewAsset {
@@ -964,12 +1124,12 @@ func (mgr *Manager) uploadReproAssets(repro *repro.Result) []dashapi.NewAsset {
 	return ret
 }
 
-func (mgr *Manager) extractMemoryDump(inst *vm.Instance, rep *report.Report) string {
+func (mgr *Manager) extractMemoryDump(slot *managedRuntime, inst *vm.Instance, rep *report.Report) string {
 	if !rep.Panicked {
 		// We can only collect a memory dump from a kernel that panicked.
 		return ""
 	}
-	if mgr.crashStore.HasMemoryDump(rep.Title) {
+	if slot.crashStore.HasMemoryDump(rep.Title) {
 		// Keep only one memory dump to save disk space.
 		// For now let it be the first one.
 		return ""
@@ -979,7 +1139,7 @@ func (mgr *Manager) extractMemoryDump(inst *vm.Instance, rep *report.Report) str
 		log.Errorf("failed to create temp file for memory dump: %v", err)
 		return ""
 	}
-	if err := instance.ExtractMemoryDump(inst, mgr.sysTarget, tmpPath); err != nil {
+	if err := instance.ExtractMemoryDump(inst, slot.cfg.SysTarget, tmpPath); err != nil {
 		log.Logf(0, "VM %v: failed to extract memory dump: %v", inst.Index(), err)
 		os.Remove(tmpPath)
 		return ""
@@ -1127,8 +1287,37 @@ func (mgr *Manager) BugFrames() (leaks, races []string) {
 
 func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 	enabledSyscalls map[*prog.Syscall]bool) error {
+	return mgr.machineCheckedAndSetSource(mgr.primary, features, enabledSyscalls)
+}
+
+func (mgr *Manager) machineCheckedAndSetSource(slot *managedRuntime, features flatrpc.Feature,
+	enabledSyscalls map[*prog.Syscall]bool) error {
+	source, err := mgr.machineChecked(slot, features, enabledSyscalls)
+	if err != nil {
+		return err
+	}
+	serv := slot.runtime.Server()
+	if serv == nil {
+		return fmt.Errorf("runtime server %q is not available", slot.name)
+	}
+	serv.SetSource(source)
+	return nil
+}
+
+func (mgr *Manager) machineChecked(slot *managedRuntime, features flatrpc.Feature,
+	enabledSyscalls map[*prog.Syscall]bool) (queue.Source, error) {
 	if len(enabledSyscalls) == 0 {
-		return fmt.Errorf("all system calls are disabled")
+		return nil, fmt.Errorf("all system calls are disabled")
+	}
+	slot.features = features
+	if slot.shadow {
+		if mgr.programRegistry == nil {
+			return nil, fmt.Errorf("shadow runtime %q has no program registry", slot.name)
+		}
+		opts := fuzzer.DefaultExecOpts(slot.cfg, features, *flagDebug)
+		source := mgr.programRegistry.EnsureRuntime(slot.name, slot.cfg.Target, enabledSyscalls)
+		source = queue.DefaultOpts(source, opts)
+		return source, nil
 	}
 	if mgr.mode.ExitAfterMachineCheck {
 		mgr.exit(mgr.mode.Name)
@@ -1143,7 +1332,7 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 		}
 		data, err := kfuzztest.ExtractData(path.Join(mgr.cfg.KernelObj, "vmlinux"))
 		if err != nil {
-			return err
+			return nil, err
 		}
 		for _, call := range data.Calls {
 			enabledSyscalls[call] = true
@@ -1182,10 +1371,11 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 			Coverage:       mgr.cfg.Cover,
 			FaultInjection: features&flatrpc.FeatureFault != 0,
 			Comparisons:    features&flatrpc.FeatureComparisons != 0,
-			Collide:        true,
+			Collide:        mgr.cfg.Collide,
 			EnabledCalls:   enabledSyscalls,
 			NoMutateCalls:  mgr.cfg.NoMutateCalls,
 			FetchRawCover:  mgr.cfg.RawCover,
+			Workdir:        mgr.cfg.Workdir,
 			Logf: func(level int, msg string, args ...any) {
 				if level != 0 {
 					return
@@ -1196,6 +1386,11 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 				mgr.mu.Lock()
 				defer mgr.mu.Unlock()
 				return !mgr.saturatedCalls[call]
+			},
+			GeneratedProgram: func(req *queue.Request) {
+				if mgr.programRegistry != nil {
+					mgr.programRegistry.registerPrimary(slot.name, req)
+				}
 			},
 			ModeKFuzzTest: mgr.cfg.Experimental.EnableKFuzzTest,
 		}, rnd, mgr.target)
@@ -1212,19 +1407,20 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 				go mgr.dashboardReproTasks()
 			}
 		}
-		source := queue.DefaultOpts(fuzzerObj, opts)
-		mgr.serv.SetSource(source)
-		return nil
+		var source queue.Source = fuzzerObj
+		if mgr.programRegistry != nil {
+			source = mgr.programRegistry.sourceForRuntime(slot.name, source)
+		}
+		source = queue.DefaultOpts(source, opts)
+		return source, nil
 	case ModeCorpusRun:
 		ctx := &corpusRunner{
 			candidates: candidates,
 			rnd:        rand.New(rand.NewSource(time.Now().UnixNano())),
 		}
-		mgr.serv.SetSource(queue.DefaultOpts(ctx, opts))
-		return nil
+		return queue.DefaultOpts(ctx, opts), nil
 	case ModeRunTests:
-		mgr.runTestsMode(features, enabledSyscalls)
-		return nil
+		return mgr.runTestsMode(features, enabledSyscalls), nil
 	case ModeIfaceProbe:
 		exec := queue.Plain()
 		go func() {
@@ -1238,13 +1434,12 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 			}
 			mgr.exit("interface probe")
 		}()
-		mgr.serv.SetSource(exec)
-		return nil
+		return exec, nil
 	}
 	panic(fmt.Sprintf("unexpected mode %q", mgr.mode.Name))
 }
 
-func (mgr *Manager) runTestsMode(features flatrpc.Feature, enabledSyscalls map[*prog.Syscall]bool) {
+func (mgr *Manager) runTestsMode(features flatrpc.Feature, enabledSyscalls map[*prog.Syscall]bool) queue.Source {
 	ctx := &runtest.Context{
 		Dir:      filepath.Join(mgr.cfg.Syzkaller, "sys", mgr.cfg.Target.OS, "test"),
 		Target:   mgr.cfg.Target,
@@ -1287,7 +1482,7 @@ func (mgr *Manager) runTestsMode(features flatrpc.Feature, enabledSyscalls map[*
 		}
 		mgr.exit("tests")
 	}()
-	mgr.serv.SetSource(ctx)
+	return ctx
 }
 
 type corpusRunner struct {
@@ -1332,6 +1527,13 @@ func (mgr *Manager) MaxSignal() signal.Signal {
 }
 
 func (mgr *Manager) fuzzerLoop(fuzzer *fuzzer.Fuzzer) {
+	// A shadow runtime does not collect feedback, but its executor still uses
+	// max_signal as a read-only filter. Send the complete primary signal once
+	// after the fuzzer is initialized so shadows that connected earlier don't
+	// start with an empty map.
+	if mgr.cfg.Cover && !mgr.cfg.Snapshot && mgr.displayCfg.IsMultiRuntime() {
+		mgr.distributeSignalDelta(fuzzer.Cover.CopyMaxSignal())
+	}
 	for ; ; time.Sleep(time.Second / 2) {
 		if mgr.cfg.Cover && !mgr.cfg.Snapshot {
 			// Distribute new max signal over all instances.
@@ -1340,7 +1542,7 @@ func (mgr *Manager) fuzzerLoop(fuzzer *fuzzer.Fuzzer) {
 				log.Logf(3, "distributing %d new signal", len(newSignal))
 			}
 			if len(newSignal) != 0 {
-				mgr.serv.DistributeSignalDelta(newSignal)
+				mgr.distributeSignalDelta(newSignal)
 			}
 		}
 
@@ -1353,7 +1555,9 @@ func (mgr *Manager) fuzzerLoop(fuzzer *fuzzer.Fuzzer) {
 			switch mgr.phase {
 			case phaseLoadedCorpus:
 				if !mgr.cfg.Snapshot {
-					mgr.serv.TriagedCorpus()
+					if serv := mgr.runtime.Server(); serv != nil {
+						serv.TriagedCorpus()
+					}
 				}
 				if mgr.cfg.HubClient != "" {
 					mgr.setPhaseLocked(phaseTriagedCorpus)
@@ -1366,6 +1570,14 @@ func (mgr *Manager) fuzzerLoop(fuzzer *fuzzer.Fuzzer) {
 				mgr.setPhaseLocked(phaseTriagedHub)
 			}
 			mgr.mu.Unlock()
+		}
+	}
+}
+
+func (mgr *Manager) distributeSignalDelta(plus signal.Signal) {
+	for _, slot := range mgr.runtimeList() {
+		if serv := slot.runtime.Server(); serv != nil {
+			serv.DistributeSignalDelta(plus)
 		}
 	}
 }

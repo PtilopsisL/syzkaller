@@ -44,7 +44,10 @@ func (mgr *Manager) initStats() {
 	mgr.statAvgBootTime = stat.New("instance restart", "Average VM restart time (sec)",
 		stat.NoGraph,
 		func() int {
-			return int(mgr.pool.BootTime.Value().Seconds())
+			if pool := mgr.runtime.Pool(); pool != nil {
+				return int(pool.BootTime.Value().Seconds())
+			}
+			return 0
 		},
 		func(v int, _ time.Duration) string {
 			return fmt.Sprintf("%v sec", v)

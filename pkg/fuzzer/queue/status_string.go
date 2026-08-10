@@ -13,11 +13,12 @@ func _() {
 	_ = x[Crashed-2]
 	_ = x[Restarted-3]
 	_ = x[Hanged-4]
+	_ = x[Unsupported-5]
 }
 
-const _Status_name = "SuccessExecFailureCrashedRestartedHanged"
+const _Status_name = "SuccessExecFailureCrashedRestartedHangedUnsupported"
 
-var _Status_index = [...]uint8{0, 7, 18, 25, 34, 40}
+var _Status_index = [...]uint8{0, 7, 18, 25, 34, 40, 51}
 
 func (i Status) String() string {
 	idx := int(i) - 0

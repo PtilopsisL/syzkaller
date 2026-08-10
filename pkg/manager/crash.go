@@ -27,6 +27,8 @@ import (
 type CrashStore struct {
 	Tag          string
 	BaseDir      string
+	Namespace    string
+	Runtime      string
 	MaxCrashLogs int
 	MaxReproLogs int
 	Extractor    *subsystem.Extractor
@@ -202,7 +204,7 @@ type BugReport struct {
 }
 
 func (cs *CrashStore) Report(id string) (*BugReport, error) {
-	dir := filepath.Join(cs.BaseDir, "crashes", id)
+	dir := filepath.Join(cs.crashDir(), id)
 	desc, err := os.ReadFile(filepath.Join(dir, "description"))
 	if err != nil {
 		return nil, err
@@ -230,6 +232,7 @@ type CrashInfo struct {
 
 type BugInfo struct {
 	ID             string
+	Runtime        string
 	Title          string
 	TailTitles     []*report.TitleFreqRank
 	FirstTime      time.Time
@@ -245,9 +248,12 @@ type BugInfo struct {
 }
 
 func (cs *CrashStore) BugInfo(id string, full bool) (*BugInfo, error) {
-	dir := filepath.Join(cs.BaseDir, "crashes", id)
+	dir := filepath.Join(cs.crashDir(), id)
 
-	ret := &BugInfo{ID: id}
+	ret := &BugInfo{
+		ID:      id,
+		Runtime: cs.Runtime,
+	}
 	desc, err := os.ReadFile(filepath.Join(dir, "description"))
 	if err != nil {
 		return nil, err
@@ -282,7 +288,7 @@ func (cs *CrashStore) BugInfo(id string, full bool) (*BugInfo, error) {
 			if err == nil {
 				ret.Crashes = append(ret.Crashes, &CrashInfo{
 					Index: int(index),
-					Log:   filepath.Join("crashes", id, f),
+					Log:   filepath.Join(cs.crashRelDir(), id, f),
 				})
 			}
 		} else if f == reproFileName {
@@ -290,11 +296,11 @@ func (cs *CrashStore) BugInfo(id string, full bool) (*BugInfo, error) {
 		} else if f == cReproFileName {
 			ret.HasCRepro = true
 		} else if f == straceFileName {
-			ret.StraceFile = filepath.Join(dir, f)
+			ret.StraceFile = filepath.Join(cs.crashRelDir(), id, f)
 		} else if strings.HasPrefix(f, "repro") {
 			ret.ReproAttempts++
 		} else if f == "vmcore" {
-			ret.MemoryDumpFile = filepath.Join("crashes", id, f)
+			ret.MemoryDumpFile = filepath.Join(cs.crashRelDir(), id, f)
 		}
 	}
 	if !full {
@@ -306,7 +312,7 @@ func (cs *CrashStore) BugInfo(id string, full bool) (*BugInfo, error) {
 		}
 		tag, _ := os.ReadFile(filepath.Join(dir, fmt.Sprintf("tag%d", crash.Index)))
 		crash.Tag = string(tag)
-		reportFile := filepath.Join("crashes", id, fmt.Sprintf("report%d", crash.Index))
+		reportFile := filepath.Join(cs.crashRelDir(), id, fmt.Sprintf("report%d", crash.Index))
 		if osutil.IsExist(filepath.Join(cs.BaseDir, reportFile)) {
 			crash.Report = reportFile
 		}
@@ -381,7 +387,7 @@ func (cs *CrashStore) querySubsystems(dir, title string) ([]string, error) {
 }
 
 func (cs *CrashStore) BugList() ([]*BugInfo, error) {
-	dirs, err := osutil.ListDir(filepath.Join(cs.BaseDir, "crashes"))
+	dirs, err := osutil.ListDir(cs.crashDir())
 	if err != nil {
 		if os.IsNotExist(err) {
 			// If there were no crashes, it's okay that there's no such folder.
@@ -416,7 +422,19 @@ func crashHash(title string) string {
 }
 
 func (cs *CrashStore) path(title string) string {
-	return filepath.Join(cs.BaseDir, "crashes", crashHash(title))
+	return filepath.Join(cs.crashDir(), crashHash(title))
+}
+
+func (cs *CrashStore) crashDir() string {
+	return filepath.Join(cs.BaseDir, cs.crashRelDir())
+}
+
+func (cs *CrashStore) crashRelDir() string {
+	dir := "crashes"
+	if cs.Namespace != "" {
+		dir = filepath.Join(dir, cs.Namespace)
+	}
+	return dir
 }
 
 func (cs *CrashStore) HasMemoryDump(title string) bool {

@@ -8,7 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,6 +31,7 @@ type Runner struct {
 	source          *queue.Distributor
 	procs           int
 	cover           bool
+	layout          bool // executor auxiliary mappings; cover controls feedback collection.
 	coverEdges      bool
 	filterSignal    bool
 	debug           bool
@@ -47,6 +51,7 @@ type Runner struct {
 	updInfo         UpdateInfo
 	resultCh        chan error
 	lastRequestTime time.Time
+	workdir         string
 
 	// The mutex protects all the fields below.
 	mu          sync.Mutex
@@ -94,7 +99,7 @@ func (runner *Runner) Handshake(conn *flatrpc.Conn, cfg *handshakeConfig) (hands
 
 	connectReply := &flatrpc.ConnectReply{
 		Debug:            runner.debug,
-		Cover:            runner.cover,
+		Cover:            runner.layout,
 		CoverEdges:       runner.coverEdges,
 		Kernel64Bit:      runner.sysTarget.PtrSize == 8,
 		Procs:            int32(runner.procs),
@@ -468,6 +473,7 @@ func (runner *Runner) handleExecResult(msg *flatrpc.ExecResult) error {
 			// filtered out.
 			addFallbackSignal(req.Prog, msg.Info)
 		}
+		runner.saveSctraceLogs(req, msg)
 	}
 	status := queue.Success
 	var resErr error
@@ -493,6 +499,65 @@ func (runner *Runner) handleExecResult(msg *flatrpc.ExecResult) error {
 		Err:    resErr,
 	})
 	return nil
+}
+
+func (runner *Runner) saveSctraceLogs(req *queue.Request, msg *flatrpc.ExecResult) {
+	if msg.Info == nil || req == nil {
+		return
+	}
+	dir := "strace-log"
+	if runner.workdir != "" {
+		dir = filepath.Join(runner.workdir, "strace-log")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Logf(0, "failed to create sctrace directory: %v", err)
+		return
+	}
+	var buf bytes.Buffer
+	for _, call := range msg.Info.Calls {
+		if call == nil || len(call.Sctrace) == 0 {
+			continue
+		}
+		buf.Write(call.Sctrace)
+		if call.Sctrace[len(call.Sctrace)-1] != '\n' {
+			buf.WriteByte('\n')
+		}
+	}
+	if buf.Len() == 0 {
+		return
+	}
+	count := nextSctraceCount(dir, req.ProgID)
+	name := fmt.Sprintf("strace.prog%d.%d.log", req.ProgID, count)
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		log.Logf(0, "failed to save sctrace log %q: %v", path, err)
+	}
+}
+
+func nextSctraceCount(dir string, progID int64) int {
+	pattern := filepath.Join(dir, fmt.Sprintf("strace.prog%d.*.log", progID))
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return 1
+	}
+	prefix := fmt.Sprintf("strace.prog%d.", progID)
+	const suffix = ".log"
+	maxCount := 0
+	for _, match := range matches {
+		base := filepath.Base(match)
+		if !strings.HasPrefix(base, prefix) || !strings.HasSuffix(base, suffix) {
+			continue
+		}
+		value := strings.TrimSuffix(strings.TrimPrefix(base, prefix), suffix)
+		count, err := strconv.Atoi(value)
+		if err != nil {
+			continue
+		}
+		if count > maxCount {
+			maxCount = count
+		}
+	}
+	return maxCount + 1
 }
 
 func (runner *Runner) convertCallInfo(call *flatrpc.CallInfo) {

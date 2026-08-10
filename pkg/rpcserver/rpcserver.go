@@ -62,6 +62,9 @@ type Config struct {
 	VMType string
 	RPC    string
 	VMLess bool
+	// CoverageLayout controls executor auxiliary mappings independently of
+	// vminfo.Config.Cover, which controls feedback collection.
+	CoverageLayout bool
 	// Hash adjacent PCs to form fuzzing feedback signal (otherwise just use coverage PCs as signal).
 	UseCoverEdges bool
 	// Filter signal/comparisons against target kernel text/data ranges.
@@ -74,6 +77,7 @@ type Config struct {
 	Slowdown      int
 	ExecutorBin   string
 	Timeouts      targets.Timeouts
+	Workdir       string
 	pcBase        uint64
 	localModules  []*vminfo.KernelModule
 
@@ -143,7 +147,7 @@ func NewNamedStats(name string) Stats {
 	}
 	return Stats{
 		StatExecs: stat.New("exec total"+suffix, "Total test program executions",
-			stat.Console, stat.Rate{}, stat.Prometheus("syz_exec_total"+name),
+			stat.Console, stat.Rate{}, stat.Prometheus(prometheusMetricName("syz_exec_total", name)),
 		),
 		StatNumFuzzing: stat.New("fuzzing VMs"+suffix,
 			"Number of VMs that are currently fuzzing", stat.Graph("fuzzing VMs"),
@@ -156,6 +160,27 @@ func NewNamedStats(name string) Stats {
 		StatExecutorRestarts: stat.New("executor restarts"+suffix,
 			"Number of times executor process was restarted", stat.Rate{}, stat.Graph("executor")),
 	}
+}
+
+func prometheusMetricName(base, suffix string) string {
+	if suffix == "" {
+		return base
+	}
+	var ret strings.Builder
+	ret.WriteString(base)
+	ret.WriteByte('_')
+	for _, ch := range suffix {
+		switch {
+		case ch >= 'a' && ch <= 'z',
+			ch >= 'A' && ch <= 'Z',
+			ch >= '0' && ch <= '9',
+			ch == '_':
+			ret.WriteRune(ch)
+		default:
+			ret.WriteByte('_')
+		}
+	}
+	return ret.String()
 }
 
 func New(cfg *RemoteConfig) (Server, error) {
@@ -190,10 +215,11 @@ func New(cfg *RemoteConfig) (Server, error) {
 			Sandbox:    sandbox,
 			SandboxArg: cfg.SandboxArg,
 		},
-		Stats:  cfg.Stats,
-		VMArch: cfg.TargetVMArch,
-		RPC:    cfg.RPC,
-		VMLess: cfg.VMLess,
+		Stats:          cfg.Stats,
+		VMArch:         cfg.TargetVMArch,
+		RPC:            cfg.RPC,
+		VMLess:         cfg.VMLess,
+		CoverageLayout: cfg.CoverageLayout,
 		// gVisor coverage is not a trace, so producing edges won't work.
 		UseCoverEdges: cfg.Experimental.CoverEdges && cfg.Type != targets.GVisor,
 		// gVisor/Starnix are not Linux, so filtering against Linux ranges won't work.
@@ -204,9 +230,17 @@ func New(cfg *RemoteConfig) (Server, error) {
 		Slowdown:          cfg.Timeouts.Slowdown,
 		ExecutorBin:       cfg.ExecutorBin,
 		Timeouts:          cfg.Timeouts,
+		Workdir:           cfg.Workdir,
 		pcBase:            pcBase,
 		localModules:      cfg.LocalModules,
 	}, cfg.Manager), nil
+}
+
+// coverageLayout reports whether executor auxiliary shared mappings should be
+// installed. The fallback to Cover keeps hand-constructed Config values (used
+// by local callers and tests) compatible with the pre-multi-runtime behavior.
+func (serv *server) coverageLayout() bool {
+	return serv.cfg.CoverageLayout || serv.cfg.Cover
 }
 
 func newImpl(cfg *Config, mgr Manager) *server {
@@ -445,7 +479,7 @@ func (serv *server) connectionLoop(ctx context.Context, runner *Runner) error {
 		runner.Stop()
 	}()
 
-	if serv.cfg.Cover {
+	if serv.coverageLayout() {
 		maxSignal := serv.mgr.MaxSignal().ToRaw()
 		for len(maxSignal) != 0 {
 			// Split coverage into batches to not grow the connection serialization
@@ -565,6 +599,7 @@ func (serv *server) CreateInstance(id int, injectExec chan<- bool, updInfo Updat
 		id:            id,
 		source:        serv.execSource,
 		cover:         serv.cfg.Cover,
+		layout:        serv.coverageLayout(),
 		coverEdges:    serv.cfg.UseCoverEdges,
 		filterSignal:  serv.cfg.FilterSignal,
 		debug:         serv.cfg.Debug,
@@ -576,6 +611,7 @@ func (serv *server) CreateInstance(id int, injectExec chan<- bool, updInfo Updat
 		requests:      make(map[int64]*queue.Request),
 		executing:     make(map[int64]bool),
 		hanged:        make(map[int64]bool),
+		workdir:       serv.cfg.Workdir,
 		// Executor may report proc IDs that are larger than serv.cfg.Procs.
 		lastExec: MakeLastExecuting(prog.MaxPids, 6),
 		stats:    serv.runnerStats,

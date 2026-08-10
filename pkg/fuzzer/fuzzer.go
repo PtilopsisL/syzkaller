@@ -66,6 +66,7 @@ func NewFuzzer(ctx context.Context, cfg *Config, rnd *rand.Rand,
 		ctRegenerate: make(chan struct{}),
 	}
 	f.execQueues = newExecQueues(f)
+
 	f.updateChoiceTable(nil)
 	go f.choiceTableUpdater()
 	if cfg.Debug {
@@ -86,6 +87,7 @@ type execQueues struct {
 	candidateQueue       *queue.PlainQueue
 	triageQueue          *queue.DynamicOrderer
 	smashQueue           *queue.PlainQueue
+	straceQueue          *queue.PlainQueue
 	source               queue.Source
 }
 
@@ -95,6 +97,7 @@ func newExecQueues(fuzzer *Fuzzer) execQueues {
 		candidateQueue:       queue.Plain(),
 		triageQueue:          queue.DynamicOrder(),
 		smashQueue:           queue.Plain(),
+		straceQueue:          queue.Plain(),
 	}
 	// Alternate smash jobs with exec/fuzz to spread attention to the wider area.
 	skipQueue := 3
@@ -104,12 +107,14 @@ func newExecQueues(fuzzer *Fuzzer) execQueues {
 		// mutating various corpus programs.
 		skipQueue = 2
 	}
+
 	// Sources are listed in the order, in which they will be polled.
 	ret.source = queue.Order(
 		ret.triageCandidateQueue,
 		ret.candidateQueue,
 		ret.triageQueue,
 		queue.Alternate(ret.smashQueue, skipQueue),
+		ret.straceQueue,
 		queue.Callback(fuzzer.genFuzz),
 	)
 	return ret
@@ -212,20 +217,22 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 }
 
 type Config struct {
-	Debug          bool
-	Corpus         *corpus.Corpus
-	Logf           func(level int, msg string, args ...any)
-	Snapshot       bool
-	Coverage       bool
-	FaultInjection bool
-	Comparisons    bool
-	Collide        bool
-	EnabledCalls   map[*prog.Syscall]bool
-	NoMutateCalls  map[int]bool
-	FetchRawCover  bool
-	NewInputFilter func(call string) bool
-	PatchTest      bool
-	ModeKFuzzTest  bool
+	Debug            bool
+	Corpus           *corpus.Corpus
+	Logf             func(level int, msg string, args ...any)
+	GeneratedProgram func(*queue.Request)
+	Snapshot         bool
+	Coverage         bool
+	FaultInjection   bool
+	Comparisons      bool
+	Collide          bool
+	EnabledCalls     map[*prog.Syscall]bool
+	NoMutateCalls    map[int]bool
+	FetchRawCover    bool
+	NewInputFilter   func(call string) bool
+	PatchTest        bool
+	ModeKFuzzTest    bool
+	Workdir          string
 }
 
 func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call int, triage *map[int]*triageCall) {
@@ -304,6 +311,12 @@ func (fuzzer *Fuzzer) genFuzz() *queue.Request {
 			Stat: fuzzer.statExecCollide,
 		}
 	}
+
+	if fuzzer.Config.GeneratedProgram != nil && req != nil && req.Prog != nil {
+		fuzzer.Config.GeneratedProgram(req)
+	}
+
+	// Install processResult callback.
 	fuzzer.prepare(req, 0, 0)
 	return req
 }
@@ -334,12 +347,17 @@ func (fuzzer *Fuzzer) startJob(stat *stat.Val, newJob job) {
 }
 
 func (fuzzer *Fuzzer) Next() *queue.Request {
-	req := fuzzer.source.Next()
-	if req == nil {
-		// The fuzzer is not supposed to issue nil requests.
-		panic("nil request from the fuzzer")
+	for {
+		req := fuzzer.source.Next()
+		if req == nil {
+			// The fuzzer is not supposed to issue nil requests.
+			panic("nil request from the fuzzer")
+		}
+		if fuzzer.maybeStraceProg(req) {
+			continue
+		}
+		return req
 	}
-	return req
 }
 
 func (fuzzer *Fuzzer) Logf(level int, msg string, args ...any) {

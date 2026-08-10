@@ -119,6 +119,7 @@ func (serv *snapshotServer) RunRequests(ctx context.Context, inst *vm.Instance,
 		if serv.cfg.Stats.StatExecs != nil {
 			serv.cfg.Stats.StatExecs.Add(1)
 		}
+		req.ExecOpts.EnvFlags = snapshotEnvFlags(req.ExecOpts.EnvFlags)
 		if first {
 			envFlags = req.ExecOpts.EnvFlags
 			if err := serv.snapshotSetup(inst, builder, envFlags); err != nil {
@@ -161,6 +162,12 @@ func (serv *snapshotServer) RunRequests(ctx context.Context, inst *vm.Instance,
 		req.Done(res)
 	}
 	return nil, nil
+}
+
+func snapshotEnvFlags(flags flatrpc.ExecEnv) flatrpc.ExecEnv {
+	// Snapshot executor does not initialize syscall trace buffers, and environment flags
+	// are fixed when the snapshot is created rather than supplied with each request.
+	return flags &^ flatrpc.ExecEnvSyscallTrace
 }
 
 func (serv *snapshotServer) snapshotSetup(inst *vm.Instance, builder *flatbuffers.Builder, env flatrpc.ExecEnv) error {

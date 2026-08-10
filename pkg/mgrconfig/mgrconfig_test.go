@@ -43,6 +43,24 @@ func TestCanned(t *testing.T) {
 	}
 }
 
+func TestCollideConfig(t *testing.T) {
+	cfg, err := LoadPartialData([]byte(`{"target":"linux/amd64"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Collide {
+		t.Fatalf("default collide: got true, want false")
+	}
+
+	cfg, err = LoadPartialData([]byte(`{"target":"linux/amd64","collide":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Collide {
+		t.Fatalf("configured collide: got false, want true")
+	}
+}
+
 func TestMatchSyscall(t *testing.T) {
 	tests := []struct {
 		pattern string

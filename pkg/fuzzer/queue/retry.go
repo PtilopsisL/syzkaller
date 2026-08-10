@@ -33,7 +33,7 @@ func (r *retryer) Next() *Request {
 
 func (r *retryer) done(req *Request, res *Result) bool {
 	switch res.Status {
-	case Success, ExecFailure, Hanged:
+	case Success, ExecFailure, Hanged, Unsupported:
 		return true
 	case Restarted:
 		// The input was on a restarted VM.

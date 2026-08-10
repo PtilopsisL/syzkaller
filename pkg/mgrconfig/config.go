@@ -19,6 +19,10 @@ type Config struct {
 	HTTP string `json:"http"`
 	// TCP address to serve RPC for fuzzer processes (optional).
 	RPC string `json:"rpc,omitempty"`
+	// Fixed primary runtime name in multi-runtime mode.
+	PrimaryRuntime string `json:"primary,omitempty"`
+	// Optional per-runtime overrides in multi-runtime mode.
+	Runtimes []Runtime `json:"runtimes,omitempty"`
 	// Location of a working directory for the syz-manager process. Outputs here include:
 	// - <workdir>/crashes/*: crash output files
 	// - <workdir>/corpus.db: corpus with interesting programs
@@ -60,6 +64,12 @@ type Config struct {
 	KernelSubsystem []Subsystem `json:"kernel_subsystem,omitempty"`
 	// Arbitrary optional tag that is saved along with crash reports (e.g. branch/commit).
 	Tag string `json:"tag,omitempty"`
+	// Optional kernel release identity recorded with multi-runtime results.
+	KernelVersion string `json:"kernel_version,omitempty"`
+	// Optional JSON file containing manually reviewed multi-runtime diff labels.
+	RuntimeDiffLabels string `json:"runtime_diff_labels,omitempty"`
+	// Optional JSON overlay for syzlang-driven runtime output comparison policies.
+	RuntimeOutputPolicy string `json:"runtime_output_policy,omitempty"`
 	// Location of the disk image file.
 	Image string `json:"image,omitempty"`
 	// Location (on the host machine) of a root SSH identity to use for communicating with
@@ -145,6 +155,8 @@ type Config struct {
 
 	// Use KCOV coverage (default: true).
 	Cover bool `json:"cover"`
+	// Enable random collide/async transformations during normal fuzzing.
+	Collide bool `json:"collide"`
 
 	// CovFilter used to restrict the area of the kernel visible to syzkaller.
 	// DEPRECATED! Use the FocusAreas parameter instead.
@@ -233,7 +245,25 @@ type Config struct {
 	Experimental Experimental
 
 	// Implementation details beyond this point. Filled after parsing.
-	Derived `json:"-"`
+	Derived        `json:"-"`
+	RuntimeConfigs map[string]*Config `json:"-"`
+}
+
+type Runtime struct {
+	Name           string          `json:"name"`
+	KernelObj      string          `json:"kernel_obj,omitempty"`
+	KernelSrc      string          `json:"kernel_src,omitempty"`
+	KernelBuildSrc string          `json:"kernel_build_src,omitempty"`
+	Image          string          `json:"image,omitempty"`
+	SSHKey         string          `json:"sshkey,omitempty"`
+	Tag            string          `json:"tag,omitempty"`
+	KernelVersion  string          `json:"kernel_version,omitempty"`
+	Type           string          `json:"type,omitempty"`
+	VM             json.RawMessage `json:"vm,omitempty"`
+}
+
+func (cfg *Config) IsMultiRuntime() bool {
+	return len(cfg.RuntimeConfigs) != 0
 }
 
 // Experimental contains options that are not guaranteed to be backward- or forward-compatible
