@@ -168,10 +168,11 @@ func (kc *kernelContext) setupFuzzer(features flatrpc.Feature, syscalls map[*pro
 		// Fault injection may bring instaibility into bug reproducibility, which may lead to false positives.
 		FaultInjection: false,
 		Comparisons:    features&flatrpc.FeatureComparisons != 0,
-		Collide:        true,
+		Collide:        kc.cfg.Collide,
 		EnabledCalls:   syscalls,
 		NoMutateCalls:  kc.cfg.NoMutateCalls,
 		PatchTest:      true,
+		Workdir:        kc.cfg.Workdir,
 		Logf: func(level int, msg string, args ...any) {
 			if level != 0 {
 				return

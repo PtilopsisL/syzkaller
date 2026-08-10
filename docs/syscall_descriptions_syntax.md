@@ -178,6 +178,31 @@ foo {
 See [the corresponding section](syscall_descriptions_syntax.md#conditional-fields)
 for more details.
 
+Output fields and composite types may also declare how their values are compared
+in multi-runtime mode:
+
+```
+foo {
+	object	int64	(output_policy["object_identity"], output_domain["widget"])
+	sec	int64	(output_policy["timestamp"], output_scope["created"])
+	nsec	int32	(output_policy["timestamp"], output_scope["created"])
+}
+```
+
+`output_policy` accepts `semantic` (the default), `resource_identity`,
+`object_identity`, `address`, `timestamp`, `filesystem_identity`, `counter`,
+`reserved`, and `version_identity`. `output_domain` separates identity
+namespaces, `output_mode` selects a policy-specific comparison mode, and
+`output_scope` joins sibling fields into one semantic value. The same four
+attributes may be placed on a struct or union, where they are inherited by its
+output fields unless a more specific declaration overrides them.
+
+These attributes only affect the comparison view. Raw executor output is still
+recorded. `reserved` fields are omitted from comparison, while
+`version_identity` fields retain their value and are classified as expected
+version differences. A field without an applicable declaration continues to be
+compared exactly; resource-typed values retain the historical identity default.
+
 `out_overlay` attribute allows to have separate input and output layouts for the struct.
 Fields before the `out_overlay` field are input, fields starting from `out_overlay` are output.
 Input and output fields overlap in memory (both start from the beginning of the struct in memory).

@@ -47,10 +47,25 @@ func main() {
 		diff.PatchFocusAreas(newCfg, [][]byte{data}, nil, nil)
 	}
 
+	bugs := make(chan *diff.Bug, 16)
+
 	ctx := vm.ShutdownCtx()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case bug := <-bugs:
+				if bug != nil && bug.Report != nil {
+					log.Logf(0, "patched-only: %s", bug.Report.Title)
+				}
+			}
+		}
+	}()
 	err = diff.Run(ctx, baseCfg, newCfg, diff.Config{
-		Store: &manager.DiffFuzzerStore{BasePath: newCfg.Workdir},
-		Debug: *flagDebug,
+		Store:       &manager.DiffFuzzerStore{BasePath: newCfg.Workdir},
+		Debug:       *flagDebug,
+		PatchedOnly: bugs,
 	})
 	if err != nil {
 		log.Fatal(err)
