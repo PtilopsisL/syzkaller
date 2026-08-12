@@ -134,7 +134,6 @@ type shadowConsumer struct {
 	enabledCalls map[int]bool
 
 	mu            sync.Mutex
-	cond          *sync.Cond
 	priorityQueue []*queue.Request
 	queue         []storedProgram
 	priorityBurst int
@@ -195,12 +194,10 @@ func newShadowConsumer(target *prog.Target, enabledSyscalls map[*prog.Syscall]bo
 	for call := range enabledSyscalls {
 		enabled[call.ID] = true
 	}
-	consumer := &shadowConsumer{
+	return &shadowConsumer{
 		target:       target,
 		enabledCalls: enabled,
 	}
-	consumer.cond = sync.NewCond(&consumer.mu)
-	return consumer
 }
 
 func (coord *multiRuntimeCoordinator) EnsureRuntime(name string, target *prog.Target,
@@ -439,7 +436,6 @@ func (consumer *shadowConsumer) enqueue(program storedProgram) {
 		return
 	}
 	consumer.queue = append(consumer.queue, program)
-	consumer.cond.Signal()
 }
 
 func (consumer *shadowConsumer) enqueuePriority(req *queue.Request) {
@@ -449,7 +445,6 @@ func (consumer *shadowConsumer) enqueuePriority(req *queue.Request) {
 		return
 	}
 	consumer.priorityQueue = append(consumer.priorityQueue, req)
-	consumer.cond.Signal()
 }
 
 func (consumer *shadowConsumer) priorityLen() int {
@@ -459,11 +454,10 @@ func (consumer *shadowConsumer) priorityLen() int {
 }
 
 func (consumer *shadowConsumer) next() (*queue.Request, storedProgram, bool) {
+	// queue.Source.Next must not block: the RPC runner relies on nil results to
+	// service its idle loop and send VM keepalive requests.
 	consumer.mu.Lock()
 	defer consumer.mu.Unlock()
-	for len(consumer.priorityQueue) == 0 && len(consumer.queue) == 0 && !consumer.closed {
-		consumer.cond.Wait()
-	}
 	if len(consumer.priorityQueue) != 0 &&
 		(consumer.priorityBurst < shadowPriorityBurst || len(consumer.queue) == 0) {
 		req := consumer.priorityQueue[0]
@@ -488,7 +482,6 @@ func (consumer *shadowConsumer) close() {
 	consumer.mu.Lock()
 	defer consumer.mu.Unlock()
 	consumer.closed = true
-	consumer.cond.Broadcast()
 }
 
 func (consumer *shadowConsumer) supports(program *prog.Prog) bool {

@@ -280,43 +280,33 @@ func TestMultiRuntimeCoordinatorBalancesPriorityAndNormalShadowWork(t *testing.T
 	assert.Equal(t, int64(100+shadowPriorityBurst), req.ProgID)
 }
 
-func TestMultiRuntimeCoordinatorWakesAllShadowPriorityWaiters(t *testing.T) {
+func TestMultiRuntimeCoordinatorEmptyShadowDoesNotBlock(t *testing.T) {
 	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
 	require.NoError(t, err)
 
 	coord := newMultiRuntimeCoordinator(t.TempDir())
 	shadowSource := coord.EnsureRuntime("shadow", target, allSyscalls(target))
-	coord.mu.Lock()
-	consumer := coord.consumers["shadow"]
-	coord.mu.Unlock()
 
-	const requestCount = 8
-	results := make(chan *queue.Request, requestCount)
-	for range requestCount {
-		go func() {
-			results <- shadowSource.Next()
-		}()
-	}
-	for index := range requestCount {
-		consumer.enqueuePriority(&queue.Request{ProgID: int64(100 + index)})
+	next := make(chan *queue.Request, 1)
+	go func() {
+		next <- shadowSource.Next()
+	}()
+	select {
+	case req := <-next:
+		assert.Nil(t, req)
+	case <-time.After(time.Second):
+		coord.Close()
+		t.Fatal("empty shadow source blocked")
 	}
 
-	seen := map[int64]bool{}
-	for range requestCount {
-		select {
-		case req := <-results:
-			require.NotNil(t, req)
-			seen[req.ProgID] = true
-		case <-time.After(time.Second):
-			coord.Close()
-			t.Fatal("not all shadow waiters were woken for queued priority requests")
-		}
-	}
-	assert.Len(t, seen, requestCount)
-	assert.Equal(t, 0, consumer.priorityLen())
+	primaryReq := &queue.Request{Prog: testRegistryProg(target)}
+	coord.registerPrimary("primary", primaryReq)
+	shadowReq := shadowSource.Next()
+	require.NotNil(t, shadowReq)
+	assert.Equal(t, primaryReq.ProgID, shadowReq.ProgID)
 }
 
-func TestMultiRuntimeCoordinatorWakesShadowForPriorityRepro(t *testing.T) {
+func TestMultiRuntimeCoordinatorQueuesShadowPriorityRepro(t *testing.T) {
 	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
 	require.NoError(t, err)
 
@@ -329,20 +319,11 @@ func TestMultiRuntimeCoordinatorWakesShadowForPriorityRepro(t *testing.T) {
 	require.NotNil(t, shadowReq)
 
 	primaryReq.Done(testResult(0, ""))
-	next := make(chan *queue.Request, 1)
-	go func() {
-		next <- shadowSource.Next()
-	}()
 	shadowReq.Done(testResult(1, ""))
 
-	select {
-	case reproReq := <-next:
-		require.NotNil(t, reproReq)
-		assert.NotEqual(t, primaryReq.ProgID, reproReq.ProgID)
-	case <-time.After(time.Second):
-		coord.Close()
-		t.Fatal("shadow source was not woken for a queued repro request")
-	}
+	reproReq := shadowSource.Next()
+	require.NotNil(t, reproReq)
+	assert.NotEqual(t, primaryReq.ProgID, reproReq.ProgID)
 }
 
 func TestMultiRuntimeCoordinatorDoesNotPersistUnstableResults(t *testing.T) {
