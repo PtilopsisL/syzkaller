@@ -208,6 +208,67 @@ func TestMultiRuntimeCoordinatorSchedulesMismatchRepro(t *testing.T) {
 	}
 }
 
+func TestMultiRuntimeCoordinatorUsesComparisonPrimary(t *testing.T) {
+	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
+	require.NoError(t, err)
+
+	workdir := t.TempDir()
+	coord := newMultiRuntimeCoordinator(workdir)
+	coord.setComparisonPrimary("primary-comparison", "primary")
+	coord.setRuntimeVersion("primary-comparison", "6.2")
+	coord.setRuntimeVersion("shadow", "6.1")
+	dirtyPrimarySource := coord.sourceForRuntime("primary-fuzzing", queue.Plain())
+	comparisonSource := coord.EnsureRuntime("primary-comparison", target, allSyscalls(target))
+	shadowSource := coord.EnsureRuntime("shadow", target, allSyscalls(target))
+
+	primaryReq := &queue.Request{Prog: mustDeserializeProg(t, target, `ptrace(0x10, 0x17)`)}
+	coord.registerPrimary("primary-fuzzing", primaryReq)
+	comparisonReq := comparisonSource.Next()
+	shadowReq := shadowSource.Next()
+	require.NotNil(t, comparisonReq)
+	require.NotNil(t, shadowReq)
+
+	// The fuzzing primary result is recorded for observability, but it does not
+	// participate in either the initial comparison or mismatch reproduction.
+	primaryReq.Done(testResult(7, "0: dirty() = -1 {7}\n"))
+	comparisonReq.Done(testResult(0, "0: test() = 0 {0}\n"))
+	shadowReq.Done(testResult(1, "0: test() = -1 {1}\n"))
+
+	assert.Nil(t, dirtyPrimarySource.Next())
+	assert.Zero(t, coord.reproQueueLen("primary-fuzzing"))
+	for range mismatchReproRuns {
+		comparisonRepro := comparisonSource.Next()
+		shadowRepro := shadowSource.Next()
+		require.NotNil(t, comparisonRepro)
+		require.NotNil(t, shadowRepro)
+		comparisonRepro.Done(testResult(0, "0: test() = 0 {0}\n"))
+		shadowRepro.Done(testResult(1, "0: test() = -1 {1}\n"))
+	}
+
+	entries, err := os.ReadDir(filepath.Join(workdir, "runtime-mismatches"))
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	data, err := os.ReadFile(filepath.Join(workdir, "runtime-mismatches", entries[0].Name(), "report.json"))
+	require.NoError(t, err)
+	var report storedMismatchReport
+	require.NoError(t, json.Unmarshal(data, &report))
+	assert.ElementsMatch(t, []string{"primary", "shadow"}, report.Runtimes)
+	assert.Contains(t, report.InitialResults, "primary")
+	assert.NotContains(t, report.InitialResults, "primary-comparison")
+	assert.Contains(t, report.ReproSamples, "primary")
+	assert.NotContains(t, report.ReproSamples, "primary-comparison")
+	assert.Contains(t, report.Compared, "primary")
+	assert.NotContains(t, report.Compared, "primary-comparison")
+	assert.Contains(t, report.TraceFiles, "logs/primary.initial.strace.log")
+	assert.True(t, runtimeDiffLabelScopeMatches(runtimeDiffLabelScope{
+		RuntimeNames: []string{"primary", "shadow"},
+		RuntimeVersions: map[string]string{
+			"primary": "6.2",
+			"shadow":  "6.1",
+		},
+	}, report.ReproSamples))
+}
+
 func TestMismatchStoreOmitsEmptyTraceManifest(t *testing.T) {
 	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
 	require.NoError(t, err)

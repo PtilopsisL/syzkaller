@@ -84,6 +84,54 @@ func TestInitRuntimeCreatesPrimaryAndShadowRuntimes(t *testing.T) {
 	assert.Equal(t, "shadow", mgr.shadows["shadow"].crashStore.Namespace)
 }
 
+func TestInitRuntimeCreatesComparisonPrimaryAsShadow(t *testing.T) {
+	primaryCfg := testManagerConfig(t)
+	primaryCfg.Snapshot = false
+	comparisonCfg := testManagerConfig(t)
+	comparisonCfg.Workdir = t.TempDir()
+	comparisonCfg.Cover = false
+	comparisonCfg.Snapshot = true
+	shadowCfg := testManagerConfig(t)
+	shadowCfg.Workdir = t.TempDir()
+	shadowCfg.Cover = false
+	shadowCfg.Snapshot = true
+
+	displayCfg := testManagerConfig(t)
+	displayCfg.PrimaryRuntime = "primary"
+	displayCfg.ComparisonPrimary = "primary-comparison"
+	displayCfg.Runtimes = []mgrconfig.Runtime{
+		{Name: "primary"},
+		{Name: "shadow"},
+		{Name: "primary-comparison"},
+	}
+	displayCfg.RuntimeConfigs = map[string]*mgrconfig.Config{
+		"primary":            primaryCfg,
+		"shadow":             shadowCfg,
+		"primary-comparison": comparisonCfg,
+	}
+
+	mgr := &Manager{
+		cfg:        primaryCfg,
+		displayCfg: displayCfg,
+		mode:       ModeFuzzing,
+	}
+
+	require.NoError(t, mgr.initRuntime(false))
+	t.Cleanup(func() {
+		require.NoError(t, mgr.closeRuntimes())
+	})
+
+	require.Len(t, mgr.shadows, 2)
+	assert.Equal(t, "primary-fuzzing", mgr.primary.name)
+	assert.Equal(t, "primary-fuzzing", mgr.primary.crashStore.Namespace)
+	assert.False(t, mgr.primary.cfg.Snapshot)
+	assert.Equal(t, "primary-comparison", mgr.shadows["primary-comparison"].name)
+	assert.True(t, mgr.shadows["primary-comparison"].cfg.Snapshot)
+	assert.False(t, mgr.shadows["primary-comparison"].cfg.Cover)
+	assert.Same(t, mgr.primary, mgr.slotForRuntime("primary"))
+	assert.Same(t, mgr.primary, mgr.slotForRuntime("primary-fuzzing"))
+}
+
 func TestInitRuntimeUsesPrimaryNamedStatsInMultiRuntimeMode(t *testing.T) {
 	primaryName := "primary-stats"
 	shadowName := "shadow-stats"

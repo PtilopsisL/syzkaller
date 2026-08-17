@@ -33,6 +33,14 @@ type managedRuntime struct {
 	features   flatrpc.Feature
 	stats      rpcserver.Stats
 	shadow     bool
+	ready      chan struct{}
+	readyOnce  sync.Once
+}
+
+func (runtime *managedRuntime) markReady() {
+	runtime.readyOnce.Do(func() {
+		close(runtime.ready)
+	})
 }
 
 type runtimeController struct {
@@ -118,15 +126,26 @@ type multiRuntimeCoordinator struct {
 	progIDState    string
 	reservedProgID int64
 
-	mu              sync.Mutex
-	consumers       map[string]*shadowConsumer
-	reproQueues     map[string]*queue.PlainQueue
-	runtimeVersions map[string]string
-	statuses        map[string]map[int64]queue.Status
-	runs            map[int64]*programRun
-	store           *mismatchStore
-	diffLabels      *runtimeDiffLabelStore
-	outputPolicies  *runtimeOutputPolicyStore
+	mu                sync.Mutex
+	comparisonPrimary string
+	comparisonNames   map[string]string
+	consumers         map[string]*shadowConsumer
+	reproQueues       map[string]*queue.PlainQueue
+	runtimeVersions   map[string]string
+	statuses          map[string]map[int64]queue.Status
+	runs              map[int64]*programRun
+	store             *mismatchStore
+	diffLabels        *runtimeDiffLabelStore
+	outputPolicies    *runtimeOutputPolicyStore
+}
+
+func (coord *multiRuntimeCoordinator) setComparisonPrimary(slotName, runtimeName string) {
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	coord.comparisonPrimary = slotName
+	if slotName != "" {
+		coord.comparisonNames[slotName] = runtimeName
+	}
 }
 
 type shadowConsumer struct {
@@ -145,6 +164,7 @@ func newMultiRuntimeCoordinator(workdir string) *multiRuntimeCoordinator {
 	coord := &multiRuntimeCoordinator{
 		progIDState:     progIDStatePath(workdir),
 		reservedProgID:  maxID,
+		comparisonNames: map[string]string{},
 		consumers:       map[string]*shadowConsumer{},
 		reproQueues:     map[string]*queue.PlainQueue{},
 		runtimeVersions: map[string]string{},
@@ -253,7 +273,12 @@ func (coord *multiRuntimeCoordinator) registerPrimary(runtimeName string, req *q
 	if coord.statuses[runtimeName] == nil {
 		coord.statuses[runtimeName] = map[int64]queue.Status{}
 	}
-	expected := map[string]bool{runtimeName: true}
+	expected := map[string]bool{}
+	if coord.comparisonPrimary == "" {
+		expected[runtimeName] = true
+	} else {
+		expected[coord.comparisonPrimary] = true
+	}
 	consumers := make(map[string]*shadowConsumer, len(coord.consumers))
 	for name, consumer := range coord.consumers {
 		expected[name] = true

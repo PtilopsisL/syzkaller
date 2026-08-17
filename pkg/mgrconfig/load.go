@@ -230,6 +230,9 @@ func Complete(cfg *Config) error {
 	if len(cfg.Runtimes) != 0 {
 		return cfg.completeRuntimes()
 	}
+	if cfg.ComparisonPrimary != "" {
+		return fmt.Errorf("comparison_primary requires multi-runtime mode")
+	}
 
 	return nil
 }
@@ -240,9 +243,21 @@ func (cfg *Config) completeRuntimes() error {
 	if cfg.PrimaryRuntime == "" {
 		return fmt.Errorf("multi-runtime mode requires primary to be set")
 	}
+	if cfg.ComparisonPrimary != "" {
+		if !cfg.Snapshot {
+			return fmt.Errorf("comparison_primary requires snapshot=true")
+		}
+		if !runtimeNameRe.MatchString(cfg.ComparisonPrimary) {
+			return fmt.Errorf("bad comparison primary runtime name %q", cfg.ComparisonPrimary)
+		}
+		if cfg.ComparisonPrimary == cfg.PrimaryRuntime {
+			return fmt.Errorf("comparison_primary must differ from primary")
+		}
+	}
 
 	base := *cfg
 	base.PrimaryRuntime = ""
+	base.ComparisonPrimary = ""
 	base.Runtimes = nil
 	base.RuntimeConfigs = nil
 	base.Derived = Derived{}
@@ -251,41 +266,34 @@ func (cfg *Config) completeRuntimes() error {
 		return fmt.Errorf("failed to serialize base runtime config: %w", err)
 	}
 
-	cfg.RuntimeConfigs = make(map[string]*Config, len(cfg.Runtimes))
+	cfg.RuntimeConfigs = make(map[string]*Config, len(cfg.Runtimes)+1)
 	seen := make(map[string]struct{}, len(cfg.Runtimes))
 	foundPrimary := false
-	for _, runtime := range cfg.Runtimes {
-		if !runtimeNameRe.MatchString(runtime.Name) {
-			return fmt.Errorf("bad runtime name %q", runtime.Name)
-		}
-		if _, ok := seen[runtime.Name]; ok {
-			return fmt.Errorf("duplicate runtime %q", runtime.Name)
-		}
-		seen[runtime.Name] = struct{}{}
-		if runtime.Name == cfg.PrimaryRuntime {
-			foundPrimary = true
-		}
-
+	var primaryRuntime Runtime
+	completeRuntime := func(runtime Runtime, primary bool) (*Config, error) {
 		overrideJSON, err := json.Marshal(runtime)
 		if err != nil {
-			return fmt.Errorf("failed to serialize runtime %q overrides: %w", runtime.Name, err)
+			return nil, fmt.Errorf("failed to serialize runtime %q overrides: %w", runtime.Name, err)
 		}
 		merged, err := config.MergeJSONs(baseJSON, overrideJSON)
 		if err != nil {
-			return fmt.Errorf("failed to merge runtime %q config: %w", runtime.Name, err)
+			return nil, fmt.Errorf("failed to merge runtime %q config: %w", runtime.Name, err)
 		}
 		runtimeCfg, err := LoadPartialData(merged)
 		if err != nil {
-			return fmt.Errorf("failed to load runtime %q config: %w", runtime.Name, err)
+			return nil, fmt.Errorf("failed to load runtime %q config: %w", runtime.Name, err)
 		}
 		runtimeCfg.PrimaryRuntime = ""
+		runtimeCfg.ComparisonPrimary = ""
 		runtimeCfg.Runtimes = nil
 		runtimeCfg.RuntimeConfigs = nil
-		switch runtime.Name {
-		case cfg.PrimaryRuntime:
+		if primary {
 			runtimeCfg.Name = cfg.Name
 			runtimeCfg.Workdir = cfg.Workdir
-		default:
+			if cfg.ComparisonPrimary != "" {
+				runtimeCfg.Snapshot = false
+			}
+		} else {
 			runtimeCfg.Name = fmt.Sprintf("%s/%s", cfg.Name, runtime.Name)
 			runtimeCfg.Workdir = filepath.Join(cfg.Workdir, "runtimes", runtime.Name)
 			runtimeCfg.HTTP = ""
@@ -303,18 +311,60 @@ func (cfg *Config) completeRuntimes() error {
 			runtimeCfg.Cover = false
 		}
 		if err := Complete(runtimeCfg); err != nil {
-			return fmt.Errorf("runtime %q: %w", runtime.Name, err)
+			return nil, fmt.Errorf("runtime %q: %w", runtime.Name, err)
 		}
 		// Cover is deliberately disabled for shadow runtimes, while the executor
 		// layout remains identical to the primary runtime.
 		runtimeCfg.CoverageLayout = cfg.Cover
 		if runtimeCfg.VMLess {
-			return fmt.Errorf("runtime %q: type=none is not supported in multi-runtime mode", runtime.Name)
+			return nil, fmt.Errorf("runtime %q: type=none is not supported in multi-runtime mode", runtime.Name)
+		}
+		return runtimeCfg, nil
+	}
+	for _, runtime := range cfg.Runtimes {
+		if !runtimeNameRe.MatchString(runtime.Name) {
+			return fmt.Errorf("bad runtime name %q", runtime.Name)
+		}
+		if _, ok := seen[runtime.Name]; ok {
+			return fmt.Errorf("duplicate runtime %q", runtime.Name)
+		}
+		seen[runtime.Name] = struct{}{}
+		isPrimary := runtime.Name == cfg.PrimaryRuntime
+		if isPrimary {
+			foundPrimary = true
+			primaryRuntime = runtime
+		}
+		runtimeCfg, err := completeRuntime(runtime, isPrimary)
+		if err != nil {
+			return err
 		}
 		cfg.RuntimeConfigs[runtime.Name] = runtimeCfg
 	}
 	if !foundPrimary {
 		return fmt.Errorf("primary runtime %q is not defined", cfg.PrimaryRuntime)
+	}
+	if cfg.ComparisonPrimary != "" {
+		fuzzingPrimary := cfg.PrimaryFuzzingRuntimeName()
+		if fuzzingPrimary == cfg.ComparisonPrimary {
+			return fmt.Errorf("fuzzing primary runtime name %q conflicts with comparison_primary",
+				fuzzingPrimary)
+		}
+		if _, ok := seen[fuzzingPrimary]; ok {
+			return fmt.Errorf("fuzzing primary runtime name %q conflicts with a configured runtime",
+				fuzzingPrimary)
+		}
+		if _, ok := seen[cfg.ComparisonPrimary]; ok {
+			return fmt.Errorf("comparison primary runtime %q conflicts with a configured runtime",
+				cfg.ComparisonPrimary)
+		}
+		comparisonRuntime := primaryRuntime
+		comparisonRuntime.Name = cfg.ComparisonPrimary
+		comparisonCfg, err := completeRuntime(comparisonRuntime, false)
+		if err != nil {
+			return err
+		}
+		cfg.RuntimeConfigs[cfg.ComparisonPrimary] = comparisonCfg
+		cfg.Runtimes = append(cfg.Runtimes, Runtime{Name: cfg.ComparisonPrimary})
 	}
 	return nil
 }

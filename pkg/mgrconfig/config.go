@@ -21,6 +21,8 @@ type Config struct {
 	RPC string `json:"rpc,omitempty"`
 	// Fixed primary runtime name in multi-runtime mode.
 	PrimaryRuntime string `json:"primary,omitempty"`
+	// Optional snapshot-isolated clone of the primary runtime used for comparisons.
+	ComparisonPrimary string `json:"comparison_primary,omitempty"`
 	// Optional per-runtime overrides in multi-runtime mode.
 	Runtimes []Runtime `json:"runtimes,omitempty"`
 	// Location of a working directory for the syz-manager process. Outputs here include:
@@ -264,6 +266,14 @@ type Runtime struct {
 
 func (cfg *Config) IsMultiRuntime() bool {
 	return len(cfg.RuntimeConfigs) != 0
+}
+
+// PrimaryFuzzingRuntimeName returns the execution slot name of the non-comparison primary.
+func (cfg *Config) PrimaryFuzzingRuntimeName() string {
+	if cfg.ComparisonPrimary == "" {
+		return cfg.PrimaryRuntime
+	}
+	return cfg.PrimaryRuntime + "-fuzzing"
 }
 
 // Experimental contains options that are not guaranteed to be backward- or forward-compatible

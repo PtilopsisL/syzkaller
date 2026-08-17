@@ -220,7 +220,7 @@ func summarizeRuntimeResult(runtimeName string, req *queue.Request, res *queue.R
 func (coord *multiRuntimeCoordinator) handleCompletedRun(run *programRun) {
 	switch run.Stage {
 	case runStageFuzz:
-		mismatch := compareRuntimeResults(run.Results, coord.diffLabels)
+		mismatch := compareRuntimeResults(coord.comparisonResults(run.Results), coord.diffLabels)
 		if mismatch == nil {
 			return
 		}
@@ -231,7 +231,8 @@ func (coord *multiRuntimeCoordinator) handleCompletedRun(run *programRun) {
 		}
 		coord.enqueueMismatchRepro(run)
 	case runStageRepro:
-		mismatch := compareRuntimeSamples(run.Samples, coord.diffLabels)
+		comparisonSamples := coord.comparisonSamples(run.Samples)
+		mismatch := compareRuntimeSamples(comparisonSamples, coord.diffLabels)
 		if mismatch == nil {
 			return
 		}
@@ -245,7 +246,10 @@ func (coord *multiRuntimeCoordinator) handleCompletedRun(run *programRun) {
 				run.ParentID)
 			return
 		}
-		path, err := coord.store.Save(run, mismatch)
+		reportRun := *run
+		reportRun.InitialResults = coord.comparisonResults(run.InitialResults)
+		reportRun.Samples = comparisonSamples
+		path, err := coord.store.Save(&reportRun, mismatch)
 		if err != nil {
 			log.Logf(0, "failed to save runtime mismatch for program %d: %v", run.ParentID, err)
 			return
@@ -255,6 +259,63 @@ func (coord *multiRuntimeCoordinator) handleCompletedRun(run *programRun) {
 	default:
 		panic(fmt.Sprintf("unknown multi-runtime run stage %d", run.Stage))
 	}
+}
+
+func (coord *multiRuntimeCoordinator) comparisonResults(
+	results map[string]*runtimeResult) map[string]*runtimeResult {
+	names := coord.comparisonRuntimeNames()
+	ret := make(map[string]*runtimeResult, len(results))
+	for slotName, result := range results {
+		runtimeName := comparisonRuntimeName(slotName, names)
+		if _, ok := ret[runtimeName]; ok {
+			panic(fmt.Sprintf("runtime comparison name %q is not unique", runtimeName))
+		}
+		ret[runtimeName] = comparisonRuntimeResultWithName(result, runtimeName)
+	}
+	return ret
+}
+
+func (coord *multiRuntimeCoordinator) comparisonRuntimeNames() map[string]string {
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	names := make(map[string]string, len(coord.comparisonNames))
+	for slotName, runtimeName := range coord.comparisonNames {
+		names[slotName] = runtimeName
+	}
+	return names
+}
+
+func (coord *multiRuntimeCoordinator) comparisonSamples(
+	samples map[string][]*runtimeResult) map[string][]*runtimeResult {
+	names := coord.comparisonRuntimeNames()
+	ret := make(map[string][]*runtimeResult, len(samples))
+	for slotName, runtimeSamples := range samples {
+		runtimeName := comparisonRuntimeName(slotName, names)
+		if _, ok := ret[runtimeName]; ok {
+			panic(fmt.Sprintf("runtime comparison name %q is not unique", runtimeName))
+		}
+		ret[runtimeName] = make([]*runtimeResult, len(runtimeSamples))
+		for index, result := range runtimeSamples {
+			ret[runtimeName][index] = comparisonRuntimeResultWithName(result, runtimeName)
+		}
+	}
+	return ret
+}
+
+func comparisonRuntimeName(slotName string, names map[string]string) string {
+	if runtimeName := names[slotName]; runtimeName != "" {
+		return runtimeName
+	}
+	return slotName
+}
+
+func comparisonRuntimeResultWithName(result *runtimeResult, runtimeName string) *runtimeResult {
+	if result == nil {
+		return nil
+	}
+	copyResult := *result
+	copyResult.Runtime = runtimeName
+	return &copyResult
 }
 
 func compareRuntimeResults(results map[string]*runtimeResult, labels ...*runtimeDiffLabelStore) *runtimeMismatch {

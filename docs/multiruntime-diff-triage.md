@@ -4,6 +4,47 @@ Multi-runtime comparison keeps every stable difference. It does not infer that
 an older/newer kernel difference is a bug and it does not discard a report
 because a label matches.
 
+## Snapshot-isolated comparison primary
+
+Use `comparison_primary` to keep normal primary fuzzing outside snapshot mode
+while comparing every identified generated program in clean snapshot runtimes:
+
+```json
+{
+  "snapshot": true,
+  "primary": "linux-new",
+  "comparison_primary": "linux-new-comparison",
+  "runtimes": [
+    {"name": "linux-new"},
+    {"name": "linux-old"}
+  ]
+}
+```
+
+The manager automatically clones the `linux-new` runtime configuration as
+`linux-new-comparison`; do not add that name to `runtimes`. The normal
+primary runs in the `linux-new-fuzzing` execution slot with snapshot disabled
+and remains responsible for coverage and fuzzing. The clone and all shadow
+runtimes retain snapshot mode, receive only programs with a generated program
+ID, and provide the initial and reproduction samples used by the differential
+comparison. Results from the normal primary are still recorded under its
+fuzzing slot name, but are excluded from both comparisons and mismatch
+reproduction.
+
+Execution slot names remain distinct for queues, RPC, statistics, and crash
+namespaces. At the comparison boundary, `linux-new-comparison` is mapped back
+to the logical runtime name `linux-new`. Consequently, `report.json`, trace
+file names, stable-difference value maps, fingerprints, and diff-label scopes
+continue to use `linux-new`, preserving compatibility with reports and labels
+from the original primary.
+
+`comparison_primary` requires `snapshot: true`, must differ from `primary`, and
+must not collide with another configured runtime name. The derived
+`<primary>-fuzzing` slot name must also be unique. The normal primary keeps the
+manager workdir root, while the snapshot clone uses
+`<workdir>/runtimes/<comparison_primary>`. Local crash namespaces and runtime
+statistics use the physical slot names.
+
 Set `runtime_diff_labels` in the manager configuration to load reviewed labels:
 
 ```json

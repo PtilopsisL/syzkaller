@@ -4,8 +4,10 @@
 package mgrconfig_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	. "github.com/google/syzkaller/pkg/mgrconfig"
@@ -111,4 +113,89 @@ func TestLoadDataMultiRuntimeSnapshot(t *testing.T) {
 	require.True(t, cfg.RuntimeConfigs["shadow"].Snapshot)
 	require.True(t, cfg.RuntimeConfigs["main"].CoverageLayout)
 	require.True(t, cfg.RuntimeConfigs["shadow"].CoverageLayout)
+}
+
+func TestLoadDataMultiRuntimeComparisonPrimary(t *testing.T) {
+	workdir := t.TempDir()
+	data := fmt.Sprintf(`{
+               "name": "multi-manager",
+               "target": "linux/amd64",
+               "http": "localhost:0",
+               "workdir": %q,
+               "kernel_obj": "/linux",
+               "image": "./testdata/wheezy.img",
+               "syzkaller": "./testdata/syzkaller",
+               "type": "qemu",
+               "cover": true,
+               "snapshot": true,
+               "vm": {
+                       "count": 1,
+                       "cpu": 1,
+                       "mem": 256,
+                       "kernel": "/linux/arch/x86/boot/bzImage"
+               },
+               "primary": "main",
+               "comparison_primary": "main-comparison",
+               "runtimes": [
+                       {"name": "main", "tag": "primary-tag", "kernel_version": "6.2.0"},
+                       {"name": "shadow", "kernel_obj": "/linux-shadow"}
+               ]
+       }`, workdir)
+	cfg, err := LoadData([]byte(data))
+	require.NoError(t, err)
+	require.Len(t, cfg.RuntimeConfigs, 3)
+	require.Len(t, cfg.Runtimes, 3)
+
+	primary := cfg.RuntimeConfigs["main"]
+	comparison := cfg.RuntimeConfigs["main-comparison"]
+	shadow := cfg.RuntimeConfigs["shadow"]
+	require.NotNil(t, primary)
+	require.NotNil(t, comparison)
+	require.NotNil(t, shadow)
+
+	assert.False(t, primary.Snapshot)
+	assert.True(t, primary.Cover)
+	assert.True(t, primary.CoverageLayout)
+	assert.Equal(t, workdir, primary.Workdir)
+
+	assert.True(t, comparison.Snapshot)
+	assert.False(t, comparison.Cover)
+	assert.True(t, comparison.CoverageLayout)
+	assert.Equal(t, filepath.Join(workdir, "runtimes", "main-comparison"), comparison.Workdir)
+	assert.Equal(t, primary.KernelObj, comparison.KernelObj)
+	assert.Equal(t, primary.Tag, comparison.Tag)
+	assert.Equal(t, primary.KernelVersion, comparison.KernelVersion)
+
+	assert.True(t, shadow.Snapshot)
+	assert.Equal(t, "main-fuzzing", cfg.PrimaryFuzzingRuntimeName())
+
+	for _, test := range []struct {
+		name    string
+		old     string
+		new     string
+		wantErr string
+	}{
+		{"snapshot required", `"snapshot": true`, `"snapshot": false`,
+			"comparison_primary requires snapshot=true"},
+		{"must differ from primary", `"comparison_primary": "main-comparison"`,
+			`"comparison_primary": "main"`, "comparison_primary must differ from primary"},
+		{"must not collide", `"comparison_primary": "main-comparison"`,
+			`"comparison_primary": "shadow"`, "conflicts with a configured runtime"},
+		{"fuzzing name must not collide", `"comparison_primary": "main-comparison"`,
+			`"comparison_primary": "main-fuzzing"`, "fuzzing primary runtime name"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := LoadData([]byte(strings.Replace(data, test.old, test.new, 1)))
+			require.ErrorContains(t, err, test.wantErr)
+		})
+	}
+
+	var singleRuntime map[string]any
+	require.NoError(t, json.Unmarshal([]byte(data), &singleRuntime))
+	delete(singleRuntime, "primary")
+	delete(singleRuntime, "runtimes")
+	singleRuntimeData, err := json.Marshal(singleRuntime)
+	require.NoError(t, err)
+	_, err = LoadData(singleRuntimeData)
+	require.ErrorContains(t, err, "comparison_primary requires multi-runtime mode")
 }

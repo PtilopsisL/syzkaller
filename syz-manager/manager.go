@@ -415,6 +415,17 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 	for _, slot := range mgr.shadows {
 		go slot.runtime.Pool().Loop(ctx)
 	}
+	if name := mgr.displayCfg.ComparisonPrimary; name != "" {
+		comparison := mgr.shadows[name]
+		if comparison == nil {
+			log.Fatalf("comparison primary runtime %q is not available", name)
+		}
+		select {
+		case <-comparison.ready:
+		case <-ctx.Done():
+			return
+		}
+	}
 	mgr.runtime.Pool().Loop(ctx)
 }
 
@@ -430,8 +441,13 @@ func (mgr *Manager) initRuntime(debug bool) error {
 	mgr.shadows = make(map[string]*managedRuntime)
 	if mgr.displayCfg.IsMultiRuntime() {
 		coord := newMultiRuntimeCoordinator(mgr.displayCfg.Workdir)
+		coord.setComparisonPrimary(mgr.displayCfg.ComparisonPrimary, mgr.displayCfg.PrimaryRuntime)
 		for name, runtimeCfg := range mgr.displayCfg.RuntimeConfigs {
-			coord.setRuntimeVersion(name, runtimeCfg.KernelVersion)
+			runtimeName := name
+			if name == mgr.displayCfg.PrimaryRuntime {
+				runtimeName = mgr.displayCfg.PrimaryFuzzingRuntimeName()
+			}
+			coord.setRuntimeVersion(runtimeName, runtimeCfg.KernelVersion)
 		}
 		if err := coord.configureRuntimeDiffLabels(mgr.displayCfg.RuntimeDiffLabels); err != nil {
 			return fmt.Errorf("runtime diff labels: %w", err)
@@ -442,11 +458,12 @@ func (mgr *Manager) initRuntime(debug bool) error {
 		mgr.programRegistry = coord
 	}
 
-	createSlot := func(name string, runtimeCfg *mgrconfig.Config, shadow bool) error {
+	createSlot := func(configName, name string, runtimeCfg *mgrconfig.Config, shadow bool) error {
 		slot := &managedRuntime{
 			name:       name,
 			cfg:        runtimeCfg,
 			shadow:     shadow,
+			ready:      make(chan struct{}),
 			controller: &runtimeController{mgr: mgr, slot: nil},
 			crashStore: newManagedCrashStore(mgr.displayCfg.Workdir, runtimeCfg, name,
 				mgr.displayCfg.IsMultiRuntime()),
@@ -481,9 +498,9 @@ func (mgr *Manager) initRuntime(debug bool) error {
 			slot.reproLoop = manager.NewReproLoop(&runtimeReproView{mgr: mgr, slot: slot},
 				reproVMs, !shadow && runtimeCfg.DashboardOnlyRepro)
 		}
-		mgr.allRuntimes[name] = slot
+		mgr.allRuntimes[configName] = slot
 		if shadow {
-			mgr.shadows[name] = slot
+			mgr.shadows[configName] = slot
 			return nil
 		}
 		mgr.primary = slot
@@ -494,12 +511,17 @@ func (mgr *Manager) initRuntime(debug bool) error {
 	}
 
 	if !mgr.displayCfg.IsMultiRuntime() {
-		return createSlot("main", mgr.cfg, false)
+		return createSlot("main", "main", mgr.cfg, false)
 	}
 	for _, runtime := range mgr.displayCfg.Runtimes {
-		name := runtime.Name
-		if err := createSlot(name, mgr.displayCfg.RuntimeConfigs[name], name != mgr.displayCfg.PrimaryRuntime); err != nil {
-			return fmt.Errorf("runtime %q: %w", name, err)
+		configName := runtime.Name
+		name := configName
+		if configName == mgr.displayCfg.PrimaryRuntime {
+			name = mgr.displayCfg.PrimaryFuzzingRuntimeName()
+		}
+		if err := createSlot(configName, name, mgr.displayCfg.RuntimeConfigs[configName],
+			configName != mgr.displayCfg.PrimaryRuntime); err != nil {
+			return fmt.Errorf("runtime %q: %w", configName, err)
 		}
 	}
 	if mgr.primary == nil {
@@ -807,7 +829,15 @@ func (mgr *Manager) slotForRuntime(runtimeName string) *managedRuntime {
 	if runtimeName == "" || !mgr.displayCfg.IsMultiRuntime() {
 		return mgr.primary
 	}
-	return mgr.allRuntimes[runtimeName]
+	if slot := mgr.allRuntimes[runtimeName]; slot != nil {
+		return slot
+	}
+	for _, slot := range mgr.allRuntimes {
+		if slot.name == runtimeName {
+			return slot
+		}
+	}
+	return nil
 }
 
 func (mgr *Manager) saveCrash(crash *manager.Crash) bool {
@@ -1301,6 +1331,7 @@ func (mgr *Manager) machineCheckedAndSetSource(slot *managedRuntime, features fl
 		return fmt.Errorf("runtime server %q is not available", slot.name)
 	}
 	serv.SetSource(source)
+	slot.markReady()
 	return nil
 }
 
