@@ -10,6 +10,11 @@ import (
 	"github.com/google/syzkaller/pkg/asset"
 )
 
+const (
+	DefaultMaxFirstRunInflight    = 10000
+	DefaultResumeFirstRunInflight = 8000
+)
+
 type Config struct {
 	// Instance name (used for identification and as GCE instance prefix).
 	Name string `json:"name"`
@@ -25,6 +30,11 @@ type Config struct {
 	ComparisonPrimary string `json:"comparison_primary,omitempty"`
 	// Optional per-runtime overrides in multi-runtime mode.
 	Runtimes []Runtime `json:"runtimes,omitempty"`
+	// Maximum number of programs waiting for their initial results from all runtimes.
+	// Reaching this soft limit pauses generation of new multi-runtime fuzz programs.
+	MaxFirstRunInflight int `json:"max_first_run_inflight,omitempty"`
+	// Initial multi-runtime fuzz program generation resumes at or below this value.
+	ResumeFirstRunInflight int `json:"resume_first_run_inflight,omitempty"`
 	// Location of a working directory for the syz-manager process. Outputs here include:
 	// - <workdir>/crashes/*: crash output files
 	// - <workdir>/corpus.db: corpus with interesting programs

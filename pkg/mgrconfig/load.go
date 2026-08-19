@@ -101,15 +101,17 @@ func LoadPartialFile(filename string) (*Config, error) {
 
 func DefaultValues() *Config {
 	return &Config{
-		SSHUser:        "root",
-		Cover:          true,
-		Reproduce:      true,
-		Sandbox:        "none",
-		RPC:            ":0",
-		MaxCrashLogs:   100,
-		Procs:          6,
-		PreserveCorpus: true,
-		RunFsck:        true,
+		SSHUser:                "root",
+		Cover:                  true,
+		Reproduce:              true,
+		Sandbox:                "none",
+		RPC:                    ":0",
+		MaxCrashLogs:           100,
+		Procs:                  6,
+		PreserveCorpus:         true,
+		RunFsck:                true,
+		MaxFirstRunInflight:    DefaultMaxFirstRunInflight,
+		ResumeFirstRunInflight: DefaultResumeFirstRunInflight,
 		Experimental: Experimental{
 			RemoteCover:      true,
 			CoverEdges:       true,
@@ -240,6 +242,15 @@ func Complete(cfg *Config) error {
 var runtimeNameRe = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,64}$`)
 
 func (cfg *Config) completeRuntimes() error {
+	if cfg.MaxFirstRunInflight <= 0 {
+		return fmt.Errorf("max_first_run_inflight must be greater than 0")
+	}
+	if cfg.ResumeFirstRunInflight <= 0 {
+		return fmt.Errorf("resume_first_run_inflight must be greater than 0")
+	}
+	if cfg.ResumeFirstRunInflight >= cfg.MaxFirstRunInflight {
+		return fmt.Errorf("resume_first_run_inflight must be less than max_first_run_inflight")
+	}
 	if cfg.PrimaryRuntime == "" {
 		return fmt.Errorf("multi-runtime mode requires primary to be set")
 	}

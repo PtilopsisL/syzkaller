@@ -134,9 +134,14 @@ type multiRuntimeCoordinator struct {
 	runtimeVersions   map[string]string
 	statuses          map[string]map[int64]queue.Status
 	runs              map[int64]*programRun
-	store             *mismatchStore
-	diffLabels        *runtimeDiffLabelStore
-	outputPolicies    *runtimeOutputPolicyStore
+
+	maxFirstRunInflight    int
+	resumeFirstRunInflight int
+	firstRunInflight       int
+	firstRunThrottled      bool
+	store                  *mismatchStore
+	diffLabels             *runtimeDiffLabelStore
+	outputPolicies         *runtimeOutputPolicyStore
 }
 
 func (coord *multiRuntimeCoordinator) setComparisonPrimary(slotName, runtimeName string) {
@@ -162,15 +167,17 @@ type shadowConsumer struct {
 func newMultiRuntimeCoordinator(workdir string) *multiRuntimeCoordinator {
 	maxID := maxPersistedProgID(workdir)
 	coord := &multiRuntimeCoordinator{
-		progIDState:     progIDStatePath(workdir),
-		reservedProgID:  maxID,
-		comparisonNames: map[string]string{},
-		consumers:       map[string]*shadowConsumer{},
-		reproQueues:     map[string]*queue.PlainQueue{},
-		runtimeVersions: map[string]string{},
-		statuses:        map[string]map[int64]queue.Status{},
-		runs:            map[int64]*programRun{},
-		store:           newMismatchStore(workdir),
+		progIDState:            progIDStatePath(workdir),
+		reservedProgID:         maxID,
+		comparisonNames:        map[string]string{},
+		consumers:              map[string]*shadowConsumer{},
+		reproQueues:            map[string]*queue.PlainQueue{},
+		runtimeVersions:        map[string]string{},
+		statuses:               map[string]map[int64]queue.Status{},
+		runs:                   map[int64]*programRun{},
+		maxFirstRunInflight:    mgrconfig.DefaultMaxFirstRunInflight,
+		resumeFirstRunInflight: mgrconfig.DefaultResumeFirstRunInflight,
+		store:                  newMismatchStore(workdir),
 	}
 	coord.nextID.Store(maxID)
 	return coord
@@ -183,6 +190,29 @@ func (coord *multiRuntimeCoordinator) setRuntimeVersion(name, version string) {
 		coord.runtimeVersions = make(map[string]string)
 	}
 	coord.runtimeVersions[name] = version
+}
+
+func (coord *multiRuntimeCoordinator) setFirstRunLimits(maxInflight, resumeInflight int) {
+	if maxInflight <= 0 || resumeInflight <= 0 || resumeInflight >= maxInflight {
+		panic(fmt.Sprintf("invalid first-run limits: max=%d resume=%d", maxInflight, resumeInflight))
+	}
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	coord.maxFirstRunInflight = maxInflight
+	coord.resumeFirstRunInflight = resumeInflight
+	coord.firstRunThrottled = coord.firstRunInflight >= maxInflight
+}
+
+func (coord *multiRuntimeCoordinator) canGenerateFirstRun() bool {
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	return !coord.firstRunThrottled
+}
+
+func (coord *multiRuntimeCoordinator) firstRunState() (inflight int, throttled bool) {
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	return coord.firstRunInflight, coord.firstRunThrottled
 }
 
 func newShadowProgramRegistry() *multiRuntimeCoordinator {
@@ -269,6 +299,8 @@ func (coord *multiRuntimeCoordinator) registerPrimary(runtimeName string, req *q
 	if req.ProgID == 0 {
 		req.ProgID = coord.allocateProgID()
 	}
+	paused := false
+	pauseAt := 0
 	coord.mu.Lock()
 	if coord.statuses[runtimeName] == nil {
 		coord.statuses[runtimeName] = map[int64]queue.Status{}
@@ -293,15 +325,26 @@ func (coord *multiRuntimeCoordinator) registerPrimary(runtimeName string, req *q
 		Expected:  expected,
 		Results:   map[string]*runtimeResult{},
 	}
+	coord.firstRunInflight++
+	if !coord.firstRunThrottled && coord.firstRunInflight >= coord.maxFirstRunInflight {
+		coord.firstRunThrottled = true
+		paused = true
+		pauseAt = coord.firstRunInflight
+	}
 	coord.mu.Unlock()
+	if paused {
+		log.Logf(1, "pausing multi-runtime fuzz generation at %d initial runs", pauseAt)
+	}
 
 	program := storedProgram{
 		ID:        req.ProgID,
 		ProgData:  req.Prog.Serialize(),
 		Important: req.Important,
 	}
-	for _, consumer := range consumers {
-		consumer.enqueue(program)
+	for name, consumer := range consumers {
+		if !consumer.enqueue(program) {
+			coord.recordStatus(name, req.ProgID, queue.ExecFailure)
+		}
 	}
 	req.OnDone(func(r *queue.Request, res *queue.Result) bool {
 		coord.recordResult(runtimeName, r, res)
@@ -333,6 +376,8 @@ func (coord *multiRuntimeCoordinator) recordRuntimeResult(runtimeName string, pr
 	var completed *programRun
 	var nextSample *programRun
 	var nextQueue *queue.PlainQueue
+	resumed := false
+	resumeAt := 0
 	coord.mu.Lock()
 	if result != nil && result.RuntimeVersion == "" {
 		result.RuntimeVersion = coord.runtimeVersions[runtimeName]
@@ -357,10 +402,22 @@ func (coord *multiRuntimeCoordinator) recordRuntimeResult(runtimeName string, pr
 		}
 		if runComplete(run) {
 			completed = run
+			if run.Stage == runStageFuzz {
+				coord.firstRunInflight--
+				if coord.firstRunThrottled &&
+					coord.firstRunInflight <= coord.resumeFirstRunInflight {
+					coord.firstRunThrottled = false
+					resumed = true
+					resumeAt = coord.firstRunInflight
+				}
+			}
 			delete(coord.runs, progID)
 		}
 	}
 	coord.mu.Unlock()
+	if resumed {
+		log.Logf(1, "resuming multi-runtime fuzz generation at %d initial runs", resumeAt)
+	}
 	if nextSample != nil {
 		coord.submitReproSample(nextSample, runtimeName, nextQueue)
 	}
@@ -454,13 +511,14 @@ func (source *shadowProgramSource) Next() *queue.Request {
 	}
 }
 
-func (consumer *shadowConsumer) enqueue(program storedProgram) {
+func (consumer *shadowConsumer) enqueue(program storedProgram) bool {
 	consumer.mu.Lock()
 	defer consumer.mu.Unlock()
 	if consumer.closed {
-		return
+		return false
 	}
 	consumer.queue = append(consumer.queue, program)
+	return true
 }
 
 func (consumer *shadowConsumer) enqueuePriority(req *queue.Request) {

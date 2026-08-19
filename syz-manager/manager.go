@@ -441,6 +441,10 @@ func (mgr *Manager) initRuntime(debug bool) error {
 	mgr.shadows = make(map[string]*managedRuntime)
 	if mgr.displayCfg.IsMultiRuntime() {
 		coord := newMultiRuntimeCoordinator(mgr.displayCfg.Workdir)
+		if mgr.displayCfg.MaxFirstRunInflight != 0 || mgr.displayCfg.ResumeFirstRunInflight != 0 {
+			coord.setFirstRunLimits(mgr.displayCfg.MaxFirstRunInflight,
+				mgr.displayCfg.ResumeFirstRunInflight)
+		}
 		coord.setComparisonPrimary(mgr.displayCfg.ComparisonPrimary, mgr.displayCfg.PrimaryRuntime)
 		for name, runtimeCfg := range mgr.displayCfg.RuntimeConfigs {
 			runtimeName := name
@@ -1417,6 +1421,9 @@ func (mgr *Manager) machineChecked(slot *managedRuntime, features flatrpc.Featur
 				mgr.mu.Lock()
 				defer mgr.mu.Unlock()
 				return !mgr.saturatedCalls[call]
+			},
+			CanGenerateProgram: func() bool {
+				return mgr.programRegistry == nil || mgr.programRegistry.canGenerateFirstRun()
 			},
 			GeneratedProgram: func(req *queue.Request) {
 				if mgr.programRegistry != nil {

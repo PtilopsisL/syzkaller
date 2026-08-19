@@ -77,6 +77,54 @@ func TestShadowProgramRegistryMarksUnsupported(t *testing.T) {
 	assert.Equal(t, queue.Unsupported, status)
 }
 
+func TestMultiRuntimeCoordinatorSoftFirstRunLimit(t *testing.T) {
+	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
+	require.NoError(t, err)
+
+	coord := newMultiRuntimeCoordinator(t.TempDir())
+	coord.setFirstRunLimits(2, 1)
+	shadowA := coord.EnsureRuntime("shadow-a", target, allSyscalls(target))
+	shadowB := coord.EnsureRuntime("shadow-b", target, allSyscalls(target))
+
+	primary := make([]*queue.Request, 3)
+	for index := range primary {
+		primary[index] = &queue.Request{Prog: testRegistryProg(target)}
+		coord.registerPrimary("primary", primary[index])
+	}
+
+	inflight, throttled := coord.firstRunState()
+	assert.Equal(t, 3, inflight)
+	assert.True(t, throttled)
+	assert.False(t, coord.canGenerateFirstRun())
+
+	shadowAReqs := make([]*queue.Request, len(primary))
+	shadowBReqs := make([]*queue.Request, len(primary))
+	for index := range primary {
+		shadowAReqs[index] = shadowA.Next()
+		shadowBReqs[index] = shadowB.Next()
+		require.NotNil(t, shadowAReqs[index])
+		require.NotNil(t, shadowBReqs[index])
+		assert.Equal(t, primary[index].ProgID, shadowAReqs[index].ProgID)
+		assert.Equal(t, primary[index].ProgID, shadowBReqs[index].ProgID)
+	}
+
+	completeInitialRun := func(index int) {
+		primary[index].Done(&queue.Result{Status: queue.Success})
+		shadowAReqs[index].Done(&queue.Result{Status: queue.Success})
+		shadowBReqs[index].Done(&queue.Result{Status: queue.Success})
+	}
+	completeInitialRun(0)
+	inflight, throttled = coord.firstRunState()
+	assert.Equal(t, 2, inflight)
+	assert.True(t, throttled)
+
+	completeInitialRun(1)
+	inflight, throttled = coord.firstRunState()
+	assert.Equal(t, 1, inflight)
+	assert.False(t, throttled)
+	assert.True(t, coord.canGenerateFirstRun())
+}
+
 func TestMultiRuntimeCoordinatorContinuesProgIDFromReservedState(t *testing.T) {
 	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
 	require.NoError(t, err)

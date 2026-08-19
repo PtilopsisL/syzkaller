@@ -42,6 +42,33 @@ func TestDefaultExecOptsCoverageLayoutIndependent(t *testing.T) {
 		"layout-only runtime must not enable feedback collection")
 }
 
+func TestFuzzerCanPauseProgramGeneration(t *testing.T) {
+	target, err := prog.GetTarget(targets.TestOS, targets.TestArch64Fuzz)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateCalls := 0
+	fuzzer := NewFuzzer(t.Context(), &Config{
+		Corpus: corpus.NewCorpus(t.Context()),
+		EnabledCalls: map[*prog.Syscall]bool{
+			target.Syscalls[0]: true,
+		},
+		CanGenerateProgram: func() bool {
+			gateCalls++
+			return false
+		},
+	}, rand.New(testutil.RandSource(t)), target)
+
+	fuzzer.AddCandidates([]Candidate{{
+		Prog: target.Generate(testutil.RandSource(t), 1, fuzzer.ct),
+	}})
+	assert.NotNil(t, fuzzer.Next())
+	assert.Zero(t, gateCalls)
+
+	assert.Nil(t, fuzzer.Next())
+	assert.Equal(t, 1, gateCalls)
+}
+
 func TestFuzz(t *testing.T) {
 	t.Cleanup(checkGoroutineLeaks)
 

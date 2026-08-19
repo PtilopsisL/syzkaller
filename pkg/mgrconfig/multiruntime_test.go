@@ -56,6 +56,8 @@ func TestLoadDataMultiRuntime(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, cfg.IsMultiRuntime())
 	require.Len(t, cfg.RuntimeConfigs, 2)
+	assert.Equal(t, DefaultMaxFirstRunInflight, cfg.MaxFirstRunInflight)
+	assert.Equal(t, DefaultResumeFirstRunInflight, cfg.ResumeFirstRunInflight)
 
 	primary := cfg.RuntimeConfigs["v6.2"]
 	shadow := cfg.RuntimeConfigs["v6.1"]
@@ -136,6 +138,8 @@ func TestLoadDataMultiRuntimeComparisonPrimary(t *testing.T) {
                },
                "primary": "main",
                "comparison_primary": "main-comparison",
+               "max_first_run_inflight": 10,
+               "resume_first_run_inflight": 8,
                "runtimes": [
                        {"name": "main", "tag": "primary-tag", "kernel_version": "6.2.0"},
                        {"name": "shadow", "kernel_obj": "/linux-shadow"}
@@ -145,6 +149,8 @@ func TestLoadDataMultiRuntimeComparisonPrimary(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, cfg.RuntimeConfigs, 3)
 	require.Len(t, cfg.Runtimes, 3)
+	assert.Equal(t, 10, cfg.MaxFirstRunInflight)
+	assert.Equal(t, 8, cfg.ResumeFirstRunInflight)
 
 	primary := cfg.RuntimeConfigs["main"]
 	comparison := cfg.RuntimeConfigs["main-comparison"]
@@ -183,6 +189,9 @@ func TestLoadDataMultiRuntimeComparisonPrimary(t *testing.T) {
 			`"comparison_primary": "shadow"`, "conflicts with a configured runtime"},
 		{"fuzzing name must not collide", `"comparison_primary": "main-comparison"`,
 			`"comparison_primary": "main-fuzzing"`, "fuzzing primary runtime name"},
+		{"resume limit must be lower", `"resume_first_run_inflight": 8`,
+			`"resume_first_run_inflight": 10`,
+			"resume_first_run_inflight must be less than max_first_run_inflight"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := LoadData([]byte(strings.Replace(data, test.old, test.new, 1)))
