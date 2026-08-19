@@ -164,6 +164,17 @@ type shadowConsumer struct {
 	closed        bool
 }
 
+type runtimeQueueStats struct {
+	FirstRun int
+	Repro    int
+}
+
+type multiRuntimeStatsSnapshot struct {
+	FirstRunInflight  int
+	FirstRunThrottled bool
+	Queues            map[string]runtimeQueueStats
+}
+
 func newMultiRuntimeCoordinator(workdir string) *multiRuntimeCoordinator {
 	maxID := maxPersistedProgID(workdir)
 	coord := &multiRuntimeCoordinator{
@@ -213,6 +224,37 @@ func (coord *multiRuntimeCoordinator) firstRunState() (inflight int, throttled b
 	coord.mu.Lock()
 	defer coord.mu.Unlock()
 	return coord.firstRunInflight, coord.firstRunThrottled
+}
+
+func (coord *multiRuntimeCoordinator) statsSnapshot() multiRuntimeStatsSnapshot {
+	coord.mu.Lock()
+	ret := multiRuntimeStatsSnapshot{
+		FirstRunInflight:  coord.firstRunInflight,
+		FirstRunThrottled: coord.firstRunThrottled,
+		Queues:            make(map[string]runtimeQueueStats),
+	}
+	consumers := make(map[string]*shadowConsumer, len(coord.consumers))
+	for name, consumer := range coord.consumers {
+		consumers[name] = consumer
+	}
+	runtimeQueues := make(map[string]*queue.PlainQueue, len(coord.reproQueues))
+	for name, runtimeQueue := range coord.reproQueues {
+		runtimeQueues[name] = runtimeQueue
+	}
+	coord.mu.Unlock()
+
+	for name, consumer := range consumers {
+		ret.Queues[name] = consumer.queueStats()
+	}
+	for name, runtimeQueue := range runtimeQueues {
+		if _, ok := consumers[name]; ok {
+			continue
+		}
+		queueStats := ret.Queues[name]
+		queueStats.Repro = runtimeQueue.Len()
+		ret.Queues[name] = queueStats
+	}
+	return ret
 }
 
 func newShadowProgramRegistry() *multiRuntimeCoordinator {
@@ -531,9 +573,16 @@ func (consumer *shadowConsumer) enqueuePriority(req *queue.Request) {
 }
 
 func (consumer *shadowConsumer) priorityLen() int {
+	return consumer.queueStats().Repro
+}
+
+func (consumer *shadowConsumer) queueStats() runtimeQueueStats {
 	consumer.mu.Lock()
 	defer consumer.mu.Unlock()
-	return len(consumer.priorityQueue)
+	return runtimeQueueStats{
+		FirstRun: len(consumer.queue),
+		Repro:    len(consumer.priorityQueue),
+	}
 }
 
 func (consumer *shadowConsumer) next() (*queue.Request, storedProgram, bool) {

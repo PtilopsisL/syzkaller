@@ -97,6 +97,12 @@ func TestMultiRuntimeCoordinatorSoftFirstRunLimit(t *testing.T) {
 	assert.True(t, throttled)
 	assert.False(t, coord.canGenerateFirstRun())
 
+	snapshot := coord.statsSnapshot()
+	assert.Equal(t, 3, snapshot.FirstRunInflight)
+	assert.True(t, snapshot.FirstRunThrottled)
+	assert.Equal(t, runtimeQueueStats{FirstRun: 3}, snapshot.Queues["shadow-a"])
+	assert.Equal(t, runtimeQueueStats{FirstRun: 3}, snapshot.Queues["shadow-b"])
+
 	shadowAReqs := make([]*queue.Request, len(primary))
 	shadowBReqs := make([]*queue.Request, len(primary))
 	for index := range primary {
@@ -107,6 +113,17 @@ func TestMultiRuntimeCoordinatorSoftFirstRunLimit(t *testing.T) {
 		assert.Equal(t, primary[index].ProgID, shadowAReqs[index].ProgID)
 		assert.Equal(t, primary[index].ProgID, shadowBReqs[index].ProgID)
 	}
+
+	coord.mu.Lock()
+	consumerA := coord.consumers["shadow-a"]
+	primaryReproQueue := coord.runtimeQueueLocked("primary")
+	coord.mu.Unlock()
+	consumerA.enqueuePriority(&queue.Request{ProgID: 100})
+	primaryReproQueue.Submit(&queue.Request{ProgID: 101})
+	snapshot = coord.statsSnapshot()
+	assert.Equal(t, runtimeQueueStats{Repro: 1}, snapshot.Queues["shadow-a"])
+	assert.Equal(t, runtimeQueueStats{}, snapshot.Queues["shadow-b"])
+	assert.Equal(t, runtimeQueueStats{Repro: 1}, snapshot.Queues["primary"])
 
 	completeInitialRun := func(index int) {
 		primary[index].Done(&queue.Result{Status: queue.Success})

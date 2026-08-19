@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/google/syzkaller/pkg/fuzzer/queue"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/report"
 	"github.com/google/syzkaller/pkg/stat"
@@ -170,6 +171,62 @@ func TestInitRuntimeUsesPrimaryNamedStatsInMultiRuntimeMode(t *testing.T) {
 	}
 	assert.Equal(t, 7, statsByName["exec total ["+primaryName+"]"])
 	assert.Zero(t, statsByName["exec total ["+shadowName+"]"])
+}
+
+func TestMultiRuntimeQueueStats(t *testing.T) {
+	primaryName := "primary-queue-stats"
+	shadowName := "shadow-queue-stats"
+	primaryCfg := testManagerConfig(t)
+	shadowCfg := testManagerConfig(t)
+	shadowCfg.Workdir = t.TempDir()
+
+	displayCfg := testManagerConfig(t)
+	displayCfg.PrimaryRuntime = primaryName
+	displayCfg.Runtimes = []mgrconfig.Runtime{
+		{Name: primaryName},
+		{Name: shadowName},
+	}
+	displayCfg.RuntimeConfigs = map[string]*mgrconfig.Config{
+		primaryName: primaryCfg,
+		shadowName:  shadowCfg,
+	}
+
+	mgr := &Manager{
+		cfg:        primaryCfg,
+		displayCfg: displayCfg,
+		mode:       ModeFuzzing,
+	}
+	require.NoError(t, mgr.initRuntime(false))
+	t.Cleanup(func() {
+		require.NoError(t, mgr.closeRuntimes())
+	})
+
+	coord := mgr.programRegistry
+	coord.setFirstRunLimits(2, 1)
+	mgr.initMultiRuntimeStats()
+	coord.EnsureRuntime(shadowName, primaryCfg.Target, allSyscalls(primaryCfg.Target))
+	for range 2 {
+		coord.registerPrimary(primaryName, &queue.Request{Prog: testRegistryProg(primaryCfg.Target)})
+	}
+
+	coord.mu.Lock()
+	shadowConsumer := coord.consumers[shadowName]
+	primaryReproQueue := coord.runtimeQueueLocked(primaryName)
+	coord.mu.Unlock()
+	shadowConsumer.enqueuePriority(&queue.Request{ProgID: 100})
+	primaryReproQueue.Submit(&queue.Request{ProgID: 101})
+
+	assert.Equal(t, 2, mgr.statFirstRunInflight.Val())
+	assert.Equal(t, 1, mgr.statFirstRunThrottled.Val())
+	assert.Zero(t, mgr.statFirstRunQueues[primaryName].Val())
+	assert.Equal(t, 2, mgr.statFirstRunQueues[shadowName].Val())
+	assert.Equal(t, 1, mgr.statReproduceQueues[primaryName].Val())
+	assert.Equal(t, 1, mgr.statReproduceQueues[shadowName].Val())
+}
+
+func TestMultiRuntimePrometheusName(t *testing.T) {
+	assert.Equal(t, "syz_multi_runtime_first_run_queue_linux_next",
+		multiRuntimePrometheusName("syz_multi_runtime_first_run_queue", "linux.next"))
 }
 
 func testManagerConfig(t *testing.T) *mgrconfig.Config {
