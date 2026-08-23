@@ -236,26 +236,34 @@ func (coord *multiRuntimeCoordinator) handleCompletedRun(run *programRun) {
 		if mismatch == nil {
 			return
 		}
-		if mismatch.Outcome != comparisonOutcomeMismatch {
+		store := coord.store
+		resultKind := "runtime mismatch"
+		if mismatch.Outcome == comparisonOutcomeInconclusive {
+			if len(mismatch.UnstableFields) == 0 {
+				log.Logf(1, "runtime comparison for program %d is inconclusive; report not saved",
+					run.ParentID)
+				return
+			}
+			store = coord.unstableStore
+			resultKind = "unstable runtime result"
+		} else if mismatch.Outcome != comparisonOutcomeMismatch {
 			log.Logf(1, "runtime comparison for program %d is inconclusive; report not saved",
 				run.ParentID)
 			return
 		}
-		if coord.store == nil {
-			log.Logf(1, "confirmed runtime mismatch for program %d; no mismatch store configured",
-				run.ParentID)
+		if store == nil {
+			log.Logf(1, "%s for program %d; no report store configured", resultKind, run.ParentID)
 			return
 		}
 		reportRun := *run
 		reportRun.InitialResults = coord.comparisonResults(run.InitialResults)
 		reportRun.Samples = comparisonSamples
-		path, err := coord.store.Save(&reportRun, mismatch)
+		path, err := store.Save(&reportRun, mismatch)
 		if err != nil {
-			log.Logf(0, "failed to save runtime mismatch for program %d: %v", run.ParentID, err)
+			log.Logf(0, "failed to save %s for program %d: %v", resultKind, run.ParentID, err)
 			return
 		}
-		log.Logf(0, "confirmed runtime mismatch for program %d; saved report to %s",
-			run.ParentID, path)
+		log.Logf(0, "%s for program %d; saved report to %s", resultKind, run.ParentID, path)
 	default:
 		panic(fmt.Sprintf("unknown multi-runtime run stage %d", run.Stage))
 	}
@@ -1249,16 +1257,29 @@ func cloneRuntimeCallArgs(args []*runtimeCallArg) []*runtimeCallArg {
 	return ret
 }
 
+const (
+	runtimeMismatchDirName = "runtime-mismatches"
+	runtimeUnstableDirName = "runtime-unstable"
+)
+
 type mismatchStore struct {
 	baseDir string
 }
 
 func newMismatchStore(workdir string) *mismatchStore {
+	return newRuntimeReportStore(workdir, runtimeMismatchDirName)
+}
+
+func newUnstableStore(workdir string) *mismatchStore {
+	return newRuntimeReportStore(workdir, runtimeUnstableDirName)
+}
+
+func newRuntimeReportStore(workdir, dirName string) *mismatchStore {
 	if workdir == "" {
 		return nil
 	}
 	return &mismatchStore{
-		baseDir: filepath.Join(workdir, "runtime-mismatches"),
+		baseDir: filepath.Join(workdir, dirName),
 	}
 }
 

@@ -172,6 +172,7 @@ func TestMultiRuntimeCoordinatorContinuesProgIDFromArtifacts(t *testing.T) {
 	report := []byte(`{"parent_prog_id":48,"repro_prog_id":49}`)
 	require.NoError(t, os.WriteFile(filepath.Join(workdir, "runtime-mismatches", "custom", "report.json"),
 		report, 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(workdir, "runtime-unstable", "prog50-repro51"), 0o755))
 	require.NoError(t, os.MkdirAll(filepath.Join(workdir, "strace-log"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(workdir, "strace-log", "strace.prog31.2.log"), nil, 0o644))
 	require.NoError(t, os.MkdirAll(filepath.Join(workdir, "runtimes", "shadow", "strace-log"), 0o755))
@@ -181,7 +182,7 @@ func TestMultiRuntimeCoordinatorContinuesProgIDFromArtifacts(t *testing.T) {
 	coord := newMultiRuntimeCoordinator(workdir)
 	req := &queue.Request{Prog: testRegistryProg(target)}
 	coord.registerPrimary("primary", req)
-	assert.EqualValues(t, 50, req.ProgID)
+	assert.EqualValues(t, 52, req.ProgID)
 }
 
 func TestMultiRuntimeCoordinatorSchedulesMismatchRepro(t *testing.T) {
@@ -231,6 +232,7 @@ func TestMultiRuntimeCoordinatorSchedulesMismatchRepro(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	reportDir := filepath.Join(coord.store.baseDir, entries[0].Name())
+	assert.NoDirExists(t, coord.unstableStore.baseDir)
 	reportPath := filepath.Join(reportDir, "report.json")
 	assert.FileExists(t, reportPath)
 	assert.FileExists(t, filepath.Join(reportDir, "repro.prog"))
@@ -452,7 +454,7 @@ func TestMultiRuntimeCoordinatorQueuesShadowPriorityRepro(t *testing.T) {
 	assert.NotEqual(t, primaryReq.ProgID, reproReq.ProgID)
 }
 
-func TestMultiRuntimeCoordinatorDoesNotPersistUnstableResults(t *testing.T) {
+func TestMultiRuntimeCoordinatorPersistsUnstableResultsSeparately(t *testing.T) {
 	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
 	require.NoError(t, err)
 
@@ -480,8 +482,20 @@ func TestMultiRuntimeCoordinatorDoesNotPersistUnstableResults(t *testing.T) {
 		shadowRepro.Done(testResult(9, ""))
 	}
 
-	assert.NoFileExists(t, filepath.Join(workdir, "runtime-noise.json"))
 	assert.NoFileExists(t, coord.store.baseDir)
+	entries, err := os.ReadDir(coord.unstableStore.baseDir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	reportPath := filepath.Join(coord.unstableStore.baseDir, entries[0].Name(), "report.json")
+	data, err := os.ReadFile(reportPath)
+	require.NoError(t, err)
+	var report storedMismatchReport
+	require.NoError(t, json.Unmarshal(data, &report))
+	assert.Equal(t, comparisonOutcomeInconclusive, report.Outcome)
+	assert.Empty(t, report.StableDifferences)
+	assert.Contains(t, report.UnstableFields["primary"], "calls[0].error")
+	require.Len(t, report.ReproSamples["primary"], mismatchReproRuns)
+	require.Len(t, report.ReproSamples["shadow"], mismatchReproRuns)
 }
 
 func TestMultiRuntimeCoordinatorIgnoresLegacyNoiseRules(t *testing.T) {

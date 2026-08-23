@@ -84,18 +84,26 @@ func maxPersistedProgID(workdir string) int64 {
 		log.Logf(0, "failed to load runtime program ID state: %v", err)
 	}
 	maxID = maxInt64(maxID, maxProgIDFromMismatchStore(workdir))
+	maxID = maxInt64(maxID, maxProgIDFromUnstableStore(workdir))
 	maxID = maxInt64(maxID, maxProgIDFromStraceLogs(workdir))
 	return maxID
 }
 
 func maxProgIDFromMismatchStore(workdir string) int64 {
-	dir := filepath.Join(workdir, "runtime-mismatches")
+	return maxProgIDFromRuntimeReportStore(filepath.Join(workdir, runtimeMismatchDirName))
+}
+
+func maxProgIDFromUnstableStore(workdir string) int64 {
+	return maxProgIDFromRuntimeReportStore(filepath.Join(workdir, runtimeUnstableDirName))
+}
+
+func maxProgIDFromRuntimeReportStore(dir string) int64 {
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return 0
 	}
 	if err != nil {
-		log.Logf(0, "failed to scan runtime mismatch reports: %v", err)
+		log.Logf(0, "failed to scan runtime reports in %s: %v", dir, err)
 		return 0
 	}
 	var maxID int64

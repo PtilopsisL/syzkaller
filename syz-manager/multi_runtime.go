@@ -140,6 +140,7 @@ type multiRuntimeCoordinator struct {
 	firstRunInflight       int
 	firstRunThrottled      bool
 	store                  *mismatchStore
+	unstableStore          *mismatchStore
 	diffLabels             *runtimeDiffLabelStore
 	outputPolicies         *runtimeOutputPolicyStore
 }
@@ -189,6 +190,7 @@ func newMultiRuntimeCoordinator(workdir string) *multiRuntimeCoordinator {
 		maxFirstRunInflight:    mgrconfig.DefaultMaxFirstRunInflight,
 		resumeFirstRunInflight: mgrconfig.DefaultResumeFirstRunInflight,
 		store:                  newMismatchStore(workdir),
+		unstableStore:          newUnstableStore(workdir),
 	}
 	coord.nextID.Store(maxID)
 	return coord
