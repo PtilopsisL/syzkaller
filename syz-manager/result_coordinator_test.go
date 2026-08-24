@@ -785,6 +785,46 @@ func TestLinuxStatOutputPoliciesReachRuntimeDecoder(t *testing.T) {
 	assert.Equal(t, uint64(17), *device.Value, "raw value must remain available")
 }
 
+func TestTimestampPolicyIgnoresResourceSpecialMetadata(t *testing.T) {
+	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
+	require.NoError(t, err)
+	p := mustDeserializeProg(t, target,
+		`clock_gettime(0x0, &(0x7f0000000000))`)
+	plan := p.OutputCapturePlan(0)
+	require.Len(t, plan, 1)
+
+	makeResult := func(sec, nsec uint64) *runtimeResult {
+		data := make([]byte, plan[0].Size)
+		binary.LittleEndian.PutUint64(data[0:], sec)
+		binary.LittleEndian.PutUint64(data[8:], nsec)
+		res := testResult(0, "")
+		res.Info.Calls[0].ReturnValue = 0
+		res.Info.Calls[0].ReturnValueValid = true
+		res.Info.Calls[0].Outputs = []*flatrpc.OutputCapture{{Id: plan[0].ID, Data: data}}
+		return summarizeRuntimeResult("test", &queue.Request{
+			Prog:     p,
+			ExecOpts: flatrpc.ExecOpts{ExecFlags: flatrpc.ExecFlagCollectOutputs},
+		}, res)
+	}
+
+	zeroSeconds := makeResult(0, 200)
+	oneSecond := makeResult(1, 200)
+	zeroSec := zeroSeconds.Calls[0].Outputs[0].Values[0]
+	oneSec := oneSecond.Calls[0].Outputs[0].Values[0]
+	require.True(t, zeroSec.IdentitySpecial)
+	require.False(t, oneSec.IdentitySpecial)
+	require.NotNil(t, zeroSec.CanonicalValue)
+	require.NotNil(t, oneSec.CanonicalValue)
+	assert.Equal(t, "set", zeroSec.CanonicalValue.State)
+	assert.Equal(t, zeroSec.CanonicalValue, oneSec.CanonicalValue)
+
+	assert.Nil(t, compareRuntimeResults(map[string]*runtimeResult{
+		"zero-seconds": zeroSeconds,
+		"one-second":   oneSecond,
+	}))
+	assert.True(t, zeroSec.IdentitySpecial, "raw result metadata must remain available")
+}
+
 func TestOutputPoliciesReservedCounterAndTimestamp(t *testing.T) {
 	target := &prog.Target{PtrSize: 8}
 	reserved := prog.OutputPolicy{Kind: prog.OutputPolicyReserved}

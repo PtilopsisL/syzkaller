@@ -511,6 +511,7 @@ func clearRuntimeOutputRawValue(output *runtimeDecodedOutput) {
 	output.ValueNames = nil
 	output.RawHex = ""
 	output.DataSummary = nil
+	output.IdentitySpecial = false
 }
 
 type observedComparisonValue struct {
