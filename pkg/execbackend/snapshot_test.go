@@ -8,9 +8,21 @@ import (
 
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSnapshotEnvFlagsDropSyscallTrace(t *testing.T) {
 	flags := flatrpc.ExecEnvSandboxNone | flatrpc.ExecEnvSyscallTrace
 	assert.Equal(t, flatrpc.ExecEnvSandboxNone, snapshotEnvFlags(flags))
+}
+
+func TestSnapshotExecutorEpochPerLifecycle(t *testing.T) {
+	serv := &snapshotServer{}
+	first := serv.newSnapshotExecutor(2)
+	second := serv.newSnapshotExecutor(2)
+
+	assert.Equal(t, 2, first.VM)
+	require.NotZero(t, first.SnapshotEpoch)
+	assert.Equal(t, 2, second.VM)
+	assert.Greater(t, second.SnapshotEpoch, first.SnapshotEpoch)
 }

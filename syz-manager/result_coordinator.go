@@ -1152,6 +1152,7 @@ func (coord *multiRuntimeCoordinator) enqueueMismatchRepro(initial *programRun) 
 		Important:      true,
 		Expected:       expected,
 		Samples:        map[string][]*runtimeResult{},
+		ReproAffinity:  map[string]runtimeReproAffinity{},
 		ReproRuns:      mismatchReproRuns,
 		InitialResults: copyRuntimeResults(initial.Results),
 	}
@@ -1165,16 +1166,20 @@ func (coord *multiRuntimeCoordinator) enqueueMismatchRepro(initial *programRun) 
 	coord.mu.Unlock()
 
 	for runtimeName, runtimeQueue := range queues {
-		coord.submitReproSample(reproRun, runtimeName, runtimeQueue)
+		coord.submitReproSample(reproRun, runtimeName, runtimeQueue, nil)
 	}
 }
 
 func (coord *multiRuntimeCoordinator) submitReproSample(run *programRun, runtimeName string,
-	runtimeQueue *queue.PlainQueue) {
+	runtimeQueue *queue.PlainQueue, targetVM *int) {
 	req := &queue.Request{
 		ProgID:    run.ID,
 		Prog:      run.Prog.Clone(),
 		Important: true,
+	}
+	if targetVM != nil {
+		req.TargetVM = *targetVM
+		req.HasTargetVM = true
 	}
 	fuzzer.EnableSyscallTrace(req)
 	fuzzer.EnableSyscallOutputs(req)

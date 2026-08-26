@@ -63,3 +63,20 @@ func TestDistributorSingleVM(t *testing.T) {
 	// right away without waiting out the recency window.
 	assert.Equal(t, req, dist.Next(0))
 }
+
+func TestDistributorTargetVM(t *testing.T) {
+	q := Plain()
+	dist := Distribute(q)
+	req := &Request{
+		TargetVM:    1,
+		HasTargetVM: true,
+		// A strict target takes precedence over soft avoidance.
+		Avoid: []ExecutorID{{VM: 1}},
+	}
+	q.Submit(req)
+
+	for range 1001 {
+		assert.Nil(t, dist.Next(0))
+	}
+	assert.Equal(t, req, dist.Next(1))
+}

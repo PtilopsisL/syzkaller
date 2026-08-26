@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	flatbuffers "github.com/google/flatbuffers/go"
@@ -28,11 +29,12 @@ type SnapshotConfig struct {
 
 type snapshotServer struct {
 	Server
-	cfg      SnapshotConfig
-	source   *queue.DynamicSourceCtl
-	dist     *queue.Distributor
-	bootDone chan struct{}
-	bootOnce sync.Once
+	cfg               SnapshotConfig
+	source            *queue.DynamicSourceCtl
+	dist              *queue.Distributor
+	bootDone          chan struct{}
+	bootOnce          sync.Once
+	nextSnapshotEpoch atomic.Uint64
 }
 
 func NewSnapshotBackend(base Server, cfg SnapshotConfig) Server {
@@ -99,6 +101,7 @@ func (serv *snapshotServer) RunRequests(ctx context.Context, inst *vm.Instance,
 
 	builder := flatbuffers.NewBuilder(0)
 	var envFlags flatrpc.ExecEnv
+	var executor queue.ExecutorID
 
 	if serv.cfg.Stats.StatNumFuzzing != nil {
 		serv.cfg.Stats.StatNumFuzzing.Add(1)
@@ -121,9 +124,13 @@ func (serv *snapshotServer) RunRequests(ctx context.Context, inst *vm.Instance,
 		}
 		req.ExecOpts.EnvFlags = snapshotEnvFlags(req.ExecOpts.EnvFlags)
 		if first {
+			// Allocate the generation before setup. If setup fails and the VM is
+			// restarted, the failed lifecycle must not be confused with another
+			// setup attempt on the same VM index.
+			executor = serv.newSnapshotExecutor(inst.Index())
 			envFlags = req.ExecOpts.EnvFlags
 			if err := serv.snapshotSetup(inst, builder, envFlags); err != nil {
-				req.Done(&queue.Result{Status: queue.Crashed})
+				req.Done(&queue.Result{Executor: executor, Status: queue.Crashed})
 				return nil, err
 			}
 			first = false
@@ -133,10 +140,11 @@ func (serv *snapshotServer) RunRequests(ctx context.Context, inst *vm.Instance,
 				envFlags, req.ExecOpts.EnvFlags))
 		}
 
-		res, output, err := serv.snapshotRun(inst, builder, req)
+		res, output, err := serv.snapshotRun(inst, builder, req, executor)
 		if err != nil {
 			req.Done(&queue.Result{
-				Status: queue.Crashed,
+				Executor: executor,
+				Status:   queue.Crashed,
 			})
 			return nil, err
 		}
@@ -164,6 +172,13 @@ func (serv *snapshotServer) RunRequests(ctx context.Context, inst *vm.Instance,
 	return nil, nil
 }
 
+func (serv *snapshotServer) newSnapshotExecutor(vm int) queue.ExecutorID {
+	return queue.ExecutorID{
+		VM:            vm,
+		SnapshotEpoch: serv.nextSnapshotEpoch.Add(1),
+	}
+}
+
 func snapshotEnvFlags(flags flatrpc.ExecEnv) flatrpc.ExecEnv {
 	// Snapshot executor does not initialize syscall trace buffers, and environment flags
 	// are fixed when the snapshot is created rather than supplied with each request.
@@ -186,14 +201,16 @@ func (serv *snapshotServer) snapshotSetup(inst *vm.Instance, builder *flatbuffer
 	return inst.SetupSnapshot(builder.FinishedBytes())
 }
 
-func (serv *snapshotServer) snapshotRun(inst *vm.Instance, builder *flatbuffers.Builder, req *queue.Request) (
+func (serv *snapshotServer) snapshotRun(inst *vm.Instance, builder *flatbuffers.Builder, req *queue.Request,
+	executor queue.ExecutorID) (
 	*queue.Result, []byte, error) {
 	progData, err := req.Prog.SerializeForExec()
 	if err != nil {
 		queue.StatExecBufferTooSmall.Add(1)
 		return &queue.Result{
-			Status: queue.ExecFailure,
-			Err:    fmt.Errorf("program serialization failed: %w", err),
+			Executor: executor,
+			Status:   queue.ExecFailure,
+			Err:      fmt.Errorf("program serialization failed: %w", err),
 		}, nil, nil
 	}
 	execOpts := req.EffectiveExecOpts()
@@ -239,11 +256,9 @@ func (serv *snapshotServer) snapshotRun(inst *vm.Instance, builder *flatbuffers.
 	}
 
 	ret := &queue.Result{
-		Executor: queue.ExecutorID{
-			VM: inst.Index(),
-		},
-		Status: queue.Success,
-		Info:   res.Info,
+		Executor: executor,
+		Status:   queue.Success,
+		Info:     res.Info,
 	}
 	if res.Error != "" {
 		ret.Status = queue.ExecFailure

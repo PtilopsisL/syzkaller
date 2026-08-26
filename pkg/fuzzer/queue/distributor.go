@@ -10,8 +10,8 @@ import (
 	"github.com/google/syzkaller/pkg/stat"
 )
 
-// Distributor distributes requests to different VMs during input triage
-// (allows to avoid already used VMs).
+// Distributor distributes requests to different VMs, honoring soft executor
+// avoidance and strict VM targets.
 type Distributor struct {
 	source        Source
 	seq           atomic.Uint64
@@ -44,7 +44,17 @@ func (dist *Distributor) Next(vm int) *Request {
 	}
 	for {
 		req := dist.source.Next()
-		if req == nil || !contains(req.Avoid, vm) || !dist.hasOtherActive(req.Avoid) {
+		if req == nil {
+			return req
+		}
+		if req.HasTargetVM {
+			if req.TargetVM == vm {
+				return req
+			}
+			dist.delay(req)
+			continue
+		}
+		if !contains(req.Avoid, vm) || !dist.hasOtherActive(req.Avoid) {
 			return req
 		}
 		dist.delay(req)
@@ -68,7 +78,14 @@ func (dist *Distributor) delayed(vm int) *Request {
 	defer dist.mu.Unlock()
 	seq := dist.seq.Load()
 	for i, req := range dist.queue {
-		violation := contains(req.Avoid, vm)
+		if req.HasTargetVM && req.TargetVM != vm {
+			continue
+		}
+		// A strict target takes precedence over the soft Avoid list.
+		violation := false
+		if !req.HasTargetVM {
+			violation = contains(req.Avoid, vm)
+		}
 		// The delayedSince check protects from a situation when we had another VM available,
 		// and delayed a request, but then the VM was taken for reproduction and does not
 		// serve requests any more. If we could not dispatch a request in 1000 attempts,

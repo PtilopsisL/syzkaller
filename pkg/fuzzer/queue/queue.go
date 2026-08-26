@@ -48,6 +48,11 @@ type Request struct {
 	// The restriction is soft since there can be only one executor at all or available right now.
 	Avoid []ExecutorID
 
+	// TargetVM, when set, restricts execution to a particular VM. Unlike Avoid,
+	// this is a strict restriction and must not be violated by the distributor.
+	TargetVM    int
+	HasTargetVM bool
+
 	// The callback will be called on request completion in the LIFO order.
 	// If it returns false, all further processing will be stopped.
 	// It allows wrappers to intercept Done() requests.
@@ -74,8 +79,11 @@ func (r *Request) EffectiveExecOpts() flatrpc.ExecOpts {
 }
 
 type ExecutorID struct {
-	VM   int
-	Proc int
+	// SnapshotEpoch is the snapshot lifecycle generation for this VM. It is zero
+	// for non-snapshot executors.
+	VM            int
+	Proc          int
+	SnapshotEpoch uint64
 }
 
 type DoneCallback func(*Request, *Result) bool
@@ -168,6 +176,13 @@ func (r *Request) hash() hash.Sig {
 	}
 	if err := enc.Encode(r.ExecOpts); err != nil {
 		panic(err)
+	}
+	if r.HasTargetVM {
+		// TargetVM changes the execution semantics, so targeted requests must not
+		// be deduplicated with otherwise identical requests.
+		if err := enc.Encode(r.TargetVM); err != nil {
+			panic(err)
+		}
 	}
 	var data []byte
 	switch r.Type {
