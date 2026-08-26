@@ -410,8 +410,8 @@ func TestOutputPolicyAttrs(t *testing.T) {
 foo(arg ptr[out, policy_struct])
 
 policy_struct {
-	value	int64	(output_policy["address"], output_domain["user_memory"], output_mode["strict_identity"], output_scope["value"])
-} [output_policy["timestamp"]]
+	value	int64	(output_policy["address"], output_domain["user_memory"], output_mode["strict_identity"])
+} [output_policy["timestamp"], output_mode["exact"]]
 `
 	var errors []string
 	eh := func(pos ast.Pos, msg string) {
@@ -436,12 +436,14 @@ policy_struct {
 	if found == nil {
 		t.Fatal("compiled policy_struct type was not found")
 	}
-	if found.OutputPolicy.Kind != prog.OutputPolicyTimestamp {
+	if !reflect.DeepEqual(found.OutputPolicy, prog.OutputPolicy{
+		Kind: prog.OutputPolicyTimestamp, Mode: "exact",
+	}) {
 		t.Fatalf("wrong type policy: %+v", found.OutputPolicy)
 	}
 	field := found.Fields[0]
 	want := prog.OutputPolicy{
-		Kind: prog.OutputPolicyAddress, Domain: "user_memory", Mode: "strict_identity", Scope: "value",
+		Kind: prog.OutputPolicyAddress, Domain: "user_memory", Mode: "strict_identity",
 	}
 	if !reflect.DeepEqual(field.OutputPolicy, want) {
 		t.Fatalf("wrong field policy: got %+v, want %+v", field.OutputPolicy, want)

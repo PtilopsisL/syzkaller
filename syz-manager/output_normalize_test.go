@@ -12,33 +12,29 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestTimestampScopesDoNotCrossCalls(t *testing.T) {
+func TestTimestampExactNormalizesEachComponent(t *testing.T) {
 	policy := prog.OutputPolicy{
-		Kind: prog.OutputPolicyTimestamp, Domain: "clock", Scope: "observed",
+		Kind: prog.OutputPolicyTimestamp, Domain: "clock", Mode: "exact",
 	}
-	makeResult := func(values ...uint64) *runtimeResult {
-		calls := make([]runtimeCallResult, len(values))
-		for index, value := range values {
-			calls[index] = runtimeCallResult{
-				Name:        "test",
-				Flags:       flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished,
-				ReturnValue: int64Ptr(0),
-				Outputs: []*runtimeOutputCapture{{
-					ID: uint32(index),
-					Values: []*runtimeDecodedOutput{{
-						Path: "arg[0].sec", Type: "int64", Kind: "int",
-						Value: uint64Ptr(value), OutputPolicy: policy,
-						PolicyScope: "arg[0]#observed",
-					}},
-				}},
-			}
-		}
-		result := &runtimeResult{Status: queue.Success, Calls: calls}
-		normalizeRuntimeOutputs(&prog.Prog{Target: &prog.Target{PtrSize: 8}}, result)
-		return result
+	values := []*runtimeDecodedOutput{
+		{Path: "arg[0].sec", Type: "int64", Kind: "int", Value: uint64Ptr(0), OutputPolicy: policy},
+		{Path: "arg[0].nsec", Type: "int64", Kind: "int", Value: uint64Ptr(123), OutputPolicy: policy},
+	}
+	result := &runtimeResult{
+		Status: queue.Success,
+		Calls: []runtimeCallResult{{
+			Name: "test", Flags: flatrpc.CallFlagExecuted | flatrpc.CallFlagFinished,
+			ReturnValue: int64Ptr(0),
+			Outputs:     []*runtimeOutputCapture{{ID: 0, Values: values}},
+		}},
 	}
 
-	assert.NotNil(t, compareRuntimeResults(map[string]*runtimeResult{
-		"left": makeResult(0, 1), "right": makeResult(1, 0),
-	}))
+	normalizeRuntimeOutputs(&prog.Prog{Target: &prog.Target{PtrSize: 8}}, result)
+
+	assert.Equal(t, &runtimeCanonicalOutput{
+		Kind: string(prog.OutputPolicyTimestamp), State: "exact", Exact: uint64Ptr(0),
+	}, values[0].CanonicalValue)
+	assert.Equal(t, &runtimeCanonicalOutput{
+		Kind: string(prog.OutputPolicyTimestamp), State: "exact", Exact: uint64Ptr(123),
+	}, values[1].CanonicalValue)
 }

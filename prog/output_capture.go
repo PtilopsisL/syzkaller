@@ -3,10 +3,7 @@
 
 package prog
 
-import (
-	"fmt"
-	"strings"
-)
+import "fmt"
 
 const MaxOutputCaptureBytesPerCall = 16 << 10
 
@@ -20,7 +17,6 @@ type OutputCapture struct {
 	Path         string
 	Arg          Arg
 	OutputPolicy OutputPolicy
-	PolicyScope  string
 }
 
 // OutputCapturePlan returns the deterministic post-call capture plan for a call.
@@ -34,18 +30,14 @@ func (p *Prog) OutputCapturePlan(callIndex int) []OutputCapture {
 func outputCapturePlan(target *Target, call *Call) []OutputCapture {
 	var captures []OutputCapture
 	var used uint64
-	var walk func(Arg, string, OutputPolicy, string, OutputPolicy)
-	walk = func(arg Arg, path string, inherited OutputPolicy, inheritedScope string,
-		fieldPolicy OutputPolicy) {
+	var walk func(Arg, string, OutputPolicy, OutputPolicy)
+	walk = func(arg Arg, path string, inherited OutputPolicy, fieldPolicy OutputPolicy) {
 		policy := inherited
-		scope := inheritedScope
 		if typePolicy := TypeOutputPolicy(arg.Type()); !typePolicy.Empty() {
 			policy = MergeOutputPolicy(policy, typePolicy)
-			scope = outputPolicyScope(path, typePolicy.Scope)
 		}
 		if !fieldPolicy.Empty() {
 			policy = MergeOutputPolicy(policy, fieldPolicy)
-			scope = outputPolicyScope(path, fieldPolicy.Scope)
 		}
 		switch a := arg.(type) {
 		case *PointerArg:
@@ -65,12 +57,11 @@ func outputCapturePlan(target *Target, call *Call) []OutputCapture {
 						Path:         path,
 						Arg:          a.Res,
 						OutputPolicy: policy,
-						PolicyScope:  scope,
 					})
 					used += size
 				}
 			}
-			walk(a.Res, path, policy, scope, OutputPolicy{})
+			walk(a.Res, path, policy, OutputPolicy{})
 		case *GroupArg:
 			switch typ := a.Type().(type) {
 			case *StructType:
@@ -83,11 +74,11 @@ func outputCapturePlan(target *Target, call *Call) []OutputCapture {
 							name = typ.Fields[i].Name
 						}
 					}
-					walk(inner, path+"."+name, policy, scope, childPolicy)
+					walk(inner, path+"."+name, policy, childPolicy)
 				}
 			case *ArrayType:
 				for i, inner := range a.Inner {
-					walk(inner, fmt.Sprintf("%s[%d]", path, i), policy, scope, OutputPolicy{})
+					walk(inner, fmt.Sprintf("%s[%d]", path, i), policy, OutputPolicy{})
 				}
 			}
 		case *UnionArg:
@@ -97,7 +88,7 @@ func outputCapturePlan(target *Target, call *Call) []OutputCapture {
 				name = typ.Fields[a.Index].Name
 				childPolicy = typ.Fields[a.Index].OutputPolicy
 			}
-			walk(a.Option, path+"."+name, policy, scope, childPolicy)
+			walk(a.Option, path+"."+name, policy, childPolicy)
 		}
 	}
 	for i, arg := range call.Args {
@@ -105,19 +96,9 @@ func outputCapturePlan(target *Target, call *Call) []OutputCapture {
 		if i < len(call.Meta.Args) {
 			fieldPolicy = call.Meta.Args[i].OutputPolicy
 		}
-		walk(arg, fmt.Sprintf("arg[%d]", i), OutputPolicy{}, "", fieldPolicy)
+		walk(arg, fmt.Sprintf("arg[%d]", i), OutputPolicy{}, fieldPolicy)
 	}
 	return captures
-}
-
-func outputPolicyScope(path, declared string) string {
-	if declared == "" {
-		return path
-	}
-	if index := strings.LastIndexByte(path, '.'); index != -1 {
-		return path[:index] + "#" + declared
-	}
-	return path + "#" + declared
 }
 
 func hasDirectOutputArg(arg Arg) bool {

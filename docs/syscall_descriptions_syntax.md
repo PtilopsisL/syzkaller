@@ -183,19 +183,20 @@ in multi-runtime mode:
 
 ```
 foo {
-	object	int64	(output_policy["object_identity"], output_domain["widget"])
-	sec	int64	(output_policy["timestamp"], output_scope["created"])
-	nsec	int32	(output_policy["timestamp"], output_scope["created"])
+	object		int64	(output_policy["object_identity"], output_domain["widget"])
+	observed_at	int64	(output_policy["timestamp"])
+	stable_epoch	int64	(output_policy["timestamp"], output_mode["exact"])
 }
 ```
 
 `output_policy` accepts `semantic` (the default), `resource_identity`,
 `object_identity`, `address`, `timestamp`, `filesystem_identity`, `counter`,
 `reserved`, and `version_identity`. `output_domain` separates identity
-namespaces, `output_mode` selects a policy-specific comparison mode, and
-`output_scope` joins sibling fields into one semantic value. The same four
-attributes may be placed on a struct or union, where they are inherited by its
-output fields unless a more specific declaration overrides them.
+namespaces, and `output_mode` selects a policy-specific comparison mode. Timestamp
+outputs are ignored by default; `output_mode["exact"]` compares each annotated
+output field exactly. The same three attributes may be placed on a struct or
+union, where they are inherited by its output fields unless a more specific
+declaration overrides them.
 
 These attributes only affect the comparison view. Raw executor output is still
 recorded. `reserved` fields are omitted from comparison, while

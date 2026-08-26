@@ -785,7 +785,7 @@ func TestLinuxStatOutputPoliciesReachRuntimeDecoder(t *testing.T) {
 	assert.Equal(t, uint64(17), *device.Value, "raw value must remain available")
 }
 
-func TestTimestampPolicyIgnoresResourceSpecialMetadata(t *testing.T) {
+func TestTimestampPolicyIsIgnoredByDefault(t *testing.T) {
 	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
 	require.NoError(t, err)
 	p := mustDeserializeProg(t, target,
@@ -813,10 +813,8 @@ func TestTimestampPolicyIgnoresResourceSpecialMetadata(t *testing.T) {
 	oneSec := oneSecond.Calls[0].Outputs[0].Values[0]
 	require.True(t, zeroSec.IdentitySpecial)
 	require.False(t, oneSec.IdentitySpecial)
-	require.NotNil(t, zeroSec.CanonicalValue)
-	require.NotNil(t, oneSec.CanonicalValue)
-	assert.Equal(t, "set", zeroSec.CanonicalValue.State)
-	assert.Equal(t, zeroSec.CanonicalValue, oneSec.CanonicalValue)
+	assert.Nil(t, zeroSec.CanonicalValue)
+	assert.Nil(t, oneSec.CanonicalValue)
 
 	assert.Nil(t, compareRuntimeResults(map[string]*runtimeResult{
 		"zero-seconds": zeroSeconds,
@@ -844,18 +842,26 @@ func TestOutputPoliciesReservedCounterAndTimestamp(t *testing.T) {
 	}))
 
 	timestamp := prog.OutputPolicy{
-		Kind: prog.OutputPolicyTimestamp, Domain: "filesystem", Scope: "mtime",
+		Kind: prog.OutputPolicyTimestamp, Domain: "filesystem",
 	}
 	assert.Nil(t, compareRuntimeResults(map[string]*runtimeResult{
 		"old": runtimeResultWithPolicy(target, timestamp, 100, 200),
 		"new": runtimeResultWithPolicy(target, timestamp, 200, 300),
 	}))
-	valid := runtimeResultWithNamedPolicy(target, timestamp,
-		[]string{"arg[0].sec", "arg[0].nsec"}, []uint64{100, 200})
-	invalid := runtimeResultWithNamedPolicy(target, timestamp,
-		[]string{"arg[0].sec", "arg[0].nsec"}, []uint64{100, 1_000_000_000})
+	assert.Nil(t, compareRuntimeResults(map[string]*runtimeResult{
+		"valid":   runtimeResultWithPolicy(target, timestamp, 100, 200),
+		"invalid": runtimeResultWithPolicy(target, timestamp, 100, 1_000_000_000),
+	}))
+
+	exactTimestamp := timestamp
+	exactTimestamp.Mode = "exact"
+	assert.Nil(t, compareRuntimeResults(map[string]*runtimeResult{
+		"left":  runtimeResultWithPolicy(target, exactTimestamp, 100, 200),
+		"right": runtimeResultWithPolicy(target, exactTimestamp, 100, 200),
+	}))
 	assert.NotNil(t, compareRuntimeResults(map[string]*runtimeResult{
-		"valid": valid, "invalid": invalid,
+		"left":  runtimeResultWithPolicy(target, exactTimestamp, 100, 200),
+		"right": runtimeResultWithPolicy(target, exactTimestamp, 100, 201),
 	}))
 }
 
@@ -914,7 +920,7 @@ func runtimeResultWithNamedPolicy(target *prog.Target, policy prog.OutputPolicy,
 	for index, value := range values {
 		outputs[index] = &runtimeDecodedOutput{
 			Path: paths[index], Type: "int64", Kind: "int", Value: uint64Ptr(value),
-			OutputPolicy: policy, PolicySource: "test", PolicyScope: policy.Scope,
+			OutputPolicy: policy, PolicySource: "test",
 		}
 	}
 	result := &runtimeResult{

@@ -44,16 +44,15 @@ var (
 	attrOutputPolicy = &attrDesc{Name: "output_policy", Type: stringAttr}
 	attrOutputDomain = &attrDesc{Name: "output_domain", Type: stringAttr}
 	attrOutputMode   = &attrDesc{Name: "output_mode", Type: stringAttr}
-	attrOutputScope  = &attrDesc{Name: "output_scope", Type: stringAttr}
 
 	structAttrs = makeAttrs(attrPacked, attrSize, attrAlign,
-		attrOutputPolicy, attrOutputDomain, attrOutputMode, attrOutputScope)
+		attrOutputPolicy, attrOutputDomain, attrOutputMode)
 	unionAttrs = makeAttrs(attrVarlen, attrSize,
-		attrOutputPolicy, attrOutputDomain, attrOutputMode, attrOutputScope)
+		attrOutputPolicy, attrOutputDomain, attrOutputMode)
 	structFieldAttrs = makeAttrs(attrIn, attrOut, attrInOut, attrOutOverlay, attrIf,
-		attrOutputPolicy, attrOutputDomain, attrOutputMode, attrOutputScope)
+		attrOutputPolicy, attrOutputDomain, attrOutputMode)
 	unionFieldAttrs = makeAttrs(attrIn, attrIf,
-		attrOutputPolicy, attrOutputDomain, attrOutputMode, attrOutputScope) // attrIn is safe.
+		attrOutputPolicy, attrOutputDomain, attrOutputMode) // attrIn is safe.
 	callAttrs = make(map[string]*attrDesc)
 )
 

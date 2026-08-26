@@ -139,11 +139,6 @@ func applyRuntimeOutputPolicies(callName string, captures []*runtimeOutputCaptur
 				}
 				output.OutputPolicy = prog.MergeOutputPolicy(output.OutputPolicy, rule.Policy)
 				output.PolicySource = "external:" + rule.ID
-				if rule.Policy.Scope != "" {
-					output.PolicyScope = runtimeOutputPolicyScope(output.Path, rule.Policy.Scope)
-				} else if output.PolicyScope == "" || matchedID == "" {
-					output.PolicyScope = output.Path
-				}
 				matchedID = rule.ID
 			}
 		}

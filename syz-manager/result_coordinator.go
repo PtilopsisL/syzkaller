@@ -107,7 +107,6 @@ type runtimeDecodedOutput struct {
 	DataSummary      *runtimeDataSummary     `json:"data_summary,omitempty"`
 	OutputPolicy     prog.OutputPolicy       `json:"output_policy"`
 	PolicySource     string                  `json:"policy_source,omitempty"`
-	PolicyScope      string                  `json:"policy_scope,omitempty"`
 	IdentitySpecial  bool                    `json:"identity_special,omitempty"`
 	CanonicalValue   *runtimeCanonicalOutput `json:"canonical_value,omitempty"`
 	NormalizationErr string                  `json:"normalization_error,omitempty"`
@@ -489,7 +488,8 @@ func comparisonRuntimeOutputCaptures(captures []*runtimeOutputCapture) []*runtim
 				continue
 			}
 			kind := output.OutputPolicy.EffectiveKind()
-			if kind == prog.OutputPolicyReserved {
+			if kind == prog.OutputPolicyReserved ||
+				(kind == prog.OutputPolicyTimestamp && output.OutputPolicy.Mode != "exact") {
 				continue
 			}
 			if output.CanonicalValue != nil && output.NormalizationErr == "" {

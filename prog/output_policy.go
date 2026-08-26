@@ -35,14 +35,12 @@ var validOutputPolicyKinds = map[OutputPolicyKind]bool{
 }
 
 // OutputPolicy is comparison metadata, not an executor instruction. Domain
-// separates independent identity namespaces, Mode selects a generic handler
-// mode, and Scope joins fields that must be interpreted as one value (for
-// example the seconds and nanoseconds of a timestamp).
+// separates independent identity namespaces and Mode selects a generic handler
+// mode.
 type OutputPolicy struct {
 	Kind   OutputPolicyKind `json:"kind,omitempty"`
 	Domain string           `json:"domain,omitempty"`
 	Mode   string           `json:"mode,omitempty"`
-	Scope  string           `json:"scope,omitempty"`
 }
 
 func ParseOutputPolicyKind(value string) (OutputPolicyKind, error) {
@@ -84,7 +82,7 @@ func (policy OutputPolicy) EffectiveKind() OutputPolicyKind {
 }
 
 func (policy OutputPolicy) Empty() bool {
-	return policy.Kind == "" && policy.Domain == "" && policy.Mode == "" && policy.Scope == ""
+	return policy.Kind == "" && policy.Domain == "" && policy.Mode == ""
 }
 
 // MergeOutputPolicy applies a more specific declaration without discarding
@@ -98,9 +96,6 @@ func MergeOutputPolicy(base, override OutputPolicy) OutputPolicy {
 	}
 	if override.Mode != "" {
 		base.Mode = override.Mode
-	}
-	if override.Scope != "" {
-		base.Scope = override.Scope
 	}
 	return base
 }

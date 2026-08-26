@@ -6,7 +6,6 @@ package main
 import (
 	"fmt"
 	"math/bits"
-	"strings"
 
 	"github.com/google/syzkaller/prog"
 )
@@ -24,7 +23,6 @@ func normalizeRuntimeOutputs(p *prog.Prog, result *runtimeResult) {
 		target:     p.Target,
 		identities: make(map[string]map[uint64]int),
 	}
-	timestamps := make(map[string][]*runtimeDecodedOutput)
 	for callIndex := range result.Calls {
 		for _, capture := range result.Calls[callIndex].Outputs {
 			if capture == nil {
@@ -48,12 +46,7 @@ func normalizeRuntimeOutputs(p *prog.Prog, result *runtimeResult) {
 				case prog.OutputPolicyAddress:
 					normalizer.normalizeAddress(output)
 				case prog.OutputPolicyTimestamp:
-					scope := output.PolicyScope
-					if scope == "" {
-						scope = output.Path
-					}
-					scope = fmt.Sprintf("%d/%d/%s", callIndex, capture.ID, scope)
-					timestamps[scope] = append(timestamps[scope], output)
+					normalizeTimestamp(output)
 				case prog.OutputPolicyCounter:
 					normalizer.normalizeCounter(output)
 				default:
@@ -62,9 +55,6 @@ func normalizeRuntimeOutputs(p *prog.Prog, result *runtimeResult) {
 				}
 			}
 		}
-	}
-	for _, group := range timestamps {
-		normalizeTimestampGroup(group)
 	}
 }
 
@@ -169,54 +159,17 @@ func (normalizer *runtimeOutputCanonicalizer) normalizeCounter(output *runtimeDe
 	}
 }
 
-func normalizeTimestampGroup(group []*runtimeDecodedOutput) {
-	if len(group) == 0 {
+func normalizeTimestamp(output *runtimeDecodedOutput) {
+	if output.OutputPolicy.Mode != "exact" {
 		return
 	}
-	if group[0].OutputPolicy.Mode == "exact" {
-		for _, output := range group {
-			if output.Value == nil {
-				output.NormalizationErr = "timestamp component is not an integer"
-				continue
-			}
-			output.CanonicalValue = &runtimeCanonicalOutput{
-				Kind: string(prog.OutputPolicyTimestamp), State: "exact",
-				Exact: uint64Ptr(*output.Value),
-			}
-		}
+	if output.Value == nil {
+		output.NormalizationErr = "timestamp output is not an integer"
 		return
 	}
-	state := "zero"
-	valid := true
-	for _, output := range group {
-		if output.Value == nil {
-			valid = false
-			continue
-		}
-		if *output.Value != 0 {
-			state = "set"
-		}
-		name := strings.ToLower(output.Path)
-		switch {
-		case strings.HasSuffix(name, "nsec") || strings.HasSuffix(name, "nanoseconds"):
-			valid = valid && *output.Value < 1_000_000_000
-		case strings.HasSuffix(name, "usec") || strings.HasSuffix(name, "microseconds"):
-			valid = valid && *output.Value < 1_000_000
-		}
-	}
-	if !valid {
-		state = "invalid"
-	}
-	for _, output := range group {
-		if output.Value == nil {
-			output.NormalizationErr = "timestamp component is not an integer"
-			continue
-		}
-		output.CanonicalValue = &runtimeCanonicalOutput{
-			Kind:   string(prog.OutputPolicyTimestamp),
-			Domain: output.OutputPolicy.Domain,
-			State:  state,
-		}
+	output.CanonicalValue = &runtimeCanonicalOutput{
+		Kind: string(prog.OutputPolicyTimestamp), State: "exact",
+		Exact: uint64Ptr(*output.Value),
 	}
 }
 

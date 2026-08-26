@@ -822,12 +822,12 @@ stat {
 	st_blksize	int32
 	__pad2		const[0, int32]	(output_policy["reserved"])
 	st_blocks	intptr
-	st_atime	intptr	(output_policy["timestamp"], output_domain["filesystem"], output_scope["atime"])
-	st_atime_nsec	intptr	(output_policy["timestamp"], output_domain["filesystem"], output_scope["atime"])
-	st_mtime	intptr	(output_policy["timestamp"], output_domain["filesystem"], output_scope["mtime"])
-	st_mtime_nsec	intptr	(output_policy["timestamp"], output_domain["filesystem"], output_scope["mtime"])
-	st_ctime	intptr	(output_policy["timestamp"], output_domain["filesystem"], output_scope["ctime"])
-	st_ctime_nsec	intptr	(output_policy["timestamp"], output_domain["filesystem"], output_scope["ctime"])
+	st_atime	intptr	(output_policy["timestamp"], output_domain["filesystem"])
+	st_atime_nsec	intptr	(output_policy["timestamp"], output_domain["filesystem"])
+	st_mtime	intptr	(output_policy["timestamp"], output_domain["filesystem"])
+	st_mtime_nsec	intptr	(output_policy["timestamp"], output_domain["filesystem"])
+	st_ctime	intptr	(output_policy["timestamp"], output_domain["filesystem"])
+	st_ctime_nsec	intptr	(output_policy["timestamp"], output_domain["filesystem"])
 	__unused4	const[0, int32]	(output_policy["reserved"])
 	__unused5	const[0, int32]	(output_policy["reserved"])
 }

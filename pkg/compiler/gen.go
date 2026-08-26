@@ -536,7 +536,6 @@ func (comp *compiler) genOutputPolicy(attrs map[*attrDesc]string, pos ast.Pos) p
 	policy := prog.OutputPolicy{
 		Domain: attrs[attrOutputDomain],
 		Mode:   attrs[attrOutputMode],
-		Scope:  attrs[attrOutputScope],
 	}
 	if value := attrs[attrOutputPolicy]; value != "" {
 		kind, err := prog.ParseOutputPolicyKind(value)
