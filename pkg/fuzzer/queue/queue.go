@@ -61,6 +61,18 @@ type Request struct {
 	done   chan struct{}
 }
 
+// EffectiveExecOpts returns the execution options that should be sent to the executor.
+// Programs with an ID must execute syscalls synchronously so that their execution order
+// remains deterministic. Keep the stored options unchanged because queue wrappers may
+// reuse the request.
+func (r *Request) EffectiveExecOpts() flatrpc.ExecOpts {
+	opts := r.ExecOpts
+	if r.Type == flatrpc.RequestTypeProgram && r.Prog != nil && r.ProgID != 0 {
+		opts.ExecFlags &^= flatrpc.ExecFlagThreaded
+	}
+	return opts
+}
+
 type ExecutorID struct {
 	VM   int
 	Proc int

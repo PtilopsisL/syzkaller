@@ -84,3 +84,47 @@ func TestUnsupportedDoesNotStop(t *testing.T) {
 	res := &Result{Status: Unsupported}
 	assert.False(t, res.Stop())
 }
+
+func TestEffectiveExecOpts(t *testing.T) {
+	const flags = flatrpc.ExecFlagThreaded | flatrpc.ExecFlagCollectSignal
+	tests := []struct {
+		name     string
+		req      *Request
+		threaded bool
+	}{
+		{
+			name: "program without ID",
+			req: &Request{
+				Prog:     &prog.Prog{},
+				ExecOpts: flatrpc.ExecOpts{ExecFlags: flags},
+			},
+			threaded: true,
+		},
+		{
+			name: "program with ID",
+			req: &Request{
+				ProgID:   1,
+				Prog:     &prog.Prog{},
+				ExecOpts: flatrpc.ExecOpts{ExecFlags: flags},
+			},
+			threaded: false,
+		},
+		{
+			name: "non-program request with ID",
+			req: &Request{
+				Type:     flatrpc.RequestTypeBinary,
+				ProgID:   1,
+				ExecOpts: flatrpc.ExecOpts{ExecFlags: flags},
+			},
+			threaded: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			opts := test.req.EffectiveExecOpts()
+			assert.Equal(t, test.threaded, opts.ExecFlags&flatrpc.ExecFlagThreaded != 0)
+			assert.NotZero(t, opts.ExecFlags&flatrpc.ExecFlagCollectSignal)
+			assert.NotZero(t, test.req.ExecOpts.ExecFlags&flatrpc.ExecFlagThreaded)
+		})
+	}
+}

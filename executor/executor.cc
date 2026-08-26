@@ -1187,7 +1187,6 @@ void execute_one()
 			// Execute directly.
 			if (th != &threads[0])
 				fail("using non-main thread in non-thread mode");
-			event_reset(&th->ready);
 			execute_call(th);
 			event_set(&th->done);
 			handle_completion(th);
@@ -1286,7 +1285,8 @@ thread_t* schedule_call(int call_index, int call_num, uint64 copyout_index, uint
 	th->outputs.clear();
 	for (int i = 0; i < kMaxArgs; i++)
 		th->args[i] = args[i];
-	event_set(&th->ready);
+	if (flag_threaded)
+		event_set(&th->ready);
 	running++;
 	return th;
 }

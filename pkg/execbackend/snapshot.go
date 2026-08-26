@@ -196,8 +196,9 @@ func (serv *snapshotServer) snapshotRun(inst *vm.Instance, builder *flatbuffers.
 			Err:    fmt.Errorf("program serialization failed: %w", err),
 		}, nil, nil
 	}
+	execOpts := req.EffectiveExecOpts()
 	msg := flatrpc.SnapshotRequestT{
-		ExecFlags: req.ExecOpts.ExecFlags,
+		ExecFlags: execOpts.ExecFlags,
 		NumCalls:  int32(len(req.Prog.Calls)),
 		ProgData:  progData,
 	}

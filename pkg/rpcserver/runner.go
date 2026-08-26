@@ -325,7 +325,7 @@ func (runner *Runner) sendRequest(req *queue.Request) error {
 	for i, call := range req.ReturnAllSignal {
 		allSignal[i] = int32(call)
 	}
-	opts := req.ExecOpts
+	opts := req.EffectiveExecOpts()
 	if runner.debug {
 		opts.EnvFlags |= flatrpc.ExecEnvDebug
 	}
