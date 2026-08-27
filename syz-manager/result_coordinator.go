@@ -230,42 +230,72 @@ func (coord *multiRuntimeCoordinator) handleCompletedRun(run *programRun) {
 		}
 		coord.enqueueMismatchRepro(run)
 	case runStageRepro:
-		comparisonSamples := coord.comparisonSamples(run.Samples)
-		mismatch := compareRuntimeSamples(comparisonSamples, coord.diffLabels)
-		if mismatch == nil {
+		coord.handleCompletedRepro(run)
+	case runStageMinimize:
+		mismatch := compareRuntimeSamples(coord.comparisonSamples(run.Samples), coord.diffLabels)
+		if run.Completion == nil {
+			panic(fmt.Sprintf("minimize run %d has no completion channel", run.ID))
+		}
+		select {
+		case run.Completion <- runtimeComparisonCompletion{Mismatch: mismatch}:
+		case <-coord.done:
+		}
+	default:
+		panic(fmt.Sprintf("unknown multi-runtime run stage %d", run.Stage))
+	}
+}
+
+func (coord *multiRuntimeCoordinator) handleCompletedRepro(run *programRun) {
+	mismatch := compareRuntimeSamples(coord.comparisonSamples(run.Samples), coord.diffLabels)
+	if mismatch == nil {
+		return
+	}
+	if mismatch.Outcome == comparisonOutcomeMismatch && coord.store != nil {
+		identity, callIndex, ok := firstRuntimeMismatchCallIdentity(run.Prog, mismatch)
+		if ok {
+			// Preserve the stable pre-minimization reproducer and its samples for
+			// comparison with the separately saved final minimized report.
+			coord.saveRuntimeReport(run, mismatch)
+			log.Logf(1, "runtime mismatch for program %d reproduced; minimizing first mismatching syscall %s",
+				run.ParentID, identity.CallName)
+			go coord.minimizeRuntimeMismatch(run, mismatch, identity, callIndex)
 			return
 		}
-		store := coord.store
-		resultKind := "runtime mismatch"
-		if mismatch.Outcome == comparisonOutcomeInconclusive {
-			if len(mismatch.UnstableFields) == 0 {
-				log.Logf(1, "runtime comparison for program %d is inconclusive; report not saved",
-					run.ParentID)
-				return
-			}
-			store = coord.unstableStore
-			resultKind = "unstable runtime result"
-		} else if mismatch.Outcome != comparisonOutcomeMismatch {
+		log.Logf(1, "runtime mismatch for program %d has no syscall-scoped difference; saving without minimization",
+			run.ParentID)
+	}
+	coord.saveRuntimeReport(run, mismatch)
+}
+
+func (coord *multiRuntimeCoordinator) saveRuntimeReport(run *programRun, mismatch *runtimeMismatch) {
+	store := coord.store
+	resultKind := "runtime mismatch"
+	if mismatch.Outcome == comparisonOutcomeInconclusive {
+		if len(mismatch.UnstableFields) == 0 {
 			log.Logf(1, "runtime comparison for program %d is inconclusive; report not saved",
 				run.ParentID)
 			return
 		}
-		if store == nil {
-			log.Logf(1, "%s for program %d; no report store configured", resultKind, run.ParentID)
-			return
-		}
-		reportRun := *run
-		reportRun.InitialResults = coord.comparisonResults(run.InitialResults)
-		reportRun.Samples = comparisonSamples
-		path, err := store.Save(&reportRun, mismatch)
-		if err != nil {
-			log.Logf(0, "failed to save %s for program %d: %v", resultKind, run.ParentID, err)
-			return
-		}
-		log.Logf(0, "%s for program %d; saved report to %s", resultKind, run.ParentID, path)
-	default:
-		panic(fmt.Sprintf("unknown multi-runtime run stage %d", run.Stage))
+		store = coord.unstableStore
+		resultKind = "unstable runtime result"
+	} else if mismatch.Outcome != comparisonOutcomeMismatch {
+		log.Logf(1, "runtime comparison for program %d is inconclusive; report not saved",
+			run.ParentID)
+		return
 	}
+	if store == nil {
+		log.Logf(1, "%s for program %d; no report store configured", resultKind, run.ParentID)
+		return
+	}
+	reportRun := *run
+	reportRun.InitialResults = coord.comparisonResults(run.InitialResults)
+	reportRun.Samples = coord.comparisonSamples(run.Samples)
+	path, err := store.Save(&reportRun, mismatch)
+	if err != nil {
+		log.Logf(0, "failed to save %s for program %d: %v", resultKind, run.ParentID, err)
+		return
+	}
+	log.Logf(0, "%s for program %d; saved report to %s", resultKind, run.ParentID, path)
 }
 
 func (coord *multiRuntimeCoordinator) comparisonResults(
@@ -1138,6 +1168,179 @@ func cloneInt64(v *int64) *int64 {
 		return nil
 	}
 	return int64Ptr(*v)
+}
+
+type runtimeMismatchDifferenceIdentity struct {
+	Kind         string
+	Path         string
+	OutputPolicy string
+	Values       map[string]any
+}
+
+type runtimeMismatchCallIdentity struct {
+	CallName    string
+	Differences []runtimeMismatchDifferenceIdentity
+}
+
+func firstRuntimeMismatchCallIdentity(p *prog.Prog, mismatch *runtimeMismatch) (
+	runtimeMismatchCallIdentity, int, bool) {
+	if p == nil || mismatch == nil {
+		return runtimeMismatchCallIdentity{}, -1, false
+	}
+	firstCall := len(p.Calls)
+	for _, difference := range mismatch.StableDifferences {
+		if difference.CallIndex == nil {
+			continue
+		}
+		callIndex := *difference.CallIndex
+		if callIndex >= 0 && callIndex < firstCall && callIndex < len(p.Calls) {
+			firstCall = callIndex
+		}
+	}
+	if firstCall == len(p.Calls) {
+		return runtimeMismatchCallIdentity{}, -1, false
+	}
+	identity := runtimeMismatchCallIdentity{CallName: p.CallName(firstCall)}
+	for _, difference := range mismatch.StableDifferences {
+		if difference.CallIndex == nil || *difference.CallIndex != firstCall {
+			continue
+		}
+		identity.Differences = append(identity.Differences, runtimeMismatchDifferenceIdentity{
+			Kind:         difference.Kind,
+			Path:         normalizeRuntimeDifferencePath(difference.Path),
+			OutputPolicy: difference.OutputPolicy,
+			Values:       difference.Values,
+		})
+	}
+	sort.Slice(identity.Differences, func(i, j int) bool {
+		left, right := identity.Differences[i], identity.Differences[j]
+		if left.Path != right.Path {
+			return left.Path < right.Path
+		}
+		if left.Kind != right.Kind {
+			return left.Kind < right.Kind
+		}
+		return left.OutputPolicy < right.OutputPolicy
+	})
+	return identity, firstCall, true
+}
+
+func (identity runtimeMismatchCallIdentity) matches(p *prog.Prog, mismatch *runtimeMismatch,
+	callIndex int) bool {
+	candidate, candidateCall, ok := firstRuntimeMismatchCallIdentity(p, mismatch)
+	return ok && candidateCall == callIndex && reflect.DeepEqual(identity, candidate)
+}
+
+func copyRuntimeReproAffinity(
+	affinity map[string]runtimeReproAffinity) map[string]runtimeReproAffinity {
+	ret := make(map[string]runtimeReproAffinity, len(affinity))
+	for runtimeName, value := range affinity {
+		ret[runtimeName] = value
+	}
+	return ret
+}
+
+func (coord *multiRuntimeCoordinator) minimizeRuntimeMismatch(reproduced *programRun,
+	baseline *runtimeMismatch, identity runtimeMismatchCallIdentity, callIndex int) {
+	coord.mu.Lock()
+	mode := coord.mismatchMinimizeMode
+	coord.mu.Unlock()
+
+	affinity := copyRuntimeReproAffinity(reproduced.ReproAffinity)
+	stopped := false
+	minimized, minimizedCall := prog.Minimize(reproduced.Prog.Clone(), callIndex, mode,
+		func(candidate *prog.Prog, candidateCall int) bool {
+			if stopped || len(candidate.Calls) == 0 {
+				return false
+			}
+			candidateRun, mismatch, ok := coord.executeMismatchCandidate(reproduced, candidate, affinity,
+				mismatchMinimizeCandidateRuns)
+			if candidateRun != nil {
+				affinity = copyRuntimeReproAffinity(candidateRun.ReproAffinity)
+			}
+			if !ok {
+				stopped = true
+				return false
+			}
+			return mismatch != nil && mismatch.Outcome == comparisonOutcomeMismatch &&
+				identity.matches(candidate, mismatch, candidateCall)
+		})
+	if stopped || coord.closed() {
+		return
+	}
+
+	finalRun, finalMismatch, ok := coord.executeMismatchCandidate(reproduced, minimized, affinity,
+		mismatchReproRuns)
+	if ok && finalMismatch != nil && finalMismatch.Outcome == comparisonOutcomeMismatch &&
+		identity.matches(minimized, finalMismatch, minimizedCall) {
+		finalRun.InitialResults = copyRuntimeResults(reproduced.InitialResults)
+		log.Logf(0, "minimized runtime mismatch for program %d from %d to %d calls",
+			reproduced.ParentID, len(reproduced.Prog.Calls), len(minimized.Calls))
+		coord.saveRuntimeReport(finalRun, finalMismatch)
+		return
+	}
+	if coord.closed() {
+		return
+	}
+	log.Logf(1, "final minimized program for runtime mismatch %d did not reproduce; saving original repro",
+		reproduced.ParentID)
+	coord.saveRuntimeReport(reproduced, baseline)
+}
+
+func (coord *multiRuntimeCoordinator) executeMismatchCandidate(base *programRun, candidate *prog.Prog,
+	affinity map[string]runtimeReproAffinity, reproRuns int) (*programRun, *runtimeMismatch, bool) {
+	if coord.closed() {
+		return nil, nil, false
+	}
+	run := &programRun{
+		ID:            coord.allocateProgID(),
+		ParentID:      base.ParentID,
+		Stage:         runStageMinimize,
+		Prog:          candidate.Clone(),
+		ProgData:      candidate.Serialize(),
+		Important:     true,
+		Expected:      copyExpectedRuntimes(base.Expected),
+		Samples:       map[string][]*runtimeResult{},
+		ReproAffinity: copyRuntimeReproAffinity(affinity),
+		ReproRuns:     reproRuns,
+		Completion:    make(chan runtimeComparisonCompletion, 1),
+	}
+
+	coord.mu.Lock()
+	if coord.closed() {
+		coord.mu.Unlock()
+		return nil, nil, false
+	}
+	coord.runs[run.ID] = run
+	queues := make(map[string]*queue.PlainQueue, len(run.Expected))
+	for runtimeName := range run.Expected {
+		queues[runtimeName] = coord.runtimeQueueLocked(runtimeName)
+	}
+	coord.mu.Unlock()
+
+	for runtimeName, runtimeQueue := range queues {
+		var targetVM *int
+		if runtimeAffinity, ok := run.ReproAffinity[runtimeName]; ok {
+			vm := runtimeAffinity.VM
+			targetVM = &vm
+		}
+		coord.submitReproSample(run, runtimeName, runtimeQueue, targetVM)
+	}
+	select {
+	case completion := <-run.Completion:
+		return run, completion.Mismatch, true
+	case <-coord.done:
+		return run, nil, false
+	}
+}
+
+func (coord *multiRuntimeCoordinator) closed() bool {
+	select {
+	case <-coord.done:
+		return true
+	default:
+		return false
+	}
 }
 
 func (coord *multiRuntimeCoordinator) enqueueMismatchRepro(initial *programRun) {

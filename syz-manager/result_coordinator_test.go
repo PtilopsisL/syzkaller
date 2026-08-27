@@ -43,6 +43,65 @@ func TestSummarizeRuntimeResultIncludesSyscallArgs(t *testing.T) {
 	assert.Equal(t, uint64(0x17), *pid.Value)
 }
 
+func TestFirstRuntimeMismatchCallIdentityTracksCallRemoval(t *testing.T) {
+	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
+	require.NoError(t, err)
+	original := mustDeserializeProg(t, target, `getpid()
+ptrace(0x10, 0x17)
+getpid()`)
+	secondCall, thirdCall := 1, 2
+	baseValues := map[string]any{"primary": int32(1), "shadow": int32(9)}
+	baseMismatch := &runtimeMismatch{
+		Outcome: comparisonOutcomeMismatch,
+		StableDifferences: []runtimeFieldDifference{
+			{
+				Kind: "errno", Path: "calls[1].error", Values: baseValues,
+				CallIndex: &secondCall,
+			},
+			{
+				Kind: "return_value", Path: "calls[1].return_value",
+				Values:    map[string]any{"primary": int64(-1), "shadow": int64(0)},
+				CallIndex: &secondCall,
+			},
+			{
+				Kind: "errno", Path: "calls[2].error",
+				Values:    map[string]any{"primary": int32(0), "shadow": int32(0)},
+				CallIndex: &thirdCall,
+			},
+		},
+	}
+
+	identity, callIndex, ok := firstRuntimeMismatchCallIdentity(original, baseMismatch)
+	require.True(t, ok)
+	assert.Equal(t, 1, callIndex)
+	assert.Equal(t, "ptrace", identity.CallName)
+	assert.Len(t, identity.Differences, 2)
+
+	candidate := original.Clone()
+	candidate.RemoveCall(0)
+	candidateCall := 0
+	candidateMismatch := &runtimeMismatch{
+		Outcome: comparisonOutcomeMismatch,
+		StableDifferences: []runtimeFieldDifference{
+			{
+				Kind: "errno", Path: "calls[0].error", Values: baseValues,
+				CallIndex: &candidateCall,
+			},
+			{
+				Kind: "return_value", Path: "calls[0].return_value",
+				Values:    map[string]any{"primary": int64(-1), "shadow": int64(0)},
+				CallIndex: &candidateCall,
+			},
+		},
+	}
+	assert.True(t, identity.matches(candidate, candidateMismatch, candidateCall))
+
+	candidateMismatch.StableDifferences[0].Values = map[string]any{
+		"primary": int32(2), "shadow": int32(9),
+	}
+	assert.False(t, identity.matches(candidate, candidateMismatch, candidateCall))
+}
+
 func TestSummarizeRuntimeResultIncludesPointerAndDataSummary(t *testing.T) {
 	target, err := prog.GetTarget(targets.Linux, targets.AMD64)
 	require.NoError(t, err)

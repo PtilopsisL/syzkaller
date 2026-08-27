@@ -101,13 +101,21 @@ type runStage int
 const (
 	runStageFuzz runStage = iota
 	runStageRepro
+	runStageMinimize
 )
 
-const mismatchReproRuns = 3
+const (
+	mismatchReproRuns             = 3
+	mismatchMinimizeCandidateRuns = 1
+)
 
 type runtimeReproAffinity struct {
 	VM            int
 	SnapshotEpoch uint64
+}
+
+type runtimeComparisonCompletion struct {
+	Mismatch *runtimeMismatch
 }
 
 type programRun struct {
@@ -123,6 +131,7 @@ type programRun struct {
 	ReproAffinity  map[string]runtimeReproAffinity
 	ReproRuns      int
 	InitialResults map[string]*runtimeResult
+	Completion     chan runtimeComparisonCompletion
 }
 
 type multiRuntimeCoordinator struct {
@@ -149,6 +158,9 @@ type multiRuntimeCoordinator struct {
 	unstableStore          *mismatchStore
 	diffLabels             *runtimeDiffLabelStore
 	outputPolicies         *runtimeOutputPolicyStore
+	mismatchMinimizeMode   prog.MinimizeMode
+	done                   chan struct{}
+	doneOnce               sync.Once
 }
 
 func (coord *multiRuntimeCoordinator) setComparisonPrimary(slotName, runtimeName string) {
@@ -197,9 +209,20 @@ func newMultiRuntimeCoordinator(workdir string) *multiRuntimeCoordinator {
 		resumeFirstRunInflight: mgrconfig.DefaultResumeFirstRunInflight,
 		store:                  newMismatchStore(workdir),
 		unstableStore:          newUnstableStore(workdir),
+		mismatchMinimizeMode:   prog.MinimizeCrash,
+		done:                   make(chan struct{}),
 	}
 	coord.nextID.Store(maxID)
 	return coord
+}
+
+func (coord *multiRuntimeCoordinator) setMismatchMinimizeMode(snapshot bool) {
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	coord.mismatchMinimizeMode = prog.MinimizeCrash
+	if snapshot {
+		coord.mismatchMinimizeMode = prog.MinimizeCrashSnapshot
+	}
 }
 
 func (coord *multiRuntimeCoordinator) setRuntimeVersion(name, version string) {
@@ -320,6 +343,9 @@ func (coord *multiRuntimeCoordinator) EnsureRuntime(name string, target *prog.Ta
 }
 
 func (coord *multiRuntimeCoordinator) Close() {
+	coord.doneOnce.Do(func() {
+		close(coord.done)
+	})
 	coord.mu.Lock()
 	defer coord.mu.Unlock()
 	for _, consumer := range coord.consumers {
@@ -448,7 +474,7 @@ func (coord *multiRuntimeCoordinator) recordRuntimeResultWithExecutor(runtimeNam
 		switch run.Stage {
 		case runStageFuzz:
 			run.Results[runtimeName] = result
-		case runStageRepro:
+		case runStageRepro, runStageMinimize:
 			if executor != nil {
 				current := runtimeReproAffinity{
 					VM:            executor.VM,
@@ -514,7 +540,7 @@ func runComplete(run *programRun) bool {
 	switch run.Stage {
 	case runStageFuzz:
 		return len(run.Results) == len(run.Expected)
-	case runStageRepro:
+	case runStageRepro, runStageMinimize:
 		for runtimeName := range run.Expected {
 			if len(run.Samples[runtimeName]) != run.ReproRuns {
 				return false

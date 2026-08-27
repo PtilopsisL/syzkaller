@@ -441,6 +441,7 @@ func (mgr *Manager) initRuntime(debug bool) error {
 	mgr.shadows = make(map[string]*managedRuntime)
 	if mgr.displayCfg.IsMultiRuntime() {
 		coord := newMultiRuntimeCoordinator(mgr.displayCfg.Workdir)
+		coord.setMismatchMinimizeMode(mgr.displayCfg.Snapshot)
 		if mgr.displayCfg.MaxFirstRunInflight != 0 || mgr.displayCfg.ResumeFirstRunInflight != 0 {
 			coord.setFirstRunLimits(mgr.displayCfg.MaxFirstRunInflight,
 				mgr.displayCfg.ResumeFirstRunInflight)
