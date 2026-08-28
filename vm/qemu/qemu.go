@@ -89,19 +89,21 @@ type Pool struct {
 	target     *targets.Target
 	archConfig *archConfig
 	version    string
+	template   *snapshotTemplate
 }
 
 type instance struct {
-	index      int
-	cfg        *Config
-	target     *targets.Target
-	archConfig *archConfig
-	version    string
-	args       []string
-	image      string
-	debug      bool
-	os         string
-	workdir    string
+	index       int
+	cfg         *Config
+	target      *targets.Target
+	archConfig  *archConfig
+	version     string
+	args        []string
+	image       string
+	imageFormat string
+	debug       bool
+	os          string
+	workdir     string
 	vmimpl.SSHOptions
 	timeouts    targets.Timeouts
 	monport     int
@@ -327,11 +329,24 @@ func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 		target:     targets.Get(env.OS, env.Arch),
 		archConfig: archConfig,
 	}
+	if env.Snapshot {
+		pool.template, err = newSnapshotTemplate(env.Workdir, env.Image, cfg.Qemu)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return pool, nil
 }
 
 func (pool *Pool) Count() int {
 	return pool.cfg.Count
+}
+
+func (pool *Pool) Close() error {
+	if pool.template == nil {
+		return nil
+	}
+	return pool.template.Close()
 }
 
 func (pool *Pool) Create(ctx context.Context, workdir string, index int) (vmimpl.Instance, error) {
@@ -397,7 +412,10 @@ func (pool *Pool) ctor(workdir, sshkey, sshuser string, index int) (*instance, e
 		},
 	}
 	if pool.env.Snapshot {
-		inst.snapshot = new(snapshot)
+		inst.snapshot = &snapshot{template: pool.template}
+		if err := pool.template.prepare(inst); err != nil {
+			return nil, err
+		}
 	}
 	if st, err := os.Stat(inst.image); err == nil && st.Size() == 0 {
 		// Some kernels may not need an image, however caller may still
@@ -480,22 +498,39 @@ func (inst *instance) boot() error {
 	inst.rpipe = nil
 
 	var bootOutput []byte
-	bootOutputStop := make(chan bool)
+	bootOutputStop := make(chan struct{})
+	bootOutputDone := make(chan struct{})
 	go func() {
+		defer close(bootOutputDone)
 		for {
 			select {
-			case out := <-inst.merger.Output:
+			case out, ok := <-inst.merger.Output:
+				if !ok {
+					return
+				}
 				bootOutput = append(bootOutput, out.Data...)
 			case <-bootOutputStop:
-				close(bootOutputStop)
 				return
 			}
 		}
 	}()
+	stopBootOutput := func() {
+		close(bootOutputStop)
+		<-bootOutputDone
+	}
 
 	if inst.snapshot != nil {
 		if err := inst.snapshotHandshake(); err != nil {
-			return err
+			stopBootOutput()
+			return vmimpl.MakeBootError(err, bootOutput)
+		}
+		if inst.snapshot.restored {
+			if err := inst.snapshotRestore(); err != nil {
+				stopBootOutput()
+				return vmimpl.MakeBootError(err, bootOutput)
+			}
+			stopBootOutput()
+			return nil
 		}
 	}
 
@@ -503,11 +538,10 @@ func (inst *instance) boot() error {
 	defer cancel()
 	if err := vmimpl.WaitForSSH(10*time.Minute*inst.timeouts.Scale, inst.SSHOptions,
 		inst.os, inst.merger.Errors(ctx), false, inst.debug); err != nil {
-		bootOutputStop <- true
-		<-bootOutputStop
+		stopBootOutput()
 		return vmimpl.MakeBootError(err, bootOutput)
 	}
-	bootOutputStop <- true
+	stopBootOutput()
 	return nil
 }
 
@@ -538,13 +572,22 @@ func (inst *instance) buildQemuArgs() ([]string, error) {
 		)
 	} else if inst.image != "" {
 		if inst.archConfig.UseNewQemuImageOptions {
+			format := inst.imageFormat
+			if format == "" {
+				format = "raw"
+			}
 			args = append(args,
 				"-device", "virtio-blk-device,drive=hd0",
-				"-drive", fmt.Sprintf("file=%v,if=none,format=raw,id=hd0", inst.image),
+				"-drive", fmt.Sprintf("file=%v,if=none,format=%v,id=hd0", inst.image, format),
 			)
 		} else {
 			// inst.cfg.ImageDevice can contain spaces
 			imgline := strings.Split(inst.cfg.ImageDevice, " ")
+			if inst.imageFormat != "" {
+				for i := range imgline {
+					imgline[i] = strings.ReplaceAll(imgline[i], "format=raw", "format="+inst.imageFormat)
+				}
+			}
 			imgline[0] = "-" + imgline[0]
 			if strings.HasSuffix(imgline[len(imgline)-1], "file=") {
 				imgline[len(imgline)-1] = imgline[len(imgline)-1] + inst.image
@@ -553,7 +596,7 @@ func (inst *instance) buildQemuArgs() ([]string, error) {
 			}
 			args = append(args, imgline...)
 		}
-		if inst.cfg.Snapshot {
+		if inst.cfg.Snapshot && inst.snapshot == nil {
 			args = append(args, "-snapshot")
 		}
 	}
@@ -599,6 +642,7 @@ func (inst *instance) buildQemuArgs() ([]string, error) {
 			return nil, err
 		}
 		args = append(args, snapshotArgs...)
+		args = append(args, inst.snapshotRestoreArgs()...)
 	}
 	return args, nil
 }

@@ -339,9 +339,8 @@ func (runner *Runner) sendRequest(req *queue.Request) error {
 			// This error is observed a lot on the seeded syz_mount_image calls.
 			runner.stats.statExecBufferTooSmall.Add(1)
 			req.Done(&queue.Result{
-				Executor: queue.ExecutorID{VM: runner.id},
-				Status:   queue.ExecFailure,
-				Err:      fmt.Errorf("program serialization failed: %w", err),
+				Status: queue.ExecFailure,
+				Err:    fmt.Errorf("program serialization failed: %w", err),
 			})
 			return nil
 		}
@@ -350,9 +349,8 @@ func (runner *Runner) sendRequest(req *queue.Request) error {
 		fileData, err := os.ReadFile(req.BinaryFile)
 		if err != nil {
 			req.Done(&queue.Result{
-				Executor: queue.ExecutorID{VM: runner.id},
-				Status:   queue.ExecFailure,
-				Err:      err,
+				Status: queue.ExecFailure,
+				Err:    err,
 			})
 			return nil
 		}
@@ -673,7 +671,7 @@ func (runner *Runner) Shutdown(crashed bool, extraExecs ...report.ExecutorInfo) 
 		if crashed && runner.executing[id] {
 			status = queue.Crashed
 		}
-		req.Done(&queue.Result{Executor: queue.ExecutorID{VM: runner.id}, Status: status})
+		req.Done(&queue.Result{Status: status})
 	}
 	return records
 }

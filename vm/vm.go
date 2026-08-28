@@ -212,6 +212,13 @@ func (inst *Instance) SetupSnapshot(input []byte) error {
 	return impl.SetupSnapshot(input)
 }
 
+// SnapshotReady reports whether the instance was restored from a pool-wide
+// snapshot template and can execute snapshot requests without another setup.
+func (inst *Instance) SnapshotReady() bool {
+	impl, ok := inst.impl.(snapshotter)
+	return ok && impl.SnapshotReady()
+}
+
 // RunSnapshot runs one input in snapshotting mode.
 // Input is copied into the VM in an implementation defined way and is interpreted by executor.
 // Result is the result provided by the executor.
@@ -221,7 +228,7 @@ func (inst *Instance) RunSnapshot(input []byte) (result, output []byte, err erro
 	if !ok {
 		return nil, nil, errors.New("this VM type does not support snapshot mode")
 	}
-	if !inst.snapshotSetup {
+	if !inst.snapshotSetup && !impl.SnapshotReady() {
 		return nil, nil, fmt.Errorf("RunSnapshot without SetupSnapshot")
 	}
 	// Executor has own timeout logic, so use a slightly larger timeout here.
@@ -232,6 +239,7 @@ func (inst *Instance) RunSnapshot(input []byte) (result, output []byte, err erro
 type snapshotter interface {
 	SetupSnapshot([]byte) error
 	RunSnapshot(time.Duration, []byte) ([]byte, []byte, error)
+	SnapshotReady() bool
 }
 
 func (inst *Instance) Copy(hostSrc string) (string, error) {

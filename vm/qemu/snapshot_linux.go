@@ -5,20 +5,37 @@ package qemu
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/google/syzkaller/pkg/flatrpc"
+	"github.com/google/syzkaller/pkg/osutil"
 	"golang.org/x/sys/unix"
 )
 
+type snapshotTemplate struct {
+	mu         sync.RWMutex
+	dir        string
+	image      string
+	baseImage  string
+	baseFormat string
+	qemuImg    string
+	ready      bool
+}
+
 type snapshot struct {
+	template    *snapshotTemplate
+	restored    bool
 	ivsListener *net.UnixListener
 	ivsConn     *net.UnixConn
 	doorbellFD  int
@@ -27,6 +44,264 @@ type snapshot struct {
 	shmem       []byte
 	input       []byte
 	header      *flatrpc.SnapshotHeaderT
+}
+
+func newSnapshotTemplate(workdir, baseImage, qemu string) (*snapshotTemplate, error) {
+	if baseImage == "" || baseImage == "9p" {
+		return nil, fmt.Errorf("qemu: shared snapshot mode requires a disk image")
+	}
+	absImage, err := filepath.Abs(baseImage)
+	if err != nil {
+		return nil, fmt.Errorf("qemu: failed to resolve snapshot base image: %w", err)
+	}
+	qemuImg, err := findQemuImg(qemu)
+	if err != nil {
+		return nil, fmt.Errorf("qemu: shared snapshot mode requires qemu-img: %w", err)
+	}
+	output, err := osutil.RunCmd(time.Minute, "", qemuImg, "info", "--output=json", absImage)
+	if err != nil {
+		return nil, fmt.Errorf("qemu: failed to inspect snapshot base image: %w", err)
+	}
+	var info struct {
+		Format string `json:"format"`
+	}
+	if err := json.Unmarshal(output, &info); err != nil {
+		return nil, fmt.Errorf("qemu: failed to parse snapshot base image info: %w", err)
+	}
+	if info.Format == "" {
+		return nil, fmt.Errorf("qemu: snapshot base image format is empty")
+	}
+	dir, err := os.MkdirTemp(workdir, "snapshot-template-")
+	if err != nil {
+		return nil, fmt.Errorf("qemu: failed to create snapshot template directory: %w", err)
+	}
+	return &snapshotTemplate{
+		dir:        dir,
+		image:      filepath.Join(dir, "image.qcow2"),
+		baseImage:  absImage,
+		baseFormat: info.Format,
+		qemuImg:    qemuImg,
+	}, nil
+}
+
+func findQemuImg(qemu string) (string, error) {
+	qemuPath, err := exec.LookPath(qemu)
+	if err == nil {
+		candidate := filepath.Join(filepath.Dir(qemuPath), "qemu-img")
+		if osutil.IsExist(candidate) {
+			return candidate, nil
+		}
+	}
+	return exec.LookPath("qemu-img")
+}
+
+func (template *snapshotTemplate) prepare(inst *instance) error {
+	image := filepath.Join(inst.workdir, "snapshot-image.qcow2")
+	template.mu.RLock()
+	defer template.mu.RUnlock()
+	if template.ready {
+		if err := cloneSnapshotImage(template.image, image); err != nil {
+			return fmt.Errorf("qemu: failed to clone shared snapshot: %w", err)
+		}
+		inst.snapshot.restored = true
+	} else {
+		if _, err := osutil.RunCmd(time.Minute, "", template.qemuImg,
+			"create", "-f", "qcow2", "-F", template.baseFormat,
+			"-b", template.baseImage, image); err != nil {
+			return fmt.Errorf("qemu: failed to create private snapshot image: %w", err)
+		}
+	}
+	inst.image = image
+	inst.imageFormat = "qcow2"
+	return nil
+}
+
+func (template *snapshotTemplate) publish(image string) error {
+	template.mu.Lock()
+	defer template.mu.Unlock()
+	if template.ready {
+		return nil
+	}
+	if err := cloneSnapshotImage(image, template.image); err != nil {
+		return fmt.Errorf("qemu: failed to export shared snapshot: %w", err)
+	}
+	template.ready = true
+	return nil
+}
+
+func (template *snapshotTemplate) Close() error {
+	template.mu.Lock()
+	defer template.mu.Unlock()
+	return os.RemoveAll(template.dir)
+}
+
+func cloneSnapshotImage(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+	stat, err := srcFile.Stat()
+	if err != nil {
+		return err
+	}
+	dstFile, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, stat.Mode()&os.ModePerm)
+	if err != nil {
+		return err
+	}
+	cloneErr := unix.IoctlFileClone(int(dstFile.Fd()), int(srcFile.Fd()))
+	closeErr := dstFile.Close()
+	if cloneErr == nil && closeErr == nil {
+		return nil
+	}
+	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return osutil.CopyFile(src, dst)
+}
+
+func (inst *instance) SnapshotReady() bool {
+	return inst.snapshot != nil && inst.snapshot.restored
+}
+
+func (inst *instance) snapshotRestoreArgs() []string {
+	if !inst.snapshot.restored {
+		return nil
+	}
+	// Loading the snapshot from the command line is too early for a new QEMU
+	// process. The destination does not have x-ignore-shared enabled yet, and
+	// firmware has not assigned GPAs to the ivshmem PCI BARs. Start paused and
+	// restore explicitly after both parts of the device setup are complete.
+	return []string{"-S"}
+}
+
+type qmpPCIBus struct {
+	Devices []qmpPCIDevice `json:"devices"`
+}
+
+type qmpPCIID struct {
+	Vendor int `json:"vendor"`
+	Device int `json:"device"`
+}
+
+type qmpPCIRegion struct {
+	Address int64 `json:"address"`
+	Size    int64 `json:"size"`
+}
+
+type qmpPCIDevice struct {
+	ID      qmpPCIID       `json:"id"`
+	Regions []qmpPCIRegion `json:"regions"`
+	Bridge  *struct {
+		Devices []qmpPCIDevice `json:"devices"`
+	} `json:"pci_bridge,omitempty"`
+}
+
+func snapshotPCIBarsReady(buses []qmpPCIBus) bool {
+	var shmem, doorbell bool
+	var inspect func([]qmpPCIDevice)
+	inspect = func(devices []qmpPCIDevice) {
+		for _, dev := range devices {
+			// Both ivshmem-plain and ivshmem-doorbell use this PCI ID.
+			if dev.ID.Vendor == 0x1af4 && dev.ID.Device == 0x1110 {
+				for _, region := range dev.Regions {
+					if region.Address <= 0 {
+						continue
+					}
+					switch region.Size {
+					case int64(flatrpc.ConstSnapshotShmemSize):
+						shmem = true
+					case int64(flatrpc.ConstSnapshotDoorbellSize):
+						doorbell = true
+					}
+				}
+			}
+			if dev.Bridge != nil {
+				inspect(dev.Bridge.Devices)
+			}
+		}
+	}
+	for _, bus := range buses {
+		inspect(bus.Devices)
+	}
+	return shmem && doorbell
+}
+
+func (inst *instance) snapshotWaitPCIBars(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		resp, err := inst.qmp(&qmpCommand{Execute: "query-pci"})
+		if err != nil {
+			return fmt.Errorf("qemu: failed to query PCI devices: %w", err)
+		}
+		data, err := json.Marshal(resp)
+		if err != nil {
+			return fmt.Errorf("qemu: failed to marshal PCI information: %w", err)
+		}
+		var buses []qmpPCIBus
+		if err := json.Unmarshal(data, &buses); err != nil {
+			return fmt.Errorf("qemu: failed to parse PCI information: %w", err)
+		}
+		if snapshotPCIBarsReady(buses) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("qemu: ivshmem PCI BARs were not assigned within %v", timeout)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (inst *instance) snapshotHMP(cmd string) error {
+	output, err := inst.hmp(cmd, 0)
+	if err != nil {
+		return err
+	}
+	return snapshotHMPOutputError(cmd, output)
+}
+
+func snapshotHMPOutputError(cmd, output string) error {
+	// HMP reports some loadvm failures as command output rather than a QMP
+	// error. All commands used during restore are silent on success.
+	if output = strings.TrimSpace(output); output != "" {
+		return fmt.Errorf("qemu hmp command %q failed:\n%s", cmd, output)
+	}
+	return nil
+}
+
+func (inst *instance) snapshotRestore() error {
+	// Let firmware assign the PCI BARs. The saved shared RAM block is keyed by
+	// its guest physical address, so loadvm rejects an unassigned destination
+	// BAR (GPA 0) even when x-ignore-shared is enabled.
+	if err := inst.snapshotHMP("cont"); err != nil {
+		return err
+	}
+	if err := inst.snapshotWaitPCIBars(10 * time.Second * inst.timeouts.Scale); err != nil {
+		return err
+	}
+	if err := inst.snapshotHMP("stop"); err != nil {
+		return err
+	}
+	// The snapshot was saved with this capability enabled. A new QEMU process
+	// starts with it disabled and must match the saved migration configuration
+	// before loadvm.
+	if err := inst.snapshotHMP("migrate_set_capability x-ignore-shared on"); err != nil {
+		return err
+	}
+	inst.header.UpdateState(flatrpc.SnapshotStateSnapshotted)
+	if err := inst.snapshotHMP("loadvm syz"); err != nil {
+		return err
+	}
+	if err := inst.snapshotHMP("cont"); err != nil {
+		return err
+	}
+	if !inst.waitSnapshotStateChange(flatrpc.SnapshotStateSnapshotted, time.Minute) {
+		return fmt.Errorf("restored snapshot executor did not start")
+	}
+	if state := inst.header.LoadState(); state != flatrpc.SnapshotStateExecuted {
+		return fmt.Errorf("restored snapshot executor entered unexpected state %v", state)
+	}
+	return nil
 }
 
 func (inst *instance) snapshotClose() {
@@ -189,6 +464,14 @@ func (inst *instance) SetupSnapshot(input []byte) error {
 	inst.header.UpdateState(flatrpc.SnapshotStateSnapshotted)
 	if !inst.waitSnapshotStateChange(flatrpc.SnapshotStateSnapshotted, time.Minute) {
 		return fmt.Errorf("executor has not confirmed snapshot handshake\n%s", inst.readOutput(minErrOutputWait))
+	}
+	// The template image must not change while it is being cloned. This VM is
+	// discarded after publishing, so leave it paused until Close kills QEMU.
+	if _, err := inst.hmp("stop", 0); err != nil {
+		return err
+	}
+	if err := inst.snapshot.template.publish(inst.image); err != nil {
+		return err
 	}
 	return nil
 }

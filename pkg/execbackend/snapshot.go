@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	flatbuffers "github.com/google/flatbuffers/go"
@@ -29,22 +28,27 @@ type SnapshotConfig struct {
 
 type snapshotServer struct {
 	Server
-	cfg               SnapshotConfig
-	source            *queue.DynamicSourceCtl
-	dist              *queue.Distributor
-	bootDone          chan struct{}
-	bootOnce          sync.Once
-	nextSnapshotEpoch atomic.Uint64
+	cfg              SnapshotConfig
+	source           *queue.DynamicSourceCtl
+	dist             *queue.Distributor
+	bootDone         chan struct{}
+	bootOnce         sync.Once
+	templateMu       sync.Mutex
+	templateBuilding bool
+	templateReady    bool
+	templateChanged  chan struct{}
+	templateEnvFlags flatrpc.ExecEnv
 }
 
 func NewSnapshotBackend(base Server, cfg SnapshotConfig) Server {
 	source := queue.DynamicSource(queue.Plain())
 	return &snapshotServer{
-		Server:   base,
-		cfg:      cfg,
-		source:   source,
-		dist:     queue.Distribute(queue.Retry(source)),
-		bootDone: make(chan struct{}),
+		Server:          base,
+		cfg:             cfg,
+		source:          source,
+		dist:            queue.Distribute(queue.Retry(source)),
+		bootDone:        make(chan struct{}),
+		templateChanged: make(chan struct{}),
 	}
 }
 
@@ -81,27 +85,36 @@ func (serv *snapshotServer) RunRequests(ctx context.Context, inst *vm.Instance,
 		return reps, err
 	}
 
-	updInfo(func(info *dispatcher.Info) {
-		info.Status = "snapshot fuzzing"
-	})
-
-	executorBin, err := inst.Copy(serv.cfg.ExecutorBin)
-	if err != nil {
-		return nil, err
-	}
-
-	// All network connections (including ssh) will break once we start restoring snapshots.
-	// So we start a background process and log to /dev/kmsg.
-	cmd := fmt.Sprintf("nohup %v exec snapshot 1>/dev/null 2>/dev/kmsg </dev/null &", executorBin)
-	ctxTimeout, cancel := context.WithTimeout(ctx, time.Hour)
-	defer cancel()
-	if _, _, err := inst.Run(ctxTimeout, reporter, cmd); err != nil {
-		return nil, err
-	}
-
 	builder := flatbuffers.NewBuilder(0)
 	var envFlags flatrpc.ExecEnv
-	var executor queue.ExecutorID
+	restored := inst.SnapshotReady()
+	if restored {
+		var err error
+		envFlags, err = serv.waitSharedSnapshot(ctx)
+		if err != nil {
+			return nil, err
+		}
+		updInfo(func(info *dispatcher.Info) {
+			info.Status = "snapshot fuzzing"
+		})
+	} else {
+		updInfo(func(info *dispatcher.Info) {
+			info.Status = "building shared snapshot"
+		})
+		executorBin, err := inst.Copy(serv.cfg.ExecutorBin)
+		if err != nil {
+			return nil, err
+		}
+
+		// All network connections (including ssh) will break once we start restoring snapshots.
+		// So we start a background process and log to /dev/kmsg.
+		cmd := fmt.Sprintf("nohup %v exec snapshot 1>/dev/null 2>/dev/kmsg </dev/null &", executorBin)
+		ctxTimeout, cancel := context.WithTimeout(ctx, time.Hour)
+		defer cancel()
+		if _, _, err := inst.Run(ctxTimeout, reporter, cmd); err != nil {
+			return nil, err
+		}
+	}
 
 	if serv.cfg.Stats.StatNumFuzzing != nil {
 		serv.cfg.Stats.StatNumFuzzing.Add(1)
@@ -112,38 +125,45 @@ func (serv *snapshotServer) RunRequests(ctx context.Context, inst *vm.Instance,
 	// sleep and retry instead of returning, because returning from RunRequests
 	// signals to the VM dispatcher that the instance lifecycle has ended and
 	// would cause the VM to be restarted.
-	first := true
+	first := !restored
 	for ctx.Err() == nil {
 		req := serv.dist.Next(inst.Index())
 		if req == nil {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		if serv.cfg.Stats.StatExecs != nil {
-			serv.cfg.Stats.StatExecs.Add(1)
-		}
 		req.ExecOpts.EnvFlags = snapshotEnvFlags(req.ExecOpts.EnvFlags)
 		if first {
-			// Allocate the generation before setup. If setup fails and the VM is
-			// restarted, the failed lifecycle must not be confused with another
-			// setup attempt on the same VM index.
-			executor = serv.newSnapshotExecutor(inst.Index())
 			envFlags = req.ExecOpts.EnvFlags
-			if err := serv.snapshotSetup(inst, builder, envFlags); err != nil {
-				req.Done(&queue.Result{Executor: executor, Status: queue.Crashed})
+			err := serv.ensureSharedSnapshot(ctx, envFlags, func() error {
+				return serv.snapshotSetup(inst, builder, envFlags)
+			})
+			if err != nil {
+				status := queue.Crashed
+				if errors.Is(err, context.Canceled) {
+					status = queue.Restarted
+				}
+				req.Done(&queue.Result{Status: status})
 				return nil, err
 			}
-			first = false
+			// Setup/publishing leaves the builder paused, and any other fresh VM
+			// predates the template. Restart all of them and retry their requests
+			// on private clones of the same exported snapshot.
+			req.Done(&queue.Result{Status: queue.Restarted})
+			return nil, nil
 		}
 		if envFlags != req.ExecOpts.EnvFlags {
 			panic(fmt.Sprintf("request env flags has changed: 0x%x -> 0x%x",
 				envFlags, req.ExecOpts.EnvFlags))
 		}
+		if serv.cfg.Stats.StatExecs != nil {
+			serv.cfg.Stats.StatExecs.Add(1)
+		}
 
-		res, output, err := serv.snapshotRun(inst, builder, req, executor)
+		res, output, err := serv.snapshotRun(inst, builder, req)
 		if err != nil {
 			req.Done(&queue.Result{
-				Executor: executor,
+				Executor: queue.ExecutorID{VM: inst.Index()},
 				Status:   queue.Crashed,
 			})
 			return nil, err
@@ -172,10 +192,58 @@ func (serv *snapshotServer) RunRequests(ctx context.Context, inst *vm.Instance,
 	return nil, nil
 }
 
-func (serv *snapshotServer) newSnapshotExecutor(vm int) queue.ExecutorID {
-	return queue.ExecutorID{
-		VM:            vm,
-		SnapshotEpoch: serv.nextSnapshotEpoch.Add(1),
+func (serv *snapshotServer) ensureSharedSnapshot(ctx context.Context, env flatrpc.ExecEnv,
+	setup func() error) error {
+	for {
+		serv.templateMu.Lock()
+		if serv.templateReady {
+			serv.templateMu.Unlock()
+			return nil
+		}
+		if !serv.templateBuilding {
+			serv.templateBuilding = true
+			changed := serv.templateChanged
+			serv.templateMu.Unlock()
+
+			err := setup()
+			serv.templateMu.Lock()
+			serv.templateBuilding = false
+			if err == nil {
+				serv.templateReady = true
+				serv.templateEnvFlags = env
+			}
+			close(changed)
+			if err != nil {
+				serv.templateChanged = make(chan struct{})
+			}
+			serv.templateMu.Unlock()
+			return err
+		}
+		changed := serv.templateChanged
+		serv.templateMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+func (serv *snapshotServer) waitSharedSnapshot(ctx context.Context) (flatrpc.ExecEnv, error) {
+	for {
+		serv.templateMu.Lock()
+		if serv.templateReady {
+			env := serv.templateEnvFlags
+			serv.templateMu.Unlock()
+			return env, nil
+		}
+		changed := serv.templateChanged
+		serv.templateMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-changed:
+		}
 	}
 }
 
@@ -201,14 +269,13 @@ func (serv *snapshotServer) snapshotSetup(inst *vm.Instance, builder *flatbuffer
 	return inst.SetupSnapshot(builder.FinishedBytes())
 }
 
-func (serv *snapshotServer) snapshotRun(inst *vm.Instance, builder *flatbuffers.Builder, req *queue.Request,
-	executor queue.ExecutorID) (
+func (serv *snapshotServer) snapshotRun(inst *vm.Instance, builder *flatbuffers.Builder, req *queue.Request) (
 	*queue.Result, []byte, error) {
 	progData, err := req.Prog.SerializeForExec()
 	if err != nil {
 		queue.StatExecBufferTooSmall.Add(1)
 		return &queue.Result{
-			Executor: executor,
+			Executor: queue.ExecutorID{VM: inst.Index()},
 			Status:   queue.ExecFailure,
 			Err:      fmt.Errorf("program serialization failed: %w", err),
 		}, nil, nil
@@ -256,7 +323,7 @@ func (serv *snapshotServer) snapshotRun(inst *vm.Instance, builder *flatbuffers.
 	}
 
 	ret := &queue.Result{
-		Executor: executor,
+		Executor: queue.ExecutorID{VM: inst.Index()},
 		Status:   queue.Success,
 		Info:     res.Info,
 	}

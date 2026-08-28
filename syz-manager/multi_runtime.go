@@ -109,11 +109,6 @@ const (
 	mismatchMinimizeCandidateRuns = 1
 )
 
-type runtimeReproAffinity struct {
-	VM            int
-	SnapshotEpoch uint64
-}
-
 type runtimeComparisonCompletion struct {
 	Mismatch *runtimeMismatch
 }
@@ -128,7 +123,6 @@ type programRun struct {
 	Expected       map[string]bool
 	Results        map[string]*runtimeResult
 	Samples        map[string][]*runtimeResult
-	ReproAffinity  map[string]runtimeReproAffinity
 	ReproRuns      int
 	InitialResults map[string]*runtimeResult
 	Completion     chan runtimeComparisonCompletion
@@ -443,22 +437,15 @@ func (coord *multiRuntimeCoordinator) recordResult(runtimeName string, req *queu
 	coord.mu.Lock()
 	policies := coord.outputPolicies
 	coord.mu.Unlock()
-	coord.recordRuntimeResultWithExecutor(runtimeName, req.ProgID,
-		summarizeRuntimeResult(runtimeName, req, res, policies), &res.Executor)
+	coord.recordRuntimeResult(runtimeName, req.ProgID,
+		summarizeRuntimeResult(runtimeName, req, res, policies))
 }
 
 func (coord *multiRuntimeCoordinator) recordRuntimeResult(runtimeName string, progID int64,
 	result *runtimeResult) {
-	coord.recordRuntimeResultWithExecutor(runtimeName, progID, result, nil)
-}
-
-func (coord *multiRuntimeCoordinator) recordRuntimeResultWithExecutor(runtimeName string, progID int64,
-	result *runtimeResult, executor *queue.ExecutorID) {
 	var completed *programRun
 	var nextSample *programRun
 	var nextQueue *queue.PlainQueue
-	var nextTargetVM *int
-	var affinityReset string
 	resumed := false
 	resumeAt := 0
 	coord.mu.Lock()
@@ -475,36 +462,12 @@ func (coord *multiRuntimeCoordinator) recordRuntimeResultWithExecutor(runtimeNam
 		case runStageFuzz:
 			run.Results[runtimeName] = result
 		case runStageRepro, runStageMinimize:
-			if executor != nil {
-				current := runtimeReproAffinity{
-					VM:            executor.VM,
-					SnapshotEpoch: executor.SnapshotEpoch,
-				}
-				if run.ReproAffinity == nil {
-					run.ReproAffinity = make(map[string]runtimeReproAffinity)
-				}
-				affinity, ok := run.ReproAffinity[runtimeName]
-				if !ok {
-					run.ReproAffinity[runtimeName] = current
-				} else if affinity != current {
-					run.Samples[runtimeName] = nil
-					run.ReproAffinity[runtimeName] = current
-					affinityReset = fmt.Sprintf(
-						"program %d runtime %q changed executor from VM %d/snapshot %d to VM %d/snapshot %d",
-						progID, runtimeName, affinity.VM, affinity.SnapshotEpoch,
-						current.VM, current.SnapshotEpoch)
-				}
-			}
 			if len(run.Samples[runtimeName]) < run.ReproRuns {
 				run.Samples[runtimeName] = append(run.Samples[runtimeName], result)
 			}
 			if len(run.Samples[runtimeName]) < run.ReproRuns {
 				nextSample = run
 				nextQueue = coord.runtimeQueueLocked(runtimeName)
-				if affinity, ok := run.ReproAffinity[runtimeName]; ok {
-					vm := affinity.VM
-					nextTargetVM = &vm
-				}
 			}
 		}
 		if runComplete(run) {
@@ -522,14 +485,11 @@ func (coord *multiRuntimeCoordinator) recordRuntimeResultWithExecutor(runtimeNam
 		}
 	}
 	coord.mu.Unlock()
-	if affinityReset != "" {
-		log.Logf(1, "%s; restarting reproduction samples", affinityReset)
-	}
 	if resumed {
 		log.Logf(1, "resuming multi-runtime fuzz generation at %d initial runs", resumeAt)
 	}
 	if nextSample != nil {
-		coord.submitReproSample(nextSample, runtimeName, nextQueue, nextTargetVM)
+		coord.submitReproSample(nextSample, runtimeName, nextQueue)
 	}
 	if completed != nil {
 		coord.handleCompletedRun(completed)

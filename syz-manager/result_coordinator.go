@@ -1231,33 +1231,20 @@ func (identity runtimeMismatchCallIdentity) matches(p *prog.Prog, mismatch *runt
 	return ok && candidateCall == callIndex && reflect.DeepEqual(identity, candidate)
 }
 
-func copyRuntimeReproAffinity(
-	affinity map[string]runtimeReproAffinity) map[string]runtimeReproAffinity {
-	ret := make(map[string]runtimeReproAffinity, len(affinity))
-	for runtimeName, value := range affinity {
-		ret[runtimeName] = value
-	}
-	return ret
-}
-
 func (coord *multiRuntimeCoordinator) minimizeRuntimeMismatch(reproduced *programRun,
 	baseline *runtimeMismatch, identity runtimeMismatchCallIdentity, callIndex int) {
 	coord.mu.Lock()
 	mode := coord.mismatchMinimizeMode
 	coord.mu.Unlock()
 
-	affinity := copyRuntimeReproAffinity(reproduced.ReproAffinity)
 	stopped := false
 	minimized, minimizedCall := prog.Minimize(reproduced.Prog.Clone(), callIndex, mode,
 		func(candidate *prog.Prog, candidateCall int) bool {
 			if stopped || len(candidate.Calls) == 0 {
 				return false
 			}
-			candidateRun, mismatch, ok := coord.executeMismatchCandidate(reproduced, candidate, affinity,
+			_, mismatch, ok := coord.executeMismatchCandidate(reproduced, candidate,
 				mismatchMinimizeCandidateRuns)
-			if candidateRun != nil {
-				affinity = copyRuntimeReproAffinity(candidateRun.ReproAffinity)
-			}
 			if !ok {
 				stopped = true
 				return false
@@ -1269,7 +1256,7 @@ func (coord *multiRuntimeCoordinator) minimizeRuntimeMismatch(reproduced *progra
 		return
 	}
 
-	finalRun, finalMismatch, ok := coord.executeMismatchCandidate(reproduced, minimized, affinity,
+	finalRun, finalMismatch, ok := coord.executeMismatchCandidate(reproduced, minimized,
 		mismatchReproRuns)
 	if ok && finalMismatch != nil && finalMismatch.Outcome == comparisonOutcomeMismatch &&
 		identity.matches(minimized, finalMismatch, minimizedCall) {
@@ -1288,22 +1275,21 @@ func (coord *multiRuntimeCoordinator) minimizeRuntimeMismatch(reproduced *progra
 }
 
 func (coord *multiRuntimeCoordinator) executeMismatchCandidate(base *programRun, candidate *prog.Prog,
-	affinity map[string]runtimeReproAffinity, reproRuns int) (*programRun, *runtimeMismatch, bool) {
+	reproRuns int) (*programRun, *runtimeMismatch, bool) {
 	if coord.closed() {
 		return nil, nil, false
 	}
 	run := &programRun{
-		ID:            coord.allocateProgID(),
-		ParentID:      base.ParentID,
-		Stage:         runStageMinimize,
-		Prog:          candidate.Clone(),
-		ProgData:      candidate.Serialize(),
-		Important:     true,
-		Expected:      copyExpectedRuntimes(base.Expected),
-		Samples:       map[string][]*runtimeResult{},
-		ReproAffinity: copyRuntimeReproAffinity(affinity),
-		ReproRuns:     reproRuns,
-		Completion:    make(chan runtimeComparisonCompletion, 1),
+		ID:         coord.allocateProgID(),
+		ParentID:   base.ParentID,
+		Stage:      runStageMinimize,
+		Prog:       candidate.Clone(),
+		ProgData:   candidate.Serialize(),
+		Important:  true,
+		Expected:   copyExpectedRuntimes(base.Expected),
+		Samples:    map[string][]*runtimeResult{},
+		ReproRuns:  reproRuns,
+		Completion: make(chan runtimeComparisonCompletion, 1),
 	}
 
 	coord.mu.Lock()
@@ -1319,12 +1305,7 @@ func (coord *multiRuntimeCoordinator) executeMismatchCandidate(base *programRun,
 	coord.mu.Unlock()
 
 	for runtimeName, runtimeQueue := range queues {
-		var targetVM *int
-		if runtimeAffinity, ok := run.ReproAffinity[runtimeName]; ok {
-			vm := runtimeAffinity.VM
-			targetVM = &vm
-		}
-		coord.submitReproSample(run, runtimeName, runtimeQueue, targetVM)
+		coord.submitReproSample(run, runtimeName, runtimeQueue)
 	}
 	select {
 	case completion := <-run.Completion:
@@ -1355,7 +1336,6 @@ func (coord *multiRuntimeCoordinator) enqueueMismatchRepro(initial *programRun) 
 		Important:      true,
 		Expected:       expected,
 		Samples:        map[string][]*runtimeResult{},
-		ReproAffinity:  map[string]runtimeReproAffinity{},
 		ReproRuns:      mismatchReproRuns,
 		InitialResults: copyRuntimeResults(initial.Results),
 	}
@@ -1369,20 +1349,16 @@ func (coord *multiRuntimeCoordinator) enqueueMismatchRepro(initial *programRun) 
 	coord.mu.Unlock()
 
 	for runtimeName, runtimeQueue := range queues {
-		coord.submitReproSample(reproRun, runtimeName, runtimeQueue, nil)
+		coord.submitReproSample(reproRun, runtimeName, runtimeQueue)
 	}
 }
 
 func (coord *multiRuntimeCoordinator) submitReproSample(run *programRun, runtimeName string,
-	runtimeQueue *queue.PlainQueue, targetVM *int) {
+	runtimeQueue *queue.PlainQueue) {
 	req := &queue.Request{
 		ProgID:    run.ID,
 		Prog:      run.Prog.Clone(),
 		Important: true,
-	}
-	if targetVM != nil {
-		req.TargetVM = *targetVM
-		req.HasTargetVM = true
 	}
 	fuzzer.EnableSyscallTrace(req)
 	fuzzer.EnableSyscallOutputs(req)

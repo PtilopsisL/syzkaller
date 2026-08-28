@@ -212,13 +212,6 @@ func TestMultiRuntimeCoordinatorSchedulesMismatchRepro(t *testing.T) {
 		if i == 0 {
 			reproID = primaryRepro.ProgID
 			assert.NotEqual(t, primaryReq.ProgID, reproID)
-			assert.False(t, primaryRepro.HasTargetVM)
-			assert.False(t, shadowRepro.HasTargetVM)
-		} else {
-			assert.True(t, primaryRepro.HasTargetVM)
-			assert.Equal(t, 2, primaryRepro.TargetVM)
-			assert.True(t, shadowRepro.HasTargetVM)
-			assert.Equal(t, 3, shadowRepro.TargetVM)
 		}
 		assert.Equal(t, reproID, primaryRepro.ProgID)
 		assert.Equal(t, reproID, shadowRepro.ProgID)
@@ -226,11 +219,11 @@ func TestMultiRuntimeCoordinatorSchedulesMismatchRepro(t *testing.T) {
 		assert.NotZero(t, shadowRepro.ExecOpts.EnvFlags&flatrpc.ExecEnvSyscallTrace)
 		assert.Equal(t, 0, coord.reproQueueLen("primary"))
 		assert.Equal(t, 0, coord.reproQueueLen("shadow"))
-		primaryRepro.Done(testResultAt(0, "0: test() = 0 {0}\n", 2, 10))
+		primaryRepro.Done(testResult(0, "0: test() = 0 {0}\n"))
 		if i+1 < mismatchReproRuns {
 			assert.Equal(t, 1, coord.reproQueueLen("primary"))
 		}
-		shadowRepro.Done(testResultAt(1, "0: test() = -1 {1}\n", 3, 20))
+		shadowRepro.Done(testResult(1, "0: test() = -1 {1}\n"))
 		if i+1 < mismatchReproRuns {
 			assert.Equal(t, 1, coord.reproQueueLen("shadow"))
 		}
@@ -250,12 +243,8 @@ func TestMultiRuntimeCoordinatorSchedulesMismatchRepro(t *testing.T) {
 		assert.Equal(t, minimizedID, shadowMinimized.ProgID)
 		assert.Equal(t, 1, len(primaryMinimized.Prog.Calls))
 		assert.Equal(t, 1, len(shadowMinimized.Prog.Calls))
-		assert.True(t, primaryMinimized.HasTargetVM)
-		assert.Equal(t, 2, primaryMinimized.TargetVM)
-		assert.True(t, shadowMinimized.HasTargetVM)
-		assert.Equal(t, 3, shadowMinimized.TargetVM)
-		primaryMinimized.Done(testResultAt(0, "0: test() = 0 {0}\n", 2, 10))
-		shadowMinimized.Done(testResultAt(1, "0: test() = -1 {1}\n", 3, 20))
+		primaryMinimized.Done(testResult(0, "0: test() = 0 {0}\n"))
+		shadowMinimized.Done(testResult(1, "0: test() = -1 {1}\n"))
 	}
 	require.Eventually(t, func() bool {
 		entries, err := os.ReadDir(coord.store.baseDir)
@@ -328,8 +317,8 @@ getpid()`)
 	primary := &queue.Request{Prog: program}
 	coord.registerPrimary("primary", primary)
 	shadow := nextRequestEventually(t, shadowSource)
-	primary.Done(testProgramResult(primary, 1, 2, 10))
-	shadow.Done(testProgramResult(shadow, 9, 3, 20))
+	primary.Done(testProgramResult(primary, 1))
+	shadow.Done(testProgramResult(shadow, 9))
 
 	completeCandidate := func(wantCalls, runs int) int64 {
 		var progID int64
@@ -343,8 +332,8 @@ getpid()`)
 			assert.Equal(t, progID, shadowCandidate.ProgID)
 			assert.Equal(t, wantCalls, len(primaryCandidate.Prog.Calls))
 			assert.Equal(t, primaryCandidate.Prog.Serialize(), shadowCandidate.Prog.Serialize())
-			primaryCandidate.Done(testProgramResult(primaryCandidate, 1, 2, 10))
-			shadowCandidate.Done(testProgramResult(shadowCandidate, 9, 3, 20))
+			primaryCandidate.Done(testProgramResult(primaryCandidate, 1))
+			shadowCandidate.Done(testProgramResult(shadowCandidate, 9))
 		}
 		return progID
 	}
@@ -391,87 +380,6 @@ getpid()`)
 	assert.Equal(t, "ptrace", report.ProgramCalls[0].Name)
 	require.NotEmpty(t, report.StableDifferences)
 	assert.Equal(t, 0, *report.StableDifferences[0].CallIndex)
-}
-
-func TestMultiRuntimeCoordinatorResetsOnSnapshotEpochChange(t *testing.T) {
-	coord := newMultiRuntimeCoordinator("")
-	run := &programRun{
-		ID:            1,
-		Stage:         runStageRepro,
-		Prog:          &prog.Prog{},
-		Expected:      map[string]bool{"runtime": true},
-		Samples:       map[string][]*runtimeResult{},
-		ReproAffinity: map[string]runtimeReproAffinity{},
-		ReproRuns:     mismatchReproRuns,
-	}
-	source := queue.Plain()
-	coord.mu.Lock()
-	coord.runs[run.ID] = run
-	coord.reproQueues["runtime"] = source
-	coord.mu.Unlock()
-
-	record := func(epoch uint64) {
-		coord.recordRuntimeResultWithExecutor("runtime", run.ID,
-			&runtimeResult{Runtime: "runtime", Status: queue.Success},
-			&queue.ExecutorID{VM: 2, SnapshotEpoch: epoch})
-	}
-
-	record(10)
-	req := source.Next()
-	require.NotNil(t, req)
-	assert.True(t, req.HasTargetVM)
-	assert.Equal(t, 2, req.TargetVM)
-
-	record(11)
-	assert.Len(t, run.Samples["runtime"], 1)
-	assert.Equal(t, uint64(11), run.ReproAffinity["runtime"].SnapshotEpoch)
-	req = source.Next()
-	require.NotNil(t, req)
-	assert.True(t, req.HasTargetVM)
-	assert.Equal(t, 2, req.TargetVM)
-
-	record(11)
-	assert.Len(t, run.Samples["runtime"], 2)
-	req = source.Next()
-	require.NotNil(t, req)
-	assert.True(t, req.HasTargetVM)
-	assert.Equal(t, 2, req.TargetVM)
-
-	record(11)
-	assert.Len(t, run.Samples["runtime"], mismatchReproRuns)
-	assert.Nil(t, source.Next())
-	assert.NotContains(t, coord.runs, run.ID)
-}
-
-func TestMultiRuntimeCoordinatorBindsNormalReproToVM(t *testing.T) {
-	coord := newMultiRuntimeCoordinator("")
-	run := &programRun{
-		ID:            1,
-		Stage:         runStageRepro,
-		Prog:          &prog.Prog{},
-		Expected:      map[string]bool{"runtime": true},
-		Samples:       map[string][]*runtimeResult{},
-		ReproAffinity: map[string]runtimeReproAffinity{},
-		ReproRuns:     mismatchReproRuns,
-	}
-	source := queue.Plain()
-	coord.mu.Lock()
-	coord.runs[run.ID] = run
-	coord.reproQueues["runtime"] = source
-	coord.mu.Unlock()
-
-	coord.recordResult("runtime", &queue.Request{
-		ProgID: run.ID,
-		Prog:   &prog.Prog{},
-	}, &queue.Result{
-		Status:   queue.Success,
-		Executor: queue.ExecutorID{VM: 2},
-	})
-
-	req := source.Next()
-	require.NotNil(t, req)
-	assert.True(t, req.HasTargetVM)
-	assert.Equal(t, 2, req.TargetVM)
 }
 
 func TestMultiRuntimeCoordinatorUsesComparisonPrimary(t *testing.T) {
@@ -812,8 +720,7 @@ func testResult(errno int32, sctrace string) *queue.Result {
 	}
 }
 
-func testProgramResult(req *queue.Request, mismatchErrno int32, vm int,
-	snapshotEpoch uint64) *queue.Result {
+func testProgramResult(req *queue.Request, mismatchErrno int32) *queue.Result {
 	info := &flatrpc.ProgInfo{}
 	for index := range req.Prog.Calls {
 		errno := int32(0)
@@ -832,9 +739,8 @@ func testProgramResult(req *queue.Request, mismatchErrno int32, vm int,
 		})
 	}
 	return &queue.Result{
-		Status:   queue.Success,
-		Info:     info,
-		Executor: queue.ExecutorID{VM: vm, SnapshotEpoch: snapshotEpoch},
+		Status: queue.Success,
+		Info:   info,
 	}
 }
 
@@ -862,13 +768,4 @@ func allSyscalls(target *prog.Target) map[*prog.Syscall]bool {
 		ret[call] = true
 	}
 	return ret
-}
-
-func testResultAt(errno int32, sctrace string, vm int, snapshotEpoch uint64) *queue.Result {
-	result := testResult(errno, sctrace)
-	result.Executor = queue.ExecutorID{
-		VM:            vm,
-		SnapshotEpoch: snapshotEpoch,
-	}
-	return result
 }
