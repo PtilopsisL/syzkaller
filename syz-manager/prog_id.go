@@ -111,12 +111,21 @@ func maxProgIDFromRuntimeReportStore(dir string) int64 {
 		if !entry.IsDir() {
 			continue
 		}
+		entryDir := filepath.Join(dir, entry.Name())
 		if parentID, reproID, ok := parseMismatchDirProgIDs(entry.Name()); ok {
 			maxID = maxInt64(maxID, parentID)
 			maxID = maxInt64(maxID, reproID)
 			continue
 		}
-		maxID = maxInt64(maxID, maxProgIDFromMismatchReport(filepath.Join(dir, entry.Name(), "report.json")))
+		if parentID, ok := parseRuntimeReportDirProgID(entry.Name()); ok {
+			maxID = maxInt64(maxID, parentID)
+			maxID = maxInt64(maxID, maxProgIDFromMismatchReport(
+				filepath.Join(entryDir, runtimeOriginalDirName, "report.json")))
+			maxID = maxInt64(maxID, maxProgIDFromMismatchReport(
+				filepath.Join(entryDir, runtimeMinimizeDirName, "report.json")))
+			continue
+		}
+		maxID = maxInt64(maxID, maxProgIDFromMismatchReport(filepath.Join(entryDir, "report.json")))
 	}
 	return maxID
 }
@@ -196,6 +205,13 @@ func parseMismatchDirProgIDs(name string) (int64, int64, bool) {
 		return 0, 0, false
 	}
 	return parentID, reproID, true
+}
+
+func parseRuntimeReportDirProgID(name string) (int64, bool) {
+	if !strings.HasPrefix(name, "prog") {
+		return 0, false
+	}
+	return parsePositiveInt64(strings.TrimPrefix(name, "prog"))
 }
 
 func parseStraceLogProgID(name string) (int64, bool) {

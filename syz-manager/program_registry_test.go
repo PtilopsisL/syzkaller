@@ -174,6 +174,10 @@ func TestMultiRuntimeCoordinatorContinuesProgIDFromArtifacts(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(workdir, "runtime-mismatches", "custom", "report.json"),
 		report, 0o644))
 	require.NoError(t, os.MkdirAll(filepath.Join(workdir, "runtime-unstable", "prog50-repro51"), 0o755))
+	newReportDir := filepath.Join(workdir, "runtime-mismatches", "prog52", runtimeMinimizeDirName)
+	require.NoError(t, os.MkdirAll(newReportDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(newReportDir, "report.json"),
+		[]byte(`{"parent_prog_id":52,"repro_prog_id":54}`), 0o644))
 	require.NoError(t, os.MkdirAll(filepath.Join(workdir, "strace-log"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(workdir, "strace-log", "strace.prog31.2.log"), nil, 0o644))
 	require.NoError(t, os.MkdirAll(filepath.Join(workdir, "runtimes", "shadow", "strace-log"), 0o755))
@@ -183,7 +187,7 @@ func TestMultiRuntimeCoordinatorContinuesProgIDFromArtifacts(t *testing.T) {
 	coord := newMultiRuntimeCoordinator(workdir)
 	req := &queue.Request{Prog: testRegistryProg(target)}
 	coord.registerPrimary("primary", req)
-	assert.EqualValues(t, 52, req.ProgID)
+	assert.EqualValues(t, 55, req.ProgID)
 }
 
 func TestMultiRuntimeCoordinatorSchedulesMismatchRepro(t *testing.T) {
@@ -228,7 +232,7 @@ func TestMultiRuntimeCoordinatorSchedulesMismatchRepro(t *testing.T) {
 			assert.Equal(t, 1, coord.reproQueueLen("shadow"))
 		}
 	}
-	preMinimizeDir := runtimeReportDir(coord.store.baseDir, primaryReq.ProgID, reproID)
+	preMinimizeDir := runtimeReportDir(coord.store.baseDir, primaryReq.ProgID, runStageRepro)
 	assert.FileExists(t, filepath.Join(preMinimizeDir, "report.json"))
 	assert.FileExists(t, filepath.Join(preMinimizeDir, "repro.prog"))
 
@@ -248,18 +252,18 @@ func TestMultiRuntimeCoordinatorSchedulesMismatchRepro(t *testing.T) {
 	}
 	require.Eventually(t, func() bool {
 		entries, err := os.ReadDir(coord.store.baseDir)
-		if err != nil || len(entries) != 2 {
+		if err != nil || len(entries) != 1 {
 			return false
 		}
 		_, err = os.Stat(filepath.Join(runtimeReportDir(coord.store.baseDir,
-			primaryReq.ProgID, minimizedID), "report.json"))
+			primaryReq.ProgID, runStageMinimize), "report.json"))
 		return err == nil
 	}, time.Second, time.Millisecond)
 
 	entries, err := os.ReadDir(filepath.Join(coord.store.baseDir))
 	require.NoError(t, err)
-	require.Len(t, entries, 2)
-	reportDir := runtimeReportDir(coord.store.baseDir, primaryReq.ProgID, minimizedID)
+	require.Len(t, entries, 1)
+	reportDir := runtimeReportDir(coord.store.baseDir, primaryReq.ProgID, runStageMinimize)
 	assert.NoDirExists(t, coord.unstableStore.baseDir)
 	reportPath := filepath.Join(reportDir, "report.json")
 	assert.FileExists(t, reportPath)
@@ -349,16 +353,16 @@ getpid()`)
 	var entries []os.DirEntry
 	require.Eventually(t, func() bool {
 		entries, err = os.ReadDir(coord.store.baseDir)
-		if err != nil || len(entries) != 2 {
+		if err != nil || len(entries) != 1 {
 			return false
 		}
 		_, err = os.Stat(filepath.Join(runtimeReportDir(coord.store.baseDir,
-			primary.ProgID, postMinimizeID), "report.json"))
+			primary.ProgID, runStageMinimize), "report.json"))
 		return err == nil
 	}, time.Second, time.Millisecond)
 
 	preData, err := os.ReadFile(filepath.Join(runtimeReportDir(coord.store.baseDir,
-		primary.ProgID, preMinimizeID), "report.json"))
+		primary.ProgID, runStageRepro), "report.json"))
 	require.NoError(t, err)
 	var preReport storedMismatchReport
 	require.NoError(t, json.Unmarshal(preData, &preReport))
@@ -370,7 +374,7 @@ getpid()`)
 	assert.Equal(t, 1, *preReport.StableDifferences[0].CallIndex)
 
 	data, err := os.ReadFile(filepath.Join(runtimeReportDir(coord.store.baseDir,
-		primary.ProgID, postMinimizeID), "report.json"))
+		primary.ProgID, runStageMinimize), "report.json"))
 	require.NoError(t, err)
 	var report storedMismatchReport
 	require.NoError(t, json.Unmarshal(data, &report))
@@ -438,21 +442,21 @@ func TestMultiRuntimeCoordinatorUsesComparisonPrimary(t *testing.T) {
 	}
 	require.Eventually(t, func() bool {
 		entries, err := os.ReadDir(filepath.Join(workdir, "runtime-mismatches"))
-		if err != nil || len(entries) != 2 {
+		if err != nil || len(entries) != 1 {
 			return false
 		}
 		_, err = os.Stat(filepath.Join(runtimeReportDir(filepath.Join(workdir, "runtime-mismatches"),
-			primaryReq.ProgID, postMinimizeID), "report.json"))
+			primaryReq.ProgID, runStageMinimize), "report.json"))
 		return err == nil
 	}, time.Second, time.Millisecond)
 
 	entries, err := os.ReadDir(filepath.Join(workdir, "runtime-mismatches"))
 	require.NoError(t, err)
-	require.Len(t, entries, 2)
+	require.Len(t, entries, 1)
 	assert.FileExists(t, filepath.Join(runtimeReportDir(filepath.Join(workdir, "runtime-mismatches"),
-		primaryReq.ProgID, preMinimizeID), "report.json"))
+		primaryReq.ProgID, runStageRepro), "report.json"))
 	data, err := os.ReadFile(filepath.Join(runtimeReportDir(filepath.Join(workdir, "runtime-mismatches"),
-		primaryReq.ProgID, postMinimizeID), "report.json"))
+		primaryReq.ProgID, runStageMinimize), "report.json"))
 	require.NoError(t, err)
 	var report storedMismatchReport
 	require.NoError(t, json.Unmarshal(data, &report))
@@ -623,7 +627,8 @@ func TestMultiRuntimeCoordinatorPersistsUnstableResultsSeparately(t *testing.T) 
 	entries, err := os.ReadDir(coord.unstableStore.baseDir)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
-	reportPath := filepath.Join(coord.unstableStore.baseDir, entries[0].Name(), "report.json")
+	reportPath := filepath.Join(coord.unstableStore.baseDir, entries[0].Name(),
+		runtimeOriginalDirName, "report.json")
 	data, err := os.ReadFile(reportPath)
 	require.NoError(t, err)
 	var report storedMismatchReport
@@ -758,8 +763,12 @@ func testRegistryProg(target *prog.Target) *prog.Prog {
 	return target.Generate(mathrand.NewSource(0), 1, target.DefaultChoiceTable())
 }
 
-func runtimeReportDir(baseDir string, parentID, reproID int64) string {
-	return filepath.Join(baseDir, fmt.Sprintf("prog%d-repro%d", parentID, reproID))
+func runtimeReportDir(baseDir string, parentID int64, stage runStage) string {
+	resultDir := runtimeOriginalDirName
+	if stage == runStageMinimize {
+		resultDir = runtimeMinimizeDirName
+	}
+	return filepath.Join(baseDir, fmt.Sprintf("prog%d", parentID), resultDir)
 }
 
 func allSyscalls(target *prog.Target) map[*prog.Syscall]bool {

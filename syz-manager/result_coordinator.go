@@ -1445,6 +1445,8 @@ func cloneRuntimeCallArgs(args []*runtimeCallArg) []*runtimeCallArg {
 const (
 	runtimeMismatchDirName = "runtime-mismatches"
 	runtimeUnstableDirName = "runtime-unstable"
+	runtimeOriginalDirName = "original"
+	runtimeMinimizeDirName = "minimize"
 )
 
 type mismatchStore struct {
@@ -1556,7 +1558,11 @@ func (store *mismatchStore) Save(run *programRun, mismatch *runtimeMismatch) (st
 	if store == nil {
 		return "", nil
 	}
-	dir := filepath.Join(store.baseDir, fmt.Sprintf("prog%d-repro%d", run.ParentID, run.ID))
+	resultDir := runtimeOriginalDirName
+	if run.Stage == runStageMinimize {
+		resultDir = runtimeMinimizeDirName
+	}
+	dir := filepath.Join(store.baseDir, fmt.Sprintf("prog%d", run.ParentID), resultDir)
 	if err := os.MkdirAll(filepath.Join(dir, "logs"), 0o755); err != nil {
 		return "", err
 	}
