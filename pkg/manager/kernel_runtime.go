@@ -199,13 +199,11 @@ func (runtime *KernelRuntime) SetupServer() error {
 }
 
 func (runtime *KernelRuntime) Close() error {
-	if err := runtime.CloseServer(); err != nil {
-		return err
-	}
+	serverErr := runtime.CloseServer()
 	if runtime.vmPool != nil {
-		return runtime.vmPool.Close()
+		return errors.Join(serverErr, runtime.vmPool.Close())
 	}
-	return nil
+	return serverErr
 }
 
 func (runtime *KernelRuntime) coverageFiltersSnapshot() CoverageFilters {

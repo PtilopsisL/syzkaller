@@ -5,6 +5,7 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	mathrand "math/rand"
 	"reflect"
@@ -12,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/google/syzkaller/pkg/execbackend"
 	"github.com/google/syzkaller/pkg/fuzzer"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
 	"github.com/google/syzkaller/pkg/mgrconfig"
@@ -26,8 +28,12 @@ import (
 )
 
 const testKernelRuntimeVM = "test-kernel-runtime"
+const testKernelRuntimeCloseVM = "test-kernel-runtime-close"
 
 var registerTestKernelRuntimeVM sync.Once
+var registerTestKernelRuntimeCloseVM sync.Once
+
+var testKernelRuntimeClosePoolInstance atomic.Pointer[testKernelRuntimeClosePool]
 
 func TestNewKernelRuntimeSuccess(t *testing.T) {
 	cfg := testKernelRuntimeConfig(t, testKernelRuntimeVM)
@@ -71,6 +77,37 @@ func TestNewKernelRuntimeUsesCustomInstanceHandler(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, reflect.ValueOf(handler).Pointer(), dispatcherDefaultJobPtr(t, runtime.Pool()))
+}
+
+func TestKernelRuntimeCloseClosesVMPoolAfterServerError(t *testing.T) {
+	registerTestKernelRuntimeCloseVM.Do(func() {
+		vmimpl.Register(testKernelRuntimeCloseVM, vmimpl.Type{
+			Ctor: func(env *vmimpl.Env) (vmimpl.Pool, error) {
+				pool := new(testKernelRuntimeClosePool)
+				testKernelRuntimeClosePoolInstance.Store(pool)
+				return pool, nil
+			},
+		})
+	})
+	cfg := testKernelRuntimeConfig(t, testKernelRuntimeCloseVM)
+	runtime, err := NewKernelRuntime("close", cfg, KernelRuntimeOptions{})
+	require.NoError(t, err)
+
+	serverErr := errors.New("server close failed")
+	poolErr := errors.New("pool close failed")
+	runtime.serv = &testKernelRuntimeCloseServer{
+		Server: runtime.serv,
+		err:    serverErr,
+	}
+	runtime.setup = true
+	pool := testKernelRuntimeClosePoolInstance.Load()
+	require.NotNil(t, pool)
+	pool.err = poolErr
+
+	err = runtime.Close()
+	assert.ErrorIs(t, err, serverErr)
+	assert.ErrorIs(t, err, poolErr)
+	assert.True(t, pool.closed.Load())
 }
 
 func TestKernelRuntimeMachineCheckedUsesProvidedSource(t *testing.T) {
@@ -219,6 +256,33 @@ func (pool *testKernelRuntimePool) Count() int {
 
 func (pool *testKernelRuntimePool) Create(_ context.Context, _ string, index int) (vmimpl.Instance, error) {
 	return &testKernelRuntimeInstance{index: index}, nil
+}
+
+type testKernelRuntimeCloseServer struct {
+	execbackend.Server
+	err error
+}
+
+func (serv *testKernelRuntimeCloseServer) Close() error {
+	return serv.err
+}
+
+type testKernelRuntimeClosePool struct {
+	closed atomic.Bool
+	err    error
+}
+
+func (pool *testKernelRuntimeClosePool) Count() int {
+	return 1
+}
+
+func (pool *testKernelRuntimeClosePool) Create(_ context.Context, _ string, index int) (vmimpl.Instance, error) {
+	return &testKernelRuntimeInstance{index: index}, nil
+}
+
+func (pool *testKernelRuntimeClosePool) Close() error {
+	pool.closed.Store(true)
+	return pool.err
 }
 
 type testKernelRuntimeInstance struct {
